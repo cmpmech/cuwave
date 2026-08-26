@@ -1,0 +1,13 @@
+__pycache__/
+*.egg-info/
+*.pyc
+build/
+dist/
+examples/docs/
+.zed/
+.obsidian/
+
+# ADD later
+tests/
+.claude/
+

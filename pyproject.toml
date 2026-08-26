@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cuwave"
+version = "0.2.0"
+description = "GPU finite-difference wave solver with differentiable adjoints"
+requires-python = ">=3.10"
+# CuPy is intentionally omitted: install the wheel matching your CUDA toolkit,
+# e.g. `pip install cupy-cuda12x`.
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+# Only the example drivers plot; the solver itself never imports matplotlib.
+examples = ["matplotlib>=3.7"]
+# Only `cuwave.nn` needs torch; the solver and its adjoints are cupy throughout.
+nn = ["torch>=2.0"]
+
+[tool.setuptools]
+packages = ["cuwave"]
+
+[tool.setuptools.package-data]
+cuwave = ["kernels/*.cu"]
