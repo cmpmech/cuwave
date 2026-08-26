@@ -66,7 +66,7 @@ class BoundaryCondition:
 
 
 Neumann = BoundaryCondition("homogeneous_neumann_kernel")
-Dirichlet = BoundaryCondition("dirichlet_kernel")
+Dirichlet = BoundaryCondition("homogeneous_dirichlet_kernel")
 
 
 def canonical_boundary(

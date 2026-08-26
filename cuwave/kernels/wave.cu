@@ -22,9 +22,8 @@ typedef double real_t;
 #else
 // cache
 __constant__ real_t OP_C[STENCIL_RADIUS][STENCIL_RADIUS] = OP_COEFFS;
-#define OP_W(r, k) OP_C[(r) - 1][(k) - 1]
-// grade the radius down towards a wall so the stencil never reaches past the
-// single ghost node; wall-adjacent nodes fall back to order 2
+#define OP_W(r, k) OP_C[(r) - 1][(k) - 1] // 1-indexed adjustment
+// grade radius down towards wall so the stencil never reaches past ghost nodes
 #define CLOSURE(a, N) min(STENCIL_RADIUS, min(a, (N) - 1 - (a)))
 #endif
 
@@ -175,8 +174,8 @@ __global__ void homogeneous_neumann_kernel(real_t *__restrict__ u,
 }
 
 // ------------------------------------------------------------------------------------
-__global__ void dirichlet_kernel(real_t *__restrict__ u, const int faces,
-                                 BC_PARAMS) {
+__global__ void homogeneous_dirichlet_kernel(real_t *__restrict__ u,
+                                             const int faces, BC_PARAMS) {
   BC_GEOM;
   int ghost, normal;
   if (!bc_ghost(blockIdx.x * blockDim.x + threadIdx.x, faces, n, s, ghost,

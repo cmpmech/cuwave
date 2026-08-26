@@ -133,8 +133,8 @@ def adjoint_signal(
 # ----------------------------------- kernel helpers ----------------------------------
 def define_gradient(sim: Simulation, kernels: cp.RawModule, mat: dict) -> Callable:
     """Closure accumulating both gradient densities from a forward triplet and `l1`."""
-    # one kernel for both gradients, and a prebuilt argument list mutated in place: see
-    # the launch-cost note above define_step_method in wave.py
+    # one kernel for both gradients, and a prebuilt argument list mutated in place: a
+    # launch costs more host time than either gradient body costs on the device
     gradient_kernel = kernels.get_function("gradient_kernel")
     grid, block = grid_block(sim)
     # the operator without the dt^2 the step folds into it: L, not dt^2 L
