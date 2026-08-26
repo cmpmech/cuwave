@@ -11,6 +11,7 @@ typedef float real_t;
 typedef double real_t;
 #endif
 
+// ----------------------------- finite difference helpers
 #ifndef STENCIL_RADIUS
 #define STENCIL_RADIUS 1 // default order 2
 #endif
@@ -32,27 +33,24 @@ __device__ __forceinline__ real_t flux_divergence_axis(
     const real_t *__restrict__ u1, const real_t *__restrict__ stiff,
     const int idx, const int s, const real_t uc, const real_t sc,
     const real_t factor, const int r) {
-  const real_t sp = stiff[idx + s];
-  const real_t sm = stiff[idx - s];
-  const real_t gp = sc * sp / (sc + sp);
-  const real_t gm = sc * sm / (sc + sm);
-  real_t Dp = OP_W(r, 1) * (u1[idx + s] - uc);
-  real_t Dm = OP_W(r, 1) * (uc - u1[idx - s]);
+  const real_t sp = stiff[idx + s];            // plus of sc
+  const real_t sm = stiff[idx - s];            // minus of sc
+  const real_t gp = sc * sp / (sc + sp);       // harmonic mean
+  const real_t gm = sc * sm / (sc + sm);       // harmonic mean
+  real_t Dp = OP_W(r, 1) * (u1[idx + s] - uc); // initialization: inner grad
+  real_t Dm = OP_W(r, 1) * (uc - u1[idx - s]); // initialization: inner grad
 #pragma unroll
   for (int k = 2; k <= STENCIL_RADIUS; ++k)
     if (k <= r) {
-      Dp += OP_W(r, k) * (u1[idx + k * s] - u1[idx - (k - 1) * s]);
-      Dm += OP_W(r, k) * (u1[idx + (k - 1) * s] - u1[idx - k * s]);
+      Dp +=
+          OP_W(r, k) * (u1[idx + k * s] - u1[idx - (k - 1) * s]); // inner grad
+      Dm +=
+          OP_W(r, k) * (u1[idx + (k - 1) * s] - u1[idx - k * s]); // inner grad
     }
-  return factor * (Dp * gp - Dm * gm);
+  return factor * (Dp * gp - Dm * gm); // outer grad (incl. inner grad)
 }
 
-// ------------------------------- boundary conditions ---------------------------------
-// The wall sits on node 1 and node n - 2; node 0 and node n - 1 are the single ghost
-// node per side that fd_kernel never writes, so a condition is just a rule for filling
-// it. Every bc kernel takes the field, then `faces` -- a bitmask with bit 2 * axis +
-// side set for the faces this launch covers -- then the geometry the other kernels take
-
+// ----------------------------- boundary condition helper
 #if NDIM == 1
 #define BC_PARAMS const int N0
 #define BC_GEOM const int n[1] = {N0}, s[1] = {1}
@@ -65,19 +63,9 @@ __device__ __forceinline__ real_t flux_divergence_axis(
 #define BC_GEOM const int n[3] = {N0, N1, N2}, s[3] = {s0, s1, 1}
 #endif
 
-// Decode a linear thread id into the ghost node it owns: `ghost` its flat index and
-// `normal` the stride one node inward, so ghost + 2 * normal is the node the wall
-// reflects it onto and a deeper condition can walk ghost + k * normal.
-//
-// Each face holds only the *interior* of the remaining axes, so edges and corners are
-// never written: the stencil reaches across one axis at a time from an interior node
-// and therefore only ever reads face ghosts. The axis loop subtracts each face's node
-// count from `t` until the thread's own face is found, then decodes its position within
-// that face by mixed-radix division over the other axes, the + 1 shifting it off the
-// ghost ring. Both loops run over the axis at compile time, which is what lets the
-// whole decode fold away
 __device__ __forceinline__ bool bc_ghost(int t, const int faces, const int *n,
-                                         const int *s, int &ghost, int &normal) {
+                                         const int *s, int &ghost,
+                                         int &normal) {
 #pragma unroll
   for (int d = 0; d < NDIM; ++d) {
     int face = 1; // nodes on one ghost face of axis d
@@ -88,7 +76,8 @@ __device__ __forceinline__ bool bc_ghost(int t, const int faces, const int *n,
 
     const int lo = (faces >> (2 * d)) & 1, hi = (faces >> (2 * d + 1)) & 1;
     if (t < (lo + hi) * face) {
-      const int high = (lo && t < face) ? 0 : 1; // low ghost (0) or high (n[d] - 1)
+      const int high =
+          (lo && t < face) ? 0 : 1; // low ghost (0) or high (n[d] - 1)
       int r = t - (high ? lo * face : 0);
       int off = 0; // position within the face, axis d excluded
 #pragma unroll
@@ -106,6 +95,7 @@ __device__ __forceinline__ bool bc_ghost(int t, const int faces, const int *n,
   return false;
 }
 
+// -------------------------------------- kernels
 extern "C" {
 
 // ------------------------------------------------------------------------------------
@@ -174,34 +164,23 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
 }
 
 // ------------------------------------------------------------------------------------
-// u[ghost] = u[mirror], i.e. 0 <- 2 and n - 1 <- n - 3: mirroring makes the central
-// difference across the wall vanish, which is the zero-flux condition.
-// wave.mirror_ghosts applies the same rule to the material fields on the host
-__global__ void homogeneous_neumann_kernel(real_t *__restrict__ u, const int faces,
-                                           BC_PARAMS) {
+__global__ void homogeneous_neumann_kernel(real_t *__restrict__ u,
+                                           const int faces, BC_PARAMS) {
   BC_GEOM;
   int ghost, normal;
-  if (!bc_ghost(blockIdx.x * blockDim.x + threadIdx.x, faces, n, s, ghost, normal))
+  if (!bc_ghost(blockIdx.x * blockDim.x + threadIdx.x, faces, n, s, ghost,
+                normal))
     return;
   u[ghost] = u[ghost + 2 * normal];
 }
 
 // ------------------------------------------------------------------------------------
-// u[ghost] = -u[mirror]: the odd mirror makes the *value* at the wall vanish, and keeps
-// it vanishing without the wall node ever being written. CLOSURE puts that node at
-// radius 1 whatever the order, so along its own axis it sees only u[0], u[1], u[2]:
-// with u[1] = 0 and u[0] = -u[2] the two face fluxes are Dp = u[2] and Dm = u[2], and
-// the mirrored material makes g+ and g- the same expression on the same inputs, so the
-// two products cancel. The other axes contribute neighbours inside the same wall layer,
-// zero by the same argument, and the fields start from rest -- so the layer holds zero,
-// measured bitwise in tests/boundary_test.py (which asserts against machine epsilon
-// rather than against zero, since an fma contraction of Dp * gp - Dm * gm would leave
-// the rounding residual of the product). A source on the wall node breaks that; a
-// sensor there reads nothing
-__global__ void dirichlet_kernel(real_t *__restrict__ u, const int faces, BC_PARAMS) {
+__global__ void dirichlet_kernel(real_t *__restrict__ u, const int faces,
+                                 BC_PARAMS) {
   BC_GEOM;
   int ghost, normal;
-  if (!bc_ghost(blockIdx.x * blockDim.x + threadIdx.x, faces, n, s, ghost, normal))
+  if (!bc_ghost(blockIdx.x * blockDim.x + threadIdx.x, faces, n, s, ghost,
+                normal))
     return;
   u[ghost] = -u[ghost + 2 * normal];
 }
@@ -218,7 +197,6 @@ excitation_kernel(real_t *__restrict__ u, const real_t *__restrict__ source,
 }
 
 // ------------------------------------------------------------------------------------
-
 __global__ void get_signal_kernel(const real_t *__restrict__ u,
                                   real_t *__restrict__ um, const int offset,
                                   const int *__restrict__ lin_index,

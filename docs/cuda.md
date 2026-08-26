@@ -1,5 +1,53 @@
 # CUDA kernels
 
+## finite difference helpers
+
+### OP_W, OP_C
+### CLOSURE
+
+### flux_divergence_axis
+**aim**
+compute $\nabla\cdot(k\nabla u)$ at $i$  (`idx`)
+**input args**
+`u1`: array of $u$; `stiff`: array of $k$; `idx`: index; `s`: stride along axis; `uc`: `u1[idx]`; `sc`: `sc[idx]`; `factor`: $1/h^2$ with $h$ as node distance in axis; `r`: radius of finite difference scheme in axis
+**internal args**
+**TODO**
+**how?**
+- approximation of outer gradient (flux divergence)
+$$\nabla\cdot(k\nabla u)|_i\approx \frac{1}{h} (k_{i+\frac{1}{2}}\nabla u_{i+\frac{1}{2}}-k_{i-\frac{1}{2}}\nabla u_{i-\frac{1}{2}})$$
+- $k_{i+\frac{1}{2}}, k_{i-\frac{1}{2}}$ approximated via harmonic mean (`stiff`)
+- approximation of inner gradients with higher order finite differences
+$$\nabla_{i+\frac{1}{2}}\approx \frac{1}{h}\sum_{k=1}^r w_{r,k}(u_{i+k}-u_{i-(k-1)})$$
+$$\nabla_{i-\frac{1}{2}}\approx \frac{1}{h}\sum_{k=1}^r w_{r,k}(u_{i+(k-1)}-u_{i-k})$$
+ - `factor` captures the condensed factor $\frac{1}{h^2}$ 
+
+
+## boundary helpers
+
+
+## kernels
+### fd_kernel
+**aim**
+compute next step $u^{n+1}$ based on central difference approximation in space & time
+**input args**
+`u0`: array of $u^{n-1}$; `u1`: array of $u^n$; `u2`: array of $u^{n+1}$ to be overwritten; `stiff`: array of $k$; `minv`: array of $1/m$; `derive_inertia`: true when `stiff=1/minv`, i.e., $k=m$; `damping`: array of $d$; `dt` time step size; `f0, f1, f2`: factors $1/h$ per axis; `N0, N1, N2`: physical grid dimensions; `s0, s1` strides of axis 1 and 2
+**internal args**
+`a0, a1, a2`: grid indices; `idx`: TODO; `r0, r1, r2`: finite difference radii in axis directions; `uc, sc`: central grid entries; `laplacian`: spatially approximated laplacian; `mi`: `minv`derived via `stiff`; `beta`: damping term
+**how?**
+$$u^{n+1}\approx \frac{1}{\beta}(2 u^{n} - u^{n-1}(1-\beta) + \frac{1}{m}\nabla\cdot (k\nabla u^n))$$
+
+
+
+
+
+
+
+
+
+
+
+
+
 ## compilation logic
 `compile_kernels(sim, path)` builds one `cp.RawModule` per setup: the kernels are written once for any dimension, precision and order, and the specifics arrive as `nvcc` flags or as injected source
 
