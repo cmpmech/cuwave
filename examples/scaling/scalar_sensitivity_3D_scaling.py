@@ -5,9 +5,12 @@ import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
-from cuwave.sensitivity import l2_misfit, sensitivity
+from cuwave.sensitivity import (
+    l2_misfit,
+    sensitivity,
+    superposition_sensitivity,
+)
 from cuwave.signals import sineburst
-from cuwave.superposition import SuperpositionSensitivity
 from cuwave.wave import ScalarWave, Source
 
 # -------------------------------------- settings -------------------------------------
@@ -34,7 +37,7 @@ RESOLUTIONS = {
     "standard": np.logspace(0.7, 2.5, 40).astype(np.int32),  # laptop (RTX PRO 500)
     "superposition": np.logspace(0.7, 2.69, 40).astype(np.int32),
 }
-SUPERPOSITION_SCALE = 1.0  # k; see cuwave/superposition.py on how to pick it
+SUPERPOSITION_SCALE = 1.0  # k; see cuwave/sensitivity.py on how to pick it
 
 mempool = cp.get_default_memory_pool()
 device_total = cp.cuda.Device().mem_info[1]
@@ -84,14 +87,13 @@ for method, resolutions in RESOLUTIONS.items():
         cp.cuda.Stream.null.synchronize()
         tic = time.time()
         if method == "standard":
-            cost, grads, traces = sensitivity(
+            cost, grads, traces, _ = sensitivity(
                 sim, source, indicator, sensors, objective
             )
         else:
-            evaluate = SuperpositionSensitivity(
-                sim, source, sensors, scale=SUPERPOSITION_SCALE
+            cost, grads, traces, _ = superposition_sensitivity(
+                sim, source, indicator, sensors, objective, scale=SUPERPOSITION_SCALE
             )
-            cost, grads, traces = evaluate(indicator, objective)
         cp.cuda.Stream.null.synchronize()
         toc = time.time()
 

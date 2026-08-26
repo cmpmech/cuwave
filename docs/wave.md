@@ -82,6 +82,49 @@ with the two materials `rho1`/`kappa1` and `rho2`/`kappa2` that $\gamma$ interpo
 $$m\ddot{\mathbf{u}}+d\dot{\mathbf{u}}-\nabla\cdot\boldsymbol{\sigma}=\mathbf{f},\qquad\boldsymbol{\sigma}=\lambda\,\textrm{tr}\left(\boldsymbol{\varepsilon}\right)\mathbf{I}+2\mu\boldsymbol{\varepsilon},\qquad\boldsymbol{\varepsilon}=\frac{1}{2}\left(\nabla\mathbf{u}+\nabla\mathbf{u}^\top\right)$$
 with the Lamé parameters $\lambda$ and $\mu$, solving for the displacement vector $\mathbf{u}$ instead of a scalar
 
-TODO not implemented yet
+**TODO** not implemented yet
 
 ## define_\[kernel]
+Every kernel launch in the time loop is prepared by a `define_[kernel]` factory: it is called **once** during setup and returns a closure that launches one compiled kernel. 
+
+Everything that does not change between time steps is resolved at that point: the launch configuration, the flat index arrays, the material and geometry arguments, and the scalar casts.
+
+```python
+args = [None, None, None, *sim.step_kernel_args(mat), *axis_geometry(...)]
+
+def fd_step(u0, u1, u2):
+    args[0], args[1], args[2] = u0, u1, u2
+    fd_kernel(grid, block, args)
+    return u2
+```
+
+### kernels
+
+| factory              | module           | kernel              | closure                                          |
+| -------------------- | ---------------- | ------------------- | ------------------------------------------------ |
+| `define_step_method` | `wave.py`        | `fd_kernel`         | `fd_step(u0, u1, u2)`                            |
+| `define_boundary`    | `boundary.py`    | one per condition   | `bc_step(u)`                                     |
+| `define_excitation`  | `wave.py`        | `excitation_kernel` | `excitation_step(u, signal, t_index)`            |
+| `define_get_signal`  | `wave.py`        | `get_signal_kernel` | `get_signal_step(u, um, t_index)`                |
+| `define_gradient`    | `sensitivity.py` | `gradient_kernel`   | `gradient_step(g_mass, g_stiff, u0, u1, u2, l1)` |
+
+Conventions shared by all of them
+
+| convention | reason |
+|---|---|
+| prebuilt `args` list, field slots overwritten per call | one allocation instead of $N$, see above |
+| scalars pre-cast to `np.int32` / `sim.dtype` | `RawKernel` marshals by the object's own type, so an untyped Python scalar is rejected outright and a mismatched array dtype is read as garbage |
+| grid indices flattened on the host by `flatten_indices` | the padded strides are known at setup, so the device never recomputes them |
+| axis extents and strides packed by `axis_geometry` | one ordering of the trailing kernel arguments for every `ndim`, mirrored by the factor-free variant in `boundary.py` and `sensitivity.py` |
+| the closure returns the field it wrote | lets the loop read as `u0 = fd_step(u0, u1, u0)` |
+### define_step_method
+Launches `fd_kernel` over the whole padded grid with `grid_block`, one thread per node
+### define_excitation
+Flat 1D launch of 256 threads, one thread per source, adding the current signal sample into the field
+### define_get_signal
+The mirror image of the excitation, one thread per sensor, writing row `t_index` of the recording.
+`simulate` calls it after the buffer swap, so the recorded row is the field that was just computed.
+### define_boundary
+see [boundary](boundary.md)
+### define_gradient
+see [sensitivity](sensitivity.md)

@@ -11,9 +11,6 @@ Both optimizers share the interface below and are stateful, `Adam` holding its t
 | update | `step(x, grad)` | advances the internal state and returns the new design, leaving `x` untouched |
 
 Neither optimizer enforces box constraints, so clipping the returned design to e.g. $[0,1]$ is left to the driver
-
-`step` performs no line search either, so the design it returns is accepted as it comes: `Adam` takes $\eta$ in design units, `Lbfgs` whatever length the curvature estimate implies. Where a guaranteed decrease is needed, `Lbfgs.search` wraps `step` in a backtracking line search on the forward-only cost, as `examples/fwi_2D_lbfgs.py` uses it -- `Adam` has no counterpart
-
 ## Adam
 `Adam` (adaptive moment estimation) rescales the gradient by running estimates of its first and second moment, so that every design variable takes a step of comparable size irrespective of its sensitivity magnitude, following [Kingma & Ba 2015](https://doi.org/10.48550/arXiv.1412.6980)
 $$m_t=\beta_1m_{t-1}+\left(1-\beta_1\right)g_t,\qquad v_t=\beta_2v_{t-1}+\left(1-\beta_2\right)g_t^2,\qquad\hat{m}_t=\frac{m_t}{1-\beta_1^t},\qquad\hat{v}_t=\frac{v_t}{1-\beta_2^t}$$
@@ -50,4 +47,4 @@ Without a pair the recursion returns the gradient itself and $\gamma_k$ never sc
 | update | `step(x, grad)` | records the pair of the preceding step, applies the recursion and returns the new design |
 | line search | `search(x, grad, cost, f, project=lambda x: x)` | backtracks the proposal of `step` until the Armijo condition holds against `cost`, evaluating the objective through `f(design)`, and returns `(design, cost, alpha, trials)` |
 
-Pairs of non-positive curvature $y^\top s\le0$ are skipped, since they would flip the sign of $\rho$ and with it the direction (TODO could be added with Powell damping?)
+Pairs of non-positive curvature $y^\top s\le0$ are skipped, since they would flip the sign of $\rho$ and with it the direction 

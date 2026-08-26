@@ -1,19 +1,15 @@
 import math
 import time
+from collections.abc import Callable
 
 import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
 
-from cuwave.sensitivity import sensitivity
+from cuwave.sensitivity import sensitivity, superposition_sensitivity
 from cuwave.signals import sineburst
-from cuwave.superposition import SuperpositionSensitivity
-from cuwave.wave import (
-    AcousticWave,
-    Source,
-    stable_dt,
-)
+from cuwave.wave import AcousticWave, Source, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # discretization
@@ -99,8 +95,8 @@ sensors = cp.stack([box_i.ravel(), box_j.ravel()]).astype(cp.int32)
 
 
 # --------------------------------------- solve ---------------------------------------
-def box_energy(sim):
-    # J = 1/2 int_box int_t p^2 -- the acoustic energy leaking into the target box.
+def box_energy(sim: AcousticWave) -> Callable:
+    """Objective factory: J = 1/2 int_box int_t p^2, the energy leaking into the box."""
     # Only its derivative reaches the adjoint, so any differentiable cost works; the
     # prod(dx) dt that turns the sum into an integral belongs here, not in the module.
     scale = float(np.prod(sim.dx)) * sim.dt
@@ -115,16 +111,14 @@ objective = box_energy(sim)
 cp.cuda.Stream.null.synchronize()
 tic = time.time()
 if METHOD == "standard":
-    cost, grads, traces = sensitivity(sim, source, indicator, sensors, objective)
-    note = ""
+    cost, grads, traces, info = sensitivity(sim, source, indicator, sensors, objective)
 else:
-    evaluate = SuperpositionSensitivity(
-        sim, source, sensors, scale=SUPERPOSITION_SCALE
+    cost, grads, traces, info = superposition_sensitivity(
+        sim, source, indicator, sensors, objective, scale=SUPERPOSITION_SCALE
     )
-    cost, grads, traces = evaluate(indicator, objective)
-    # how much of the mantissa the B(w, w) - B(u, u) subtraction ate: past ~1e6 in
-    # float32 the gradient is mostly round-off and SUPERPOSITION_SCALE wants raising
-    note = f"\t cancellation {evaluate.last_cancellation:.1e}"
+# how much of the mantissa the B(w, w) - B(u, u) subtraction ate: past ~1e6 in float32
+# the gradient is mostly round-off and SUPERPOSITION_SCALE wants raising
+note = f"\t cancellation {info['cancellation']:.1e}" if info else ""
 cp.cuda.Stream.null.synchronize()
 elapsed = time.time() - tic
 print(

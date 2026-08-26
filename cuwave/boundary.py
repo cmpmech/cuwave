@@ -7,9 +7,20 @@ closures once `compile_kernels` has run, which is why `simulate` needs no
 separate preparation phase.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+    import cupy as cp
+    import cupy.typing as cpt
+
+    from .wave import Simulation
 
 
 @dataclass(frozen=True, repr=False)
@@ -18,11 +29,13 @@ class BoundaryCondition:
 
     kernel: str
 
-    def __repr__(self):
-        # so that printing a Simulation shows the wall, not the kernel name
+    def __repr__(self) -> str:
+        # so that printing a Simulation shows the condition, not the kernel name
         return self.kernel.removesuffix("_kernel")
 
-    def define(self, sim, kernels, faces):
+    def define(
+        self, sim: Simulation, kernels: cp.RawModule, faces: Sequence[int]
+    ) -> Callable[[cpt.NDArray], None]:
         """closure applying this condition on `faces`, the codes 2 * axis + side"""
         kernel = kernels.get_function(self.kernel)
         threads = 256
@@ -56,10 +69,12 @@ Neumann = BoundaryCondition("homogeneous_neumann_kernel")
 Dirichlet = BoundaryCondition("dirichlet_kernel")
 
 
-def canonical_boundary(boundary, ndim):
+def canonical_boundary(
+    boundary: BoundaryCondition | Sequence | None, ndim: int
+) -> tuple[tuple[BoundaryCondition, BoundaryCondition], ...]:
     """makes the boundary canonical ((low, high),) * ndim
 
-    Accepts `None` for the default reflecting wall everywhere.
+    Accepts `None` for the reflecting default on every face.
     """
     if boundary is None:
         boundary = Neumann
@@ -77,8 +92,10 @@ def canonical_boundary(boundary, ndim):
     return tuple(pairs)
 
 
-def define_boundary(sim, kernels):
-    """one launch per distinct condition, so the default wall stays one launch."""
+def define_boundary(
+    sim: Simulation, kernels: cp.RawModule
+) -> Callable[[cpt.NDArray], cpt.NDArray]:
+    """one launch per distinct condition, so the default stays one launch."""
     groups = {}
     for d, pair in enumerate(sim.boundary):
         for side, condition in enumerate(pair):

@@ -9,10 +9,9 @@ CONVOLUTIONS = {1: nn.Conv1d, 2: nn.Conv2d, 3: nn.Conv3d}
 POOLINGS = {1: nn.AvgPool1d, 2: nn.AvgPool2d, 3: nn.AvgPool3d}
 OUTPUT_STD = 0.01
 
+
 # -------------------------------------- helpers --------------------------------------
-
-
-def _initialize(model):
+def _initialize(model: nn.Module) -> None:
     """Xavier normal with zero bias."""
     for module in model.modules():
         if isinstance(module, tuple(CONVOLUTIONS.values())):
@@ -20,22 +19,31 @@ def _initialize(model):
             nn.init.zeros_(module.bias)
 
 
-def nn_params(model):
-    """number of trainable parameters in ``model``"""
+def nn_params(model: nn.Module) -> int:
+    """Number of trainable parameters in `model`"""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def _convolution(in_channels, out_channels, kernel, dim):
-    """``kernel``-wide convolution over ``dim`` axes, padded to retain the resolution"""
+def _convolution(
+    in_channels: int, out_channels: int, kernel: int, dim: int
+) -> nn.Module:
+    """`kernel`-wide convolution over `dim` axes, padded to retain the resolution"""
     if dim not in CONVOLUTIONS:
         raise ValueError(f"dim is 1, 2 or 3, not {dim!r}")
     return CONVOLUTIONS[dim](in_channels, out_channels, kernel, padding=kernel // 2)
 
 
-def _block(in_channels, out_channels, kernel, activation, dim):
-    """convolve, normalize, activate -- the unit both networks are stacked from
+def _block(
+    in_channels: int,
+    out_channels: int,
+    kernel: int,
+    activation: type[nn.Module],
+    dim: int,
+) -> nn.Sequential:
+    """convolve, normalize, activate -- the unit a stack is built from
 
-    ``GroupNorm(1, channels)`` normalizes each sample over channels and space (layer normalization).
+    `GroupNorm(1, channels)` normalizes each sample over channels and space (layer
+    normalization).
     """
     return nn.Sequential(
         _convolution(in_channels, out_channels, kernel, dim),
@@ -45,28 +53,34 @@ def _block(in_channels, out_channels, kernel, activation, dim):
 
 
 # -------------------------------------- networks -------------------------------------
-
-
 class Generator(nn.Module):
-    """Fixed noise -> field:
-    * nearest-neighbour upsampling per channel transition
-    * ``channels`` tapers from the latent channels to the one channel of the field
-    * every transition doubles the resolution
-    * stack ends in `torch.nn.Sigmoid`, so the field is in ``[0, 1]``
-    * prior layer initialized with small random weights and ``output_bias``: field starts at 1 everywhere
-    * latent is a buffer by default and a `torch.nn.Parameter` when ``learnable``
+    """Fixed noise to field, doubling the resolution at every channel transition.
+
+    Nearest-neighbour upsampling per transition, and the stack ends in a sigmoid, so the
+    field is in [0, 1]. The output convolution starts with small random weights and
+    `output_bias`, so the field starts flat at 1 -- where the pixel-wise drivers start.
+
+    Args:
+        channels: latent channels, tapering to the one channel of the field.
+        shape: field resolution, divisible by 2**(len(channels) - 1).
+        kernel: convolution width, padded to retain the resolution.
+        activation: hidden activation; the output activation is always a sigmoid.
+        dim: 1, 2 or 3.
+        output_bias: bias into the output sigmoid, so a large value starts the field
+            flat at 1.
+        learnable: make `latent` a parameter instead of a buffer.
     """
 
     def __init__(
         self,
-        channels,
-        shape,
-        kernel=5,
-        activation=nn.GELU,
-        dim=2,
-        output_bias=10.0,
-        learnable=False,
-    ):
+        channels: list[int],
+        shape: tuple[int, ...],
+        kernel: int = 5,
+        activation: type[nn.Module] = nn.GELU,
+        dim: int = 2,
+        output_bias: float = 10.0,
+        learnable: bool = False,
+    ) -> None:
         super().__init__()
         if len(shape) != dim:
             raise ValueError(f"a {dim}D generator needs {dim} sizes, got {shape}")
@@ -98,5 +112,5 @@ class Generator(nn.Module):
         else:
             self.register_buffer("latent", noise)
 
-    def forward(self):
+    def forward(self) -> torch.Tensor:
         return self.stack(self.latent)

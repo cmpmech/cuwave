@@ -19,7 +19,7 @@ see the [documentation](docs/Home.md) for how the code works
 
 ```bash
 pip install cupy-cuda12x        # or cupy-cuda11x, to match your CUDA
-pip install -e .                # or -e ".[examples]" to also plot the examples
+pip install -e .                
 ```
 
 CuPy must be installed separately because the wheel depends on your CUDA toolkit;

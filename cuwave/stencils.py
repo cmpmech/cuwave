@@ -1,9 +1,9 @@
 import numpy as np
+import numpy.typing as npt
 
 
-def weights(R):
-    """Central second-derivative finite-difference weights of order 2R, `w[-R..R]`, via a Vandermonde solve."""
-    # collocated central second-derivative weights of order 2R, w[-R..R]
+def weights(R: int) -> npt.NDArray[np.float64]:
+    """Central second-derivative weights of order 2R, `w[-R..R]`, via a Vandermonde solve."""
     x = np.arange(-R, R + 1)
     A = x[None, :] ** np.arange(2 * R + 1)[:, None]
     rhs = np.zeros(2 * R + 1)
@@ -11,14 +11,14 @@ def weights(R):
     return np.linalg.solve(A, rhs)
 
 
-def face_coefficients(R):
-    """Cumulative tail sums of `weights(R)`, the reduced-order coefficients used near a boundary face."""
+def face_coefficients(R: int) -> npt.NDArray[np.float64]:
+    """Cumulative tail sums of `weights(R)`: the reduced-order coefficients near a face."""
     w = weights(R)
     return np.array([w[R + 1 + k :].sum() for k in range(R)])
 
 
-def preamble(space_order):
-    """CUDA preamble defining `STENCIL_RADIUS` and the `OP_COEFFS` table of face coefficients for every radius up to `space_order // 2`."""
+def preamble(space_order: int) -> str:
+    """CUDA preamble: `STENCIL_RADIUS` plus the `OP_COEFFS` table, one row per radius."""
     R = space_order // 2
     table = np.zeros((R, R))
     for r in range(1, R + 1):

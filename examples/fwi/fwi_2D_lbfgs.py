@@ -9,12 +9,21 @@ from cuwave.evals import f1_score, l2_error, pr_auc, precision, recall
 from cuwave.geometry import stacked_circles
 from cuwave.optimization import Lbfgs
 from cuwave.signals import sineburst
-from cuwave.utils import Sensors, line, measure, misfit, misfit_gradient, shots
+from cuwave.utils import (
+    Sensors,
+    line,
+    measure,
+    misfit,
+    misfit_gradient,
+    resample,
+    shots,
+)
 from cuwave.wave import ScalarWave, grid_coords, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # discretization
-SPACE_ORDER = 2
+SPACE_ORDER = 4
+SPACE_ORDER_OBS = 8  # the measurement is simulated more accurately than it is inverted
 PRECISION = "float32"
 RESOLUTION = (256, 256)
 SAFETY = 0.99
@@ -38,6 +47,9 @@ VOID_YRANGE, VOID_X = (0.1, 0.5), 0.5
 
 # optimization
 ITERS, PAIRS = 30, 4  # secant pairs L-BFGS keeps
+
+# evaluation
+THRESHOLD = 0.5
 FIRST_STEP = 0.05
 ARMIJO = 1e-4  # sufficient decrease the line search asks for
 BACKTRACK = 0.5  # factor a rejected trial step shrinks by
@@ -48,34 +60,43 @@ Nx = RESOLUTION
 dx = tuple(LENGTHS[d] / (Nx[d] - 3) for d in range(len(Nx)))
 Lx, Ly = LENGTHS
 
-dt = SAFETY * stable_dt(dx, WAVESPEED, SPACE_ORDER)
-N = math.ceil(T / dt)
+# both grids end exactly on T, so the record resamples onto dt without extrapolating
+N = math.ceil(T / (SAFETY * stable_dt(dx, WAVESPEED, SPACE_ORDER))) + 1
+N_obs = math.ceil(T / (SAFETY * stable_dt(dx, WAVESPEED, SPACE_ORDER_OBS))) + 1
+dt, dt_obs = T / (N - 1), T / (N_obs - 1)
 
 # about 12 points per wavelength is reasonable
+smallest_radius = VOID_MAX_RADIUS * VOID_GROWTH_RATE ** (NUM_VOIDS - 1)
 print(
     f"{WAVESPEED / (FREQUENCY * max(dx)):.0f} points per wavelength, "
-    f"{VOID_MAX_RADIUS * VOID_GROWTH_RATE ** (NUM_VOIDS - 1) / max(dx):.1f} per smallest radius"
+    f"{smallest_radius / max(dx):.1f} per smallest radius"
 )
 
-sim = ScalarWave(
+scalar_wave = lambda N, dt, space_order: ScalarWave(
     Nx,
     dx,
     N,
     dt,
     (4, 64),
     precision=PRECISION,
-    space_order=SPACE_ORDER,
+    space_order=space_order,
     wavespeed=WAVESPEED,
     density=DENSITY,
 )
+sim = scalar_wave(N, dt, SPACE_ORDER)
+sim_obs = scalar_wave(N_obs, dt_obs, SPACE_ORDER_OBS)
 
 # ------------------------------------ measurement ------------------------------------
-t = np.linspace(0, (N - 1) * dt, N)
-signal = sineburst(t, AMPLITUDE, FREQUENCY, CYCLES)
+burst = lambda t: sineburst(t, AMPLITUDE, FREQUENCY, CYCLES)
+t = np.linspace(0, T, N)
 surface = lambda count: line((ARRAY_SPAN[0], Ly), (ARRAY_SPAN[1], Ly), count)
-source_coords = surface(NUM_SOURCES)
-sources = shots(sim, source_coords, signal)
-sensors = Sensors(sim, surface(NUM_SENSORS))
+source_coords, sensor_coords = surface(NUM_SOURCES), surface(NUM_SENSORS)
+sources = shots(sim, source_coords, burst(t))
+sensors = Sensors(sim, sensor_coords)
+
+t_obs = np.linspace(0, T, N_obs)
+sources_obs = shots(sim_obs, source_coords, burst(t_obs))
+sensors_obs = Sensors(sim_obs, sensor_coords)
 
 coords = grid_coords(Nx, dx, dtype=sim.dtype)
 voids = stacked_circles(
@@ -92,11 +113,14 @@ truth = cp.where(voids, GAMMA_VOID, 1.0).astype(sim.dtype)
 
 cp.cuda.Stream.null.synchronize()
 tic = time.time()
-observed = measure(sim, sources, truth, sensors)
+observed = [
+    resample(record, dt_obs, dt, N)
+    for record in measure(sim_obs, sources_obs, truth, sensors_obs)
+]
 cp.cuda.Stream.null.synchronize()
 print(
-    f"{NUM_SOURCES} shots of {N} steps recorded at {NUM_SENSORS} receivers: "
-    f"{time.time() - tic:.1f}s"
+    f"{NUM_SOURCES} shots of {N_obs} steps at space order {SPACE_ORDER_OBS} "
+    f"recorded at {NUM_SENSORS} receivers: {time.time() - tic:.1f}s"
 )
 
 # ------------------------------------ optimization -----------------------------------
@@ -134,7 +158,6 @@ print(f"{ITERS}/{ITERS}: normalized misfit {history[-1] / history[0]:.4e}")
 print(f"elapsed time: {time.time() - tic:.1f}s")
 
 # ------------------------------------- evaluation ------------------------------------
-THRESHOLD = 0.5
 interior = tuple(slice(1, n - 1) for n in Nx)
 segmented = cp.where(gamma < THRESHOLD, GAMMA_VOID, 1.0).astype(sim.dtype)
 reference, recovered = truth[interior], gamma[interior]
@@ -169,7 +192,7 @@ for ax, field, title in zip(
 ):
     show_field(ax, field)
     marker = dict(clip_on=False, zorder=3)
-    ax.plot(sensors.coordinates[:, 0], sensors.coordinates[:, 1], "ko", ms=5, **marker)
+    ax.plot(sensor_coords[:, 0], sensor_coords[:, 1], "ko", ms=5, **marker)
     ax.plot(source_coords[:, 0], source_coords[:, 1], "ro", ms=3, **marker)
     ax.set_title(title)
     ax.set_aspect("equal")

@@ -1,7 +1,10 @@
 import numpy as np
+import numpy.typing as npt
 
 
-def sineburst(t, amplitude, frequency, cycles):
+def sineburst(
+    t: npt.NDArray[np.float64], amplitude: float, frequency: float, cycles: int
+) -> npt.NDArray[np.float64]:
     """Hann-windowed sine burst of `cycles` periods at `frequency`, zero outside its support."""
     mask = (t > 0) & (t <= cycles / frequency)
     return (
@@ -12,7 +15,12 @@ def sineburst(t, amplitude, frequency, cycles):
     )
 
 
-def ricker(t, amplitude, frequency, delay=None):
+def ricker(
+    t: npt.NDArray[np.float64],
+    amplitude: float,
+    frequency: float,
+    delay: float | None = None,
+) -> npt.NDArray[np.float64]:
     """Ricker wavelet at `frequency`, centered at `delay` (default one period)."""
     if delay is None:
         delay = 1.0 / frequency

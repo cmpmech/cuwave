@@ -1,7 +1,9 @@
 import math
 import time
+from collections.abc import Callable
 
 import cupy as cp
+import cupy.typing as cpt
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
@@ -10,13 +12,7 @@ from cuwave.optimization import Adam
 from cuwave.regularization import DensityFilter, Projection
 from cuwave.sensitivity import sensitivity
 from cuwave.signals import sineburst
-from cuwave.wave import (
-    AcousticWave,
-    Source,
-    grid_coords,
-    simulate,
-    stable_dt,
-)
+from cuwave.wave import AcousticWave, Source, grid_coords, simulate, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # discretization
@@ -112,8 +108,8 @@ region = (cp.abs(x - DESIGN_CENTER[0]) <= DESIGN_SIZE / 2) & (
 
 
 # ------------------------------------ optimization -----------------------------------
-def box_energy(sim):
-    # J = 1/2 int_box int_t p^2 -- the acoustic energy leaking into the target box
+def box_energy(sim: AcousticWave) -> Callable:
+    """Objective factory: J = 1/2 int_box int_t p^2, the energy leaking into the box."""
     scale = float(np.prod(sim.dx)) * sim.dt
 
     def objective(traces):
@@ -128,7 +124,8 @@ projection = Projection(BETA0, ETA)
 beta_of = lambda i: min(BETA0 * BETA_GROWTH ** (i // BETA_STEP), BETA_MAX)
 
 
-def physical(variables):
+def physical(variables: cpt.NDArray) -> tuple[cpt.NDArray, cpt.NDArray]:
+    """Filter then project the design variables: (physical field, filtered field)."""
     filtered = density_filter(variables)
     return projection(filtered) * region, filtered
 
@@ -143,7 +140,7 @@ tic = time.time()
 for iteration in range(ITERATIONS):
     projection.set(beta=beta_of(iteration))
     design, filtered = physical(variables)
-    cost, grads, _ = sensitivity(sim, source, design, sensors, objective)
+    cost, grads, _, _ = sensitivity(sim, source, design, sensors, objective)
 
     # chain rule: material fields -> indicator -> projection -> filter -> variables
     d_mass, d_stiff = sim.parametrization_jacobian()

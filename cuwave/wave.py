@@ -1,9 +1,19 @@
+"""Scalar and acoustic wave equations on a padded finite-difference grid.
+
+`Simulation` holds the grid and the compile-time configuration, `PressureWave` adds the
+nodal material fields, and `ScalarWave` / `AcousticWave` supply the parametrization that turns an indicator into those fields. The `define_*` factories bind compiled kernels to one such configuration, and `simulate` loops over the closures they return.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import cupy as cp
 import cupy.typing as cpt
 import numpy as np
+import numpy.typing as npt
 
 from .boundary import canonical_boundary, define_boundary
 from .stencils import preamble, weights
@@ -12,20 +22,20 @@ KERNEL_PATH = Path(__file__).parent / "kernels" / "wave.cu"
 
 
 # ------------------------------------- utilities -------------------------------------
-def stable_dt(dx, wavespeed, space_order=2):
-    """CFL-stable timestep for an explicit scheme with grid spacing `dx`, given `wavespeed` and finite difference `space_order`."""
+def stable_dt(dx: tuple[float, ...], wavespeed: float, space_order: int = 2) -> float:
+    """CFL-stable timestep for an explicit scheme with grid spacing `dx`."""
     lam = float(np.abs(weights(space_order // 2)).sum())
     return 2.0 / (wavespeed * float(np.sqrt(lam * sum(1.0 / d**2 for d in dx))))
 
 
 # -------------------------------------- helpers --------------------------------------
-def padded_shape(Nx):
+def padded_shape(Nx: tuple[int, ...]) -> tuple[int, ...]:
     """Pad the fastest (last) axis of `Nx` up to a multiple of 32, for coalesced access."""
     return (*Nx[:-1], ((Nx[-1] + 31) // 32) * 32)
 
 
-def mirror_ghosts(sim, field):
-    """Mirror `field`'s ghost layer onto its second-interior node on every axis, for a reflecting wall."""
+def mirror_ghosts(sim: Simulation, field: cpt.NDArray) -> cpt.NDArray:
+    """Mirror `field`'s ghost layer onto its second-interior node, for homogeneous Neumann."""
     for d in range(sim.ndim):
         for ghost, mirror in ((0, 2), (sim.Nx[d] - 1, sim.Nx[d] - 3)):
             dst = [slice(None)] * sim.ndim
@@ -36,7 +46,9 @@ def mirror_ghosts(sim, field):
     return field
 
 
-def grid_coords(Nx, dx, dtype=cp.float64):
+def grid_coords(
+    Nx: tuple[int, ...], dx: tuple[float, ...], dtype: npt.DTypeLike = cp.float64
+) -> list[cpt.NDArray]:
     """Padded grid coordinates for shape `Nx` at spacing `dx`, with node 1 at the origin."""
     # indices 0 and -1 are ghost nodes outside the domain
     axes = [(cp.arange(n, dtype=dtype) - 1) * d for n, d in zip(padded_shape(Nx), dx)]
@@ -49,7 +61,9 @@ class Source:
     signal: cpt.NDArray  # (N, num_sources) time series
 
 
-def flatten_indices(sim, position):
+def flatten_indices(
+    sim: Simulation, position: cpt.NDArray[cp.int32]
+) -> cpt.NDArray[cp.int32]:
     """Collapse (ndim, num) grid indices `position` into flat indices of the padded array."""
     lin = cp.zeros(position.shape[1], dtype=cp.int32)
     for d in range(sim.ndim):
@@ -62,7 +76,7 @@ def flatten_indices(sim, position):
 class Simulation:
     """Grid, timestepping, and compile-time configuration shared by all wave equations."""
 
-    Nx: tuple[int, ...]  # logical grid points per axis (incl. ghost cells)
+    Nx: tuple[int, ...]  # logical grid points per axis (incl. ghost nodes)
     dx: tuple[float, ...]
     N: int  # number of time steps
     dt: float
@@ -73,8 +87,8 @@ class Simulation:
 
     compile_flags = ()  # extra nvcc -D flags
 
-    def __post_init__(self):
-        """Derive `ndim`, padded shape, strides, dtype, and canonical `boundary` from the raw fields."""
+    def __post_init__(self) -> None:
+        """Derive `ndim`, padded shape, strides, dtype, and canonical `boundary`."""
         self.ndim = len(self.Nx)
         self.Nx_padded = padded_shape(self.Nx)
         # C-contiguous strides over the padded shape (last axis has unit stride)
@@ -96,23 +110,25 @@ class PressureWave(Simulation):
     derive_inertia = False  # set where m == k (rho scaling): minv derived from stiff
 
     @property
-    def compile_flags(self):
+    def compile_flags(self) -> tuple[str, ...]:
         """`-DUSE_DAMPING` when a damping field is set, else no extra flags."""
         return ("-DUSE_DAMPING",) if self.damped else ()
 
-    def build_materials(self, indicator, damping=None):
-        """Turn `indicator` (and optional `damping`) into the kernel's ghost-mirrored material dict."""
+    def build_materials(
+        self, indicator: cpt.NDArray, damping: cpt.NDArray | None = None
+    ) -> dict:
+        """Turn `indicator` (and optional `damping`) into the kernel's material dict."""
         self.damped = damping is not None
         stiff, minv = self.parametrization(indicator)
         # mirrored in place, so the ghost ring of a caller-supplied indicator is
-        # normalised to the value the reflecting wall implies (see mirror_ghosts)
+        # normalised to the value homogeneous Neumann implies (see mirror_ghosts)
         mat = {"stiff": mirror_ghosts(self, stiff)}
         mat["minv"] = None if minv is None else mirror_ghosts(self, minv)
         if self.damped:
             mat["damping"] = damping
         return mat
 
-    def step_kernel_args(self, mat):
+    def step_kernel_args(self, mat: dict) -> tuple:
         """Material and damping arguments for the finite-difference step kernel."""
         minv = mat["stiff"] if self.derive_inertia else mat["minv"]
         args = (mat["stiff"], minv, np.int32(self.derive_inertia))
@@ -120,8 +136,10 @@ class PressureWave(Simulation):
             args += (mat["damping"], self.dtype(self.dt))
         return args
 
-    def excitation_weights(self, mat, lin_index):
-        """Source weights ``dt**2 / inertia`` at `lin_index`, without materializing inertia over the grid."""
+    def excitation_weights(
+        self, mat: dict, lin_index: cpt.NDArray[cp.int32]
+    ) -> cpt.NDArray:
+        """Source weights `dt**2 / inertia` at `lin_index`, never forming inertia on the grid."""
         field = mat["stiff"] if self.derive_inertia else mat["minv"]
         weight = field.ravel()[lin_index]
         if self.derive_inertia:
@@ -140,28 +158,30 @@ class ScalarWave(PressureWave):
 
     derive_inertia = True  # gamma scales inertia and stiffness alike
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Validate `wavespeed` and `density` are set, on top of `Simulation.__post_init__`."""
         super().__post_init__()
         if self.wavespeed is None or self.density is None:
             raise ValueError("ScalarWave requires wavespeed and density")
 
-    def parametrization(self, indicator):
+    def parametrization(
+        self, indicator: cpt.NDArray
+    ) -> tuple[cpt.NDArray, cpt.NDArray | None]:
         """`indicator` is the density-scaling field gamma; `minv` is left to be derived from it."""
         return indicator, None
 
-    def parametrization_jacobian(self):
+    def parametrization_jacobian(self) -> tuple[float, float]:
         """Both mass and stiffness coefficients are gamma itself, so both derivatives are 1."""
         return 1.0, 1.0
 
-    def step_factors(self):
-        """Per-axis finite-difference step factors ``2 * c0**2 * dt**2 / dx**2``."""
+    def step_factors(self) -> list:
+        """Per-axis finite-difference step factors `2 * c0**2 * dt**2 / dx**2`."""
         return [
             self.dtype(2.0 * self.wavespeed**2 * self.dt**2 / dxk**2) for dxk in self.dx
         ]
 
-    def source_factor(self):
-        """Source scaling ``1 / rho0``."""
+    def source_factor(self) -> float:
+        """Source scaling `1 / rho0`."""
         return 1.0 / self.density
 
 
@@ -175,21 +195,23 @@ class AcousticWave(PressureWave):
     kappa1: float = None
     kappa2: float = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Validate the four material constants are set, on top of `Simulation.__post_init__`."""
         super().__post_init__()
         if None in (self.rho1, self.rho2, self.kappa1, self.kappa2):
             raise ValueError("AcousticWave requires rho1, rho2, kappa1, kappa2")
 
-    def parametrization(self, indicator):
-        """`indicator` interpolates inverse density and inverse bulk modulus between phase 1 and 2."""
+    def parametrization(
+        self, indicator: cpt.NDArray
+    ) -> tuple[cpt.NDArray, cpt.NDArray]:
+        """`indicator` interpolates inverse density and inverse bulk modulus between the phases."""
         # gamma interpolates the inverse density and the inverse bulk modulus;
         # the kernel wants 1 / rho, so rho is never formed
         rho_inv = 1 / self.rho1 + indicator * (1 / self.rho2 - 1 / self.rho1)
         kappa_inv = 1 / self.kappa1 + indicator * (1 / self.kappa2 - 1 / self.kappa1)
         return rho_inv, 1 / kappa_inv
 
-    def parametrization_jacobian(self):
+    def parametrization_jacobian(self) -> tuple[float, float]:
         """Derivatives of (mass, stiff) with respect to gamma; both coefficients are affine in it."""
         # both coefficients are affine in gamma once written as (mass, stiff):
         # mass = 1 / kappa and stiff = 1 / rho are the two the interpolation is
@@ -199,19 +221,17 @@ class AcousticWave(PressureWave):
             1 / self.rho2 - 1 / self.rho1,
         )
 
-    def step_factors(self):
-        """Per-axis finite-difference step factors ``2 * dt**2 / dx**2``."""
+    def step_factors(self) -> list:
+        """Per-axis finite-difference step factors `2 * dt**2 / dx**2`."""
         return [self.dtype(2.0 * self.dt**2 / dxk**2) for dxk in self.dx]
 
-    def source_factor(self):
+    def source_factor(self) -> float:
         """Source scaling, unscaled since rho is already folded into `parametrization`."""
         return 1.0
 
 
 # ----------------------------------- kernel helpers ----------------------------------
-
-
-def compile_kernels(sim, path=KERNEL_PATH):
+def compile_kernels(sim: Simulation, path: Path = KERNEL_PATH) -> cp.RawModule:
     """Compile the kernel source at `path` for `sim`, with the stencil table injected as source."""
     options = ["--use_fast_math", f"-DNDIM={sim.ndim}", *sim.compile_flags]
     if sim.precision == "float32":
@@ -222,7 +242,7 @@ def compile_kernels(sim, path=KERNEL_PATH):
     return cp.RawModule(code=code, options=tuple(options))
 
 
-def grid_block(sim):
+def grid_block(sim: Simulation) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """CUDA (grid, block) dimensions for `sim`, fastest axis mapped to x."""
     # map the fastest axis to grid/block x, the next to y, the next to z
     extent = sim.Nx_padded
@@ -233,7 +253,7 @@ def grid_block(sim):
     return grid, block
 
 
-def axis_geometry(sim, factors):
+def axis_geometry(sim: Simulation, factors: list) -> list:
     """Interleave `factors` with axis extents and strides, in the layout the step kernel expects."""
     # kernel args after the material arrays: f0, N0, [f1, N1, s0], [f2, N2, s1]
     geom = [factors[0], sim.Nx[0]]
@@ -243,9 +263,7 @@ def axis_geometry(sim, factors):
 
 
 # -------------------------------- simulation functions -------------------------------
-
-
-def define_step_method(sim, kernels, mat):
+def define_step_method(sim: Simulation, kernels: cp.RawModule, mat: dict) -> Callable:
     """Closure launching the finite-difference step kernel over (u0, u1, u2)."""
     fd_kernel = kernels.get_function("fd_kernel")
     grid, block = grid_block(sim)
@@ -265,7 +283,12 @@ def define_step_method(sim, kernels, mat):
     return fd_step
 
 
-def define_excitation(sim, position, kernels, mat):
+def define_excitation(
+    sim: Simulation,
+    position: cpt.NDArray[cp.int32],
+    kernels: cp.RawModule,
+    mat: dict,
+) -> Callable:
     """Closure injecting `signal` at `position` into `u` at timestep `t_index`."""
     excitation_kernel = kernels.get_function("excitation_kernel")
     threads = 256
@@ -285,8 +308,10 @@ def define_excitation(sim, position, kernels, mat):
     return excitation_step
 
 
-def define_get_signal(sim, sensors, kernels):
-    """Closure writing row `t_index` of the `(N, num_sensors)` record `um` from `u`."""
+def define_get_signal(
+    sim: Simulation, sensors: cpt.NDArray[cp.int32], kernels: cp.RawModule
+) -> Callable:
+    """Closure writing row `t_index` of the (N, num_sensors) record `um` from `u`."""
     get_signal_kernel = kernels.get_function("get_signal_kernel")
     threads = 256
     num_sensors = sensors.shape[1]
@@ -305,14 +330,27 @@ def define_get_signal(sim, sensors, kernels):
 
 
 def simulate(
-    sim,
-    source,
-    indicator,
-    damping=None,
-    sensors=None,
-    record_every=None,
-):
-    """Run `sim` forward under `source` and material `indicator`, optionally recording sensor traces and field snapshots."""
+    sim: Simulation,
+    source: Source,
+    indicator: cpt.NDArray,
+    damping: cpt.NDArray | None = None,
+    sensors: cpt.NDArray[cp.int32] | None = None,
+    record_every: int | None = None,
+) -> cpt.NDArray | tuple:
+    """Run `sim` forward under `source` and material `indicator`.
+
+    Args:
+        sim: the simulation to step, which fixes the grid and the kernels compiled.
+        source: the shot to inject, its signal an (N, num_sources) record.
+        indicator: the design field the materials are built from.
+        damping: optional damping field, which switches on `-DUSE_DAMPING`.
+        sensors: (ndim, num_sensors) grid indices to record at, or None for no record.
+        record_every: snapshot the interior field every this many steps, or None.
+
+    Returns:
+        the final interior field, followed by the (N, num_sensors) record when
+        `sensors` is given and the stacked host snapshots when `record_every` is.
+    """
     U = cp.zeros((2, *sim.Nx_padded), dtype=sim.dtype)
     u0, u1 = U[0], U[1]
 
@@ -325,8 +363,10 @@ def simulate(
         get_signal = define_get_signal(sim, sensors, kernels)
         um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
     interior = tuple(slice(0, n) for n in sim.Nx)
-    field = lambda u: u[interior]
     snapshots = []
+
+    def field(u):
+        return u[interior]
 
     for t in range(sim.N):
         u0 = fd_step(u0, u1, u0)

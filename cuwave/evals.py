@@ -1,10 +1,13 @@
 import cupy as cp
+import cupy.typing as cpt
 
 NAN = float("nan")
 
 
 # -------------------------------------- helpers --------------------------------------
-def _flatten_pair(field, truth):
+def _flatten_pair(
+    field: cpt.NDArray, truth: cpt.NDArray
+) -> tuple[cpt.NDArray, cpt.NDArray]:
     """Ravel field and truth to 1D, checking shapes match."""
     field, truth = cp.asarray(field).ravel(), cp.asarray(truth).ravel()
     if field.shape != truth.shape:
@@ -12,7 +15,7 @@ def _flatten_pair(field, truth):
     return field, truth
 
 
-def _resolve_threshold(truth, threshold=None):
+def _resolve_threshold(truth: cpt.NDArray, threshold: float | None = None) -> float:
     """Return threshold, defaulting to the midpoint of truth's range.
 
     The truth is always split at that midpoint, which is the natural cut for a
@@ -21,7 +24,9 @@ def _resolve_threshold(truth, threshold=None):
     return 0.5 * float(truth.min() + truth.max()) if threshold is None else threshold
 
 
-def _ranked(field, truth):
+def _ranked(
+    field: cpt.NDArray, truth: cpt.NDArray
+) -> tuple[cpt.NDArray, cpt.NDArray, int]:
     """Field and labels ordered by descending damage score. Also returns the positive count."""
     field, truth = _flatten_pair(field, truth)
     label = truth < _resolve_threshold(truth)
@@ -30,10 +35,10 @@ def _ranked(field, truth):
 
 
 # ------------------------------ binary indicator fields ------------------------------
-
-
-def confusion(field, truth, threshold=None):
-    """``(tp, fp, fn, tn)`` from ``field`` split at ``threshold`` and ``truth`` split at its midpoint. ``threshold`` defaults to that same midpoint."""
+def confusion(
+    field: cpt.NDArray, truth: cpt.NDArray, threshold: float | None = None
+) -> tuple[int, int, int, int]:
+    """(tp, fp, fn, tn) counts, `field` split at `threshold` and `truth` at its midpoint."""
     field, truth = _flatten_pair(field, truth)
     label = truth < _resolve_threshold(truth)
     predicted = field < _resolve_threshold(truth, threshold)
@@ -43,31 +48,39 @@ def confusion(field, truth, threshold=None):
     return tp, fp, fn, predicted.size - tp - fp - fn
 
 
-def precision(field, truth, threshold=None):
-    """Share of the detected damage that is true, ``tp / (tp + fp)``"""
+def precision(
+    field: cpt.NDArray, truth: cpt.NDArray, threshold: float | None = None
+) -> float:
+    """Share of the detected damage that is true, `tp / (tp + fp)`"""
     tp, fp, _, _ = confusion(field, truth, threshold)
     return tp / (tp + fp) if tp + fp else NAN
 
 
-def recall(field, truth, threshold=None):
-    """Share of the true damage that is detected, ``tp / (tp + fn)`` (true positive rate)"""
+def recall(
+    field: cpt.NDArray, truth: cpt.NDArray, threshold: float | None = None
+) -> float:
+    """Share of the true damage that is detected, `tp / (tp + fn)` (true positive rate)"""
     tp, _, fn, _ = confusion(field, truth, threshold)
     return tp / (tp + fn) if tp + fn else NAN
 
 
-def false_positive_rate(field, truth, threshold=None):
-    """Share of the intact material flagged as damage, ``fp / (fp + tn)``"""
+def false_positive_rate(
+    field: cpt.NDArray, truth: cpt.NDArray, threshold: float | None = None
+) -> float:
+    """Share of the intact material flagged as damage, `fp / (fp + tn)`"""
     _, fp, _, tn = confusion(field, truth, threshold)
     return fp / (fp + tn) if fp + tn else NAN
 
 
-def f1_score(field, truth, threshold=None):
-    """Harmonic mean of ``precision`` and ``recall``, ``2 tp / (2 tp + fp + fn)``"""
+def f1_score(
+    field: cpt.NDArray, truth: cpt.NDArray, threshold: float | None = None
+) -> float:
+    """Harmonic mean of `precision` and `recall`, `2 tp / (2 tp + fp + fn)`"""
     tp, fp, fn, _ = confusion(field, truth, threshold)
     return 2 * tp / (2 * tp + fp + fn) if tp else 0.0 if fp or fn else NAN
 
 
-def pr_auc(field, truth):
+def pr_auc(field: cpt.NDArray, truth: cpt.NDArray) -> float:
     """Area under the precision-recall curve, as the average precision."""
     score, label, positives = _ranked(field, truth)
     if positives == 0:
@@ -82,9 +95,8 @@ def pr_auc(field, truth):
     return float(cp.sum((recalled - previous) * (tp / counted)))
 
 
-def roc_auc(field, truth):
-    """Area under the receiver operating characteristic, ``recall`` against
-    `false_positive_rate`."""
+def roc_auc(field: cpt.NDArray, truth: cpt.NDArray) -> float:
+    """Area under the receiver operating characteristic, `recall` against `false_positive_rate`."""
     field, truth = _flatten_pair(field, truth)
     label = truth < _resolve_threshold(truth)
     positives = int(cp.count_nonzero(label))
@@ -99,8 +111,8 @@ def roc_auc(field, truth):
     return (ranks - 0.5 * positives * (positives + 1)) / (positives * negatives)
 
 
-def l2_error(field, truth, relative=True):
-    """``L2`` norm of the reconstruction error, normalized by the norm of the truth."""
+def l2_error(field: cpt.NDArray, truth: cpt.NDArray, relative: bool = True) -> float:
+    """L2 norm of the reconstruction error, normalized by the norm of `truth`."""
     field, truth = _flatten_pair(field, truth)
     error = float(cp.linalg.norm(field - truth))
     return error / float(cp.linalg.norm(truth)) if relative else error

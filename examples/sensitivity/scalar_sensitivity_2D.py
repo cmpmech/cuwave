@@ -5,9 +5,12 @@ import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
-from cuwave.sensitivity import l2_misfit, sensitivity
+from cuwave.sensitivity import (
+    l2_misfit,
+    sensitivity,
+    superposition_sensitivity,
+)
 from cuwave.signals import ricker
-from cuwave.superposition import SuperpositionSensitivity
 from cuwave.wave import (
     ScalarWave,
     Source,
@@ -91,16 +94,14 @@ objective = l2_misfit(observed)
 cp.cuda.Stream.null.synchronize()
 tic = time.time()
 if METHOD == "standard":
-    cost, grads, traces = sensitivity(sim, source, indicator, sensors, objective)
-    note = ""
+    cost, grads, traces, info = sensitivity(sim, source, indicator, sensors, objective)
 else:
-    evaluate = SuperpositionSensitivity(
-        sim, source, sensors, scale=SUPERPOSITION_SCALE
+    cost, grads, traces, info = superposition_sensitivity(
+        sim, source, indicator, sensors, objective, scale=SUPERPOSITION_SCALE
     )
-    cost, grads, traces = evaluate(indicator, objective)
-    # how much of the mantissa the B(w, w) - B(u, u) subtraction ate: past ~1e6 in
-    # float32 the gradient is mostly round-off and SUPERPOSITION_SCALE wants raising
-    note = f"\t cancellation {evaluate.last_cancellation:.1e}"
+# how much of the mantissa the B(w, w) - B(u, u) subtraction ate: past ~1e6 in float32
+# the gradient is mostly round-off and SUPERPOSITION_SCALE wants raising
+note = f"\t cancellation {info['cancellation']:.1e}" if info else ""
 cp.cuda.Stream.null.synchronize()
 elapsed = time.time() - tic
 print(f"{METHOD}: cost {cost:.4e}\t {N:d} steps: {elapsed:.2f}s{note}")

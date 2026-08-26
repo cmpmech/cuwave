@@ -1,24 +1,30 @@
 """Boolean region masks on the padded simulation grid
 
-Every helper takes the ``coords`` returned by :func:`cuwave.wave.grid_coords` and an
-optional ``out`` mask to accumulate into: it is created when omitted
+Every helper takes the `coords` returned by `grid_coords` and an optional `out` mask to
+accumulate into: it is created when omitted
 """
 
 import math
+from collections.abc import Sequence
 
 import cupy as cp
+import cupy.typing as cpt
 import numpy as np
 
 
 # -------------------------------------- helpers --------------------------------------
-def _accumulate(mask, out):
+def _accumulate(
+    mask: cpt.NDArray[cp.bool_], out: cpt.NDArray[cp.bool_] | None
+) -> cpt.NDArray[cp.bool_]:
     if out is None:
         return mask
     out |= mask
     return out
 
 
-def _empty(coords, out):
+def _empty(
+    coords: Sequence[cpt.NDArray], out: cpt.NDArray[cp.bool_] | None
+) -> cpt.NDArray[cp.bool_]:
     return cp.zeros(coords[0].shape, dtype=bool) if out is None else out
 
 
@@ -26,8 +32,14 @@ def _empty(coords, out):
 
 
 # ----------------------------------------- 2D ----------------------------------------
-def ellipse(coords, center, radii, angle=0.0, out=None):
-    """Interior of the ellipse with semi-axes ``radii``, rotated by ``angle`` radians"""
+def ellipse(
+    coords: Sequence[cpt.NDArray],
+    center: Sequence[float],
+    radii: Sequence[float],
+    angle: float = 0.0,
+    out: cpt.NDArray[cp.bool_] | None = None,
+) -> cpt.NDArray[cp.bool_]:
+    """Interior of the ellipse with semi-axes `radii`, rotated by `angle` radians"""
     dx = coords[0] - center[0]
     dy = coords[1] - center[1]
     if angle:
@@ -36,22 +48,43 @@ def ellipse(coords, center, radii, angle=0.0, out=None):
     return _accumulate((dx / radii[0]) ** 2 + (dy / radii[1]) ** 2 < 1.0, out)
 
 
-def circle(coords, center, radius, out=None):
-    """Interior of the circle of radius ``radius``"""
+def circle(
+    coords: Sequence[cpt.NDArray],
+    center: Sequence[float],
+    radius: float,
+    out: cpt.NDArray[cp.bool_] | None = None,
+) -> cpt.NDArray[cp.bool_]:
+    """Interior of the circle of radius `radius`"""
     return ellipse(coords, center, (radius, radius), out=out)
 
 
 def random_ellipses(
-    coords,
-    count,
-    radii,
-    bounds,
-    angle=(0.0, math.pi),
-    overlap=True,
-    rng=None,
-    attempts=100,
-    out=None,
-):
+    coords: Sequence[cpt.NDArray],
+    count: int,
+    radii: tuple[float, float],
+    bounds: Sequence[tuple[float, float]],
+    angle: tuple[float, float] = (0.0, math.pi),
+    overlap: bool = True,
+    rng: int | np.random.Generator | None = None,
+    attempts: int = 100,
+    out: cpt.NDArray[cp.bool_] | None = None,
+) -> cpt.NDArray[cp.bool_]:
+    """`count` ellipses at uniformly random centers, semi-axes, and orientations.
+
+    Args:
+        coords: the grid the mask is built on.
+        count: how many ellipses to place.
+        radii: (min, max) a semi-axis is drawn from, independently per axis.
+        bounds: one (low, high) per axis, the box centers are drawn from.
+        angle: (min, max) rotation in radians.
+        overlap: when false, reject a center whose circumscribed circle meets an
+            earlier one, and raise once `attempts` draws in a row are rejected.
+        rng: seed or generator, so a driver reproduces its geometry.
+        out: mask to accumulate into, created when omitted.
+
+    Returns:
+        the accumulated mask, true inside the ellipses.
+    """
     rng = np.random.default_rng(rng)
     out = _empty(coords, out)
     placed = []  # (center, circumscribed radius) of the ellipses accepted so far
@@ -75,16 +108,32 @@ def random_ellipses(
 
 
 def stacked_circles(
-    coords,
-    count,
-    radius,
-    span,
-    center,
-    axis=0,
-    ratio=0.5,
-    order="descending",
-    out=None,
-):
+    coords: Sequence[cpt.NDArray],
+    count: int,
+    radius: float,
+    span: tuple[float, float],
+    center: float | Sequence[float],
+    axis: int = 0,
+    ratio: float = 0.5,
+    order: str | None = "descending",
+    out: cpt.NDArray[cp.bool_] | None = None,
+) -> cpt.NDArray[cp.bool_]:
+    """A row of geometrically shrinking circles, evenly gapped along one axis.
+
+    Args:
+        coords: the grid the mask is built on.
+        count: how many circles to place.
+        radius: the largest radius, which `ratio` shrinks from.
+        span: (start, end) along `axis` the row is fitted into, tangent to both ends.
+        center: the coordinate on each of the other axes.
+        axis: the axis the circles are stacked along.
+        ratio: factor between consecutive radii.
+        order: `descending` or `ascending` along the axis, or None for equal radii.
+        out: mask to accumulate into, created when omitted.
+
+    Returns:
+        the accumulated mask, true inside the circles.
+    """
     if order not in (None, "ascending", "descending"):
         raise ValueError("order must be 'descending', 'ascending' or None")
     if order is None:

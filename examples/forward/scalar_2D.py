@@ -9,28 +9,29 @@ from cuwave.signals import sineburst
 from cuwave.wave import ScalarWave, Source, simulate, stable_dt
 
 # -------------------------------------- settings -------------------------------------
-# implementation
+# discretization
 DIM = 2  # fixed
 PRECISION = "float32"
 THREADS = (4, 128)
 SPACE_ORDER = 8
+RESOLUTION = 500
 SAFETY = 0.99  # fraction of the stable time step
 
 # physics
 LENGTH = 1
 WAVESPEED = 0.5
 DENSITY = 1
-AMPLITUDE = 1e8
-CYCLES = 5
 T = 20
 
-RESOLUTION = 500
+# source
+AMPLITUDE = 1e8
+CYCLES = 5
+FREQUENCY = 20  # bounded by WAVESPEED / (20.0 * min(dx))
 
 # --------------------------------------- setup ---------------------------------------
 Nx = (RESOLUTION,) * DIM
 dx = tuple(LENGTH / (n - 3) for n in Nx)
 dt = SAFETY * stable_dt(dx, WAVESPEED, SPACE_ORDER)
-frequency = 20  # bounded by WAVESPEED / (20.0 * min(dx))
 N = math.ceil(T / dt)
 
 sim = ScalarWave(
@@ -51,7 +52,7 @@ print(f"{WAVESPEED / (FREQUENCY * max(dx)):.0f} points per wavelength")
 
 # --------------------------------------- helper --------------------------------------
 t_np = np.linspace(0, (N - 1) * dt, N)
-signal_np = sineburst(t_np, AMPLITUDE, frequency, CYCLES) / np.prod(dx)
+signal_np = sineburst(t_np, AMPLITUDE, FREQUENCY, CYCLES) / np.prod(dx)
 signal = cp.asarray(signal_np[:, None], dtype=sim.dtype)
 
 source_pos = cp.array([[1] for n in Nx], dtype=cp.int32)
