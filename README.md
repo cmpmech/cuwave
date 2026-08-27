@@ -1,6 +1,6 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".assets/readme-dark.png">
-  <img src=".assets/readme-light.png" alt="CuWave" width="100%">
+  <img src=".assets/readme-light.png" width="100%">
 </picture>
 
 **CuWave** is a single GPU-accelerated differentiable finite difference wave propagation code.
@@ -10,7 +10,8 @@ Possible applications include
 - [**transient acoustic topology optimization**](https://doi.org/10.1007/s00158-025-04237-y)
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".assets/tato-dark.png">
-  <img src=".assets/tato-light.png" alt="transient acoustic topology optimization" align="right" width="30%">
+  <source media="(prefers-color-scheme: light)" srcset=".assets/tato-light.png">
+  <img align="right" width="30%" src=".assets/tato-light.png">
 </picture>
 - [**analog neural networks**](https://www.science.org/doi/10.1126/sciadv.aay6946)
 
