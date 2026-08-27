@@ -5,7 +5,7 @@ import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
-from cuwave.evals import f1_score, l2_error, pr_auc, precision, recall
+from cuwave.evals import f1_score, l2_error, pr_auc
 from cuwave.geometry import stacked_circles
 from cuwave.optimization import Lbfgs
 from cuwave.signals import sineburst

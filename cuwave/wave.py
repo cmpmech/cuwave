@@ -1,7 +1,9 @@
 """Scalar and acoustic wave equations on a padded finite-difference grid.
 
 `Simulation` holds the grid and the compile-time configuration, `PressureWave` adds the
-nodal material fields, and `ScalarWave` / `AcousticWave` supply the parametrization that turns an indicator into those fields. The `define_*` factories bind compiled kernels to one such configuration, and `simulate` loops over the closures they return.
+nodal material fields, and `ScalarWave` / `AcousticWave` supply the parametrization that
+turns an indicator into those fields. The `define_*` factories bind compiled kernels to
+one such configuration, and `simulate` loops over the closures they return.
 """
 
 from __future__ import annotations
@@ -120,8 +122,7 @@ class PressureWave(Simulation):
         """Turn `indicator` (and optional `damping`) into the kernel's material dict."""
         self.damped = damping is not None
         stiff, minv = self.parametrization(indicator)
-        # mirrored in place, so the ghost ring of a caller-supplied indicator is
-        # normalised to the value homogeneous Neumann implies (see mirror_ghosts)
+        # mirrored in place, so a caller's ghost ring is normalised to Neumann
         mat = {"stiff": mirror_ghosts(self, stiff)}
         mat["minv"] = None if minv is None else mirror_ghosts(self, minv)
         if self.damped:
@@ -205,7 +206,6 @@ class AcousticWave(PressureWave):
         self, indicator: cpt.NDArray
     ) -> tuple[cpt.NDArray, cpt.NDArray]:
         """`indicator` interpolates inverse density and inverse bulk modulus between the phases."""
-        # gamma interpolates the inverse density and the inverse bulk modulus;
         # the kernel wants 1 / rho, so rho is never formed
         rho_inv = 1 / self.rho1 + indicator * (1 / self.rho2 - 1 / self.rho1)
         kappa_inv = 1 / self.kappa1 + indicator * (1 / self.kappa2 - 1 / self.kappa1)
@@ -213,9 +213,7 @@ class AcousticWave(PressureWave):
 
     def parametrization_jacobian(self) -> tuple[float, float]:
         """Derivatives of (mass, stiff) with respect to gamma; both coefficients are affine in it."""
-        # both coefficients are affine in gamma once written as (mass, stiff):
-        # mass = 1 / kappa and stiff = 1 / rho are the two the interpolation is
-        # linear in, which is why kappa itself is inverted above
+        # affine in gamma as (mass, stiff) = (1 / kappa, 1 / rho), hence constant
         return (
             1 / self.kappa2 - 1 / self.kappa1,
             1 / self.rho2 - 1 / self.rho1,
@@ -236,8 +234,7 @@ def compile_kernels(sim: Simulation, path: Path = KERNEL_PATH) -> cp.RawModule:
     options = ["--use_fast_math", f"-DNDIM={sim.ndim}", *sim.compile_flags]
     if sim.precision == "float32":
         options.append("-DUSE_FLOAT")
-    # the stencil table is injected as source, so the CuPy module cache keys on
-    # the order without it having to appear in the compile options
+    # injected as source, so the module cache keys on the order without a -D flag
     code = preamble(sim.space_order) + Path(path).read_text()
     return cp.RawModule(code=code, options=tuple(options))
 

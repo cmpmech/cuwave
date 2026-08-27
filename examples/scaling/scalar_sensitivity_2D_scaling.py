@@ -26,13 +26,7 @@ DENSITY = 1
 AMPLITUDE = 1e8
 CYCLES = 5
 
-# Both variants run one forward and one backward sweep, so ~2x the work of the
-# forward scaling driver, and their throughput is close. What separates them is
-# memory: the standard adjoint stores the forward history, N + 2 fields, while the
-# superposition trick reconstructs it by time reversal and holds 3. At N = 20 that
-# measures 27 full grids against 7, so the two upper bounds below differ by about
-# 3.9x in node count. Retune them for your device -- and note the standard bound
-# shrinks as N grows, while the superposition one does not move at all.
+# superposition holds 3 fields where standard holds N + 2; retune for your device
 RESOLUTIONS = {
     "standard": np.logspace(0.7, 3.75, 40).astype(np.int32),  # laptop (RTX PRO 500)
     "superposition": np.logspace(0.7, 4.04, 40).astype(np.int32),
@@ -44,8 +38,7 @@ device_total = cp.cuda.Device().mem_info[1]
 
 results = {}
 for method, resolutions in RESOLUTIONS.items():
-    # first resolution repeated, so the run that pays for kernel compilation is
-    # dropped from the plot
+    # first resolution repeated, so the compiling run is dropped from the plot
     resolutions = np.insert(resolutions, 1, resolutions[0])
     timings = []
     dofs = []
@@ -78,8 +71,7 @@ for method, resolutions in RESOLUTIONS.items():
         source_pos = cp.array([[1] for n in Nx], dtype=cp.int32)
         source = Source(source_pos, signal)
 
-        # one sensor mid-grid; the misfit against a silent record costs nothing to
-        # form and drives an adjoint field of the same size as any objective would
+        # one sensor mid-grid: any objective drives an adjoint field of the same size
         sensors = cp.array([[n // 2] for n in Nx], dtype=cp.int32)
         objective = l2_misfit(cp.zeros((N, 1), dtype=sim.dtype))
 
@@ -99,8 +91,7 @@ for method, resolutions in RESOLUTIONS.items():
 
         dofs.append(np.prod(Nx))
         timings.append((toc - tic) / N)
-        # total_bytes, not used_bytes: the history buffer is freed when the call
-        # returns, so only the pool's high-water mark still shows what it cost
+        # total_bytes, not used_bytes: the history is freed before the call returns
         memory.append(mempool.total_bytes())
 
         del grads, traces, sim, source, indicator, sensors, objective

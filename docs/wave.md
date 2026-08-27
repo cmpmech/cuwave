@@ -7,7 +7,7 @@ a wave simulation is set up as follows:
 	- `ElasticWave`
 2. define source with `Source`
 3. define `indicator` (if heterogeneous)
-4. define postprocessing
+4. define postprocessing (which signals to save)
 5. run simulation with `simulate`
 ## simulate
 `simulate` has two jobs:
@@ -15,7 +15,7 @@ a wave simulation is set up as follows:
 	- `fd_step` (spatial discretization)
 	- `bc_step` (modification for boundary conditions)
 	- `excitation_step` (source contribution)
-2. unrolling of the time integration (where kernels are performed at each time step)
+2. unrolling of the time integration (where kernels are executed at each time step)
 
 - the `Simulation`class (and its derived versions) collect the simulation setup
 - the `define_[kernel]` prepare the specific kernels
@@ -85,9 +85,9 @@ with the Lamé parameters $\lambda$ and $\mu$, solving for the displacement vect
 **TODO** not implemented yet
 
 ## define_\[kernel]
-Every kernel launch in the time loop is prepared by a `define_[kernel]` factory: it is called **once** during setup and returns a closure that launches one compiled kernel. 
+Every kernel launch in the time loop is prepared by a `define_[kernel]` factory: it is called **once** during setup and returns a closure that launches one compiled kernel
 
-Everything that does not change between time steps is resolved at that point: the launch configuration, the flat index arrays, the material and geometry arguments, and the scalar casts.
+Everything that does not change between time steps is resolved at that point: the launch configuration, the flat index arrays, the material and geometry arguments, and the scalar casts
 
 ```python
 args = [None, None, None, *sim.step_kernel_args(mat), *axis_geometry(...)]
@@ -122,8 +122,9 @@ Launches `fd_kernel` over the whole padded grid with `grid_block`, one thread pe
 ### define_excitation
 Flat 1D launch of 256 threads, one thread per source, adding the current signal sample into the field
 ### define_get_signal
-The mirror image of the excitation, one thread per sensor, writing row `t_index` of the recording.
-`simulate` calls it after the buffer swap, so the recorded row is the field that was just computed.
+The mirror image of the excitation, one thread per sensor, writing row `t_index` of the recording
+
+`simulate` calls it after the buffer swap, so the recorded row is the field that was just computed
 ### define_boundary
 see [boundary](boundary.md)
 ### define_gradient

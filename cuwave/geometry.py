@@ -28,10 +28,6 @@ def _empty(
     return cp.zeros(coords[0].shape, dtype=bool) if out is None else out
 
 
-# ----------------------------------------- 1D ----------------------------------------
-
-
-# ----------------------------------------- 2D ----------------------------------------
 def ellipse(
     coords: Sequence[cpt.NDArray],
     center: Sequence[float],
@@ -165,5 +161,3 @@ def stacked_circles(
         circle(coords, origin, r, out)
     return out
 
-
-# ----------------------------------------- 3D ----------------------------------------

@@ -16,24 +16,22 @@ from cuwave.wave import AcousticWave, Source, grid_coords, simulate, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # discretization
-SPACE_ORDER = 2  # the adjoint is the exact transpose only at order 2
-PRECISION = "float32"  # "float32" | "float64"
+SPACE_ORDER = 4
+PRECISION = "float32"
 RESOLUTION = (192, 192)
-SAFETY = 0.7  # fraction of the stable time step
+SAFETY = 0.99
 
 # physics
 # air, solid
 DENSITY1, DENSITY2 = 1.204, 2643.0
 BULK_MODULUS1, BULK_MODULUS2 = 1.419e5, 6.87e8
-FREQUENCY = 200.0
-CYCLES = 3
-AMPLITUDE = 1e3
-POINTS_PER_WAVELENGTH = 10
+AMPLITUDE, FREQUENCY, CYCLES = 1e3, 200.0, 3
+POINTS_PER_WAVELENGTH = 12
 T = 0.10
 
 # geometry (metres)
 LENGTHS = (9.0, 9.0)
-SOURCE_Y = 4.5
+SOURCE_X, SOURCE_Y = 0.0, 4.5
 TARGET_CENTER = (8.0, 4.5)
 TARGET_SIZE = 2.0
 DESIGN_CENTER = (4.5, 4.5)
@@ -42,16 +40,13 @@ DESIGN_SIZE = 4.0  # centered
 # optimization
 ITERATIONS = 40
 LEARNING_RATE = 0.05
-DESIGN_START = 0.5
+DESIGN_START = 0.0  # range [0, 1]
 MINIMIZE = True
 
 # regularization
 RMIN = 0.2
 ETA = 0.5
-BETA0 = 1.0
-BETA_GROWTH = 2.0
-BETA_STEP = 8  # iterations between beta doublings
-BETA_MAX = 64.0
+BETA0, BETA_GROWTH, BETA_STEP, BETA_MAX = 1.0, 2.0, 8, 64.0
 
 # --------------------------------------- setup ---------------------------------------
 Nx = RESOLUTION
@@ -68,8 +63,7 @@ assert FREQUENCY <= f_max, (
     f"lower FREQUENCY or raise RESOLUTION"
 )
 
-# the design enters through the indicator argument, not the constructor, so one sim
-# serves every iteration
+# the design enters through the indicator, not the constructor, so one sim serves all
 sim = AcousticWave(
     Nx,
     dx,
@@ -87,7 +81,7 @@ sim = AcousticWave(
 # --------------------------------------- source --------------------------------------
 t = np.linspace(0, (N - 1) * dt, N)
 signal = sineburst(t, AMPLITUDE, FREQUENCY, CYCLES) / np.prod(dx)
-src_j = to_index((0.0, SOURCE_Y))[1]
+src_j = to_index((SOURCE_X, SOURCE_Y))[1]
 source = Source(
     cp.array([[1], [src_j]], dtype=cp.int32),
     cp.asarray(signal[:, None], dtype=sim.dtype),
@@ -192,7 +186,6 @@ axes[1].add_patch(
 )
 axes[1].plot(0, src_j - 1, "ko", markersize=4)
 axes[1].set_aspect("equal")
-axes[1].set_xticks([])
-axes[1].set_yticks([])
+axes[1].axis("off")
 fig.tight_layout()
 plt.show()

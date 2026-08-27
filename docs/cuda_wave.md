@@ -27,10 +27,10 @@ with $D_i^+/\Delta x\approx\partial u/\partial x$ at $x_{i+1/2}$, and $D_i^-=D_{
 ### OP_W, OP_C
 contain the finite difference weights:
 - `OP_C(r,k)` with `r` as stencil order and `k` as stencil index: $r, k\in[0,R-1]$
-- `OP_W(r,k)` makes it 1-index, so that $r,k\in[1,R]$  
+- `OP_W(r,k)` makes it 1-index, so that $r,k\in[1,R]$
 - $R$ is the (maximum) `STENCIL_RADIUS`
 ### CLOSURE
-computes the current stencil radius based on the distance `a` to the boundary in the axis direction 
+computes the current stencil radius based on the distance `a` to the boundary in the axis direction
 - `a` and `N-1-a` are the distances to the two ghost nodes, so the radius grades **down** towards a wall: the first interior node gets radius 1 (order 2), the deep interior saturates at $R$
 ### flux_divergence_axis
 **aim**
@@ -51,7 +51,7 @@ $$\nabla_{i-\frac{1}{2}}\approx \frac{1}{h}\sum_{k=1}^r w_{r,k}(u_{i+(k-1)}-u_{i
 
 ### BC_PARAMS, BC_GEOM
 macro pair carrying the dimension-dependent tail of the boundary kernel signature
-* `BC_PARAMS` expands to the grid-size (`N0,N1,...`) and stride (`s0,s1,...`) parameters for the current `NDIM` 
+* `BC_PARAMS` expands to the grid-size (`N0,N1,...`) and stride (`s0,s1,...`) parameters for the current `NDIM`
 - `BC_GEOM` expands to local arrays `n[NDIM]` (grid sizes) and `s[NDIM]` (strides, fastest axis fixed to 1), packing the `BC_PARAMS` scalars for dimension-generic indexing: enables `bc_ghost`to keep one loop over axes instead of an `#if` per dimension
 ### bc_ghost
 **aim**
@@ -73,7 +73,7 @@ compute next step $u^{n+1}$ based on central difference approximation in space &
 **how?**
 - central difference in time, explicit, with $\Delta t^2$ already folded into $f_d$
 $$u^{n+1}\approx\frac{1}{1+\beta}\left(2 u^{n} - u^{n-1}(1-\beta) + \frac{1}{m}\nabla\cdot (k\nabla u^n)\right),\qquad\beta=\frac{d\,\Delta t}{2m}$$
-- without `-DUSE_DAMPING` the $\beta$ branch is not compiled at all and the update is 
+- without `-DUSE_DAMPING` the $\beta$ branch is not compiled at all and the update is
 $$u^{n+1}=-u^{n-1}+2u^n+m^{-1}\nabla\cdot(k\nabla u^n)$$
 ### homogeneous_neumann_kernel
 **parallelization**

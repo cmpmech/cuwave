@@ -11,16 +11,18 @@ Common **helpers** ease the creation of driver files for applied problem setups
 ## forward simulation
 - [wave](wave.md) with [forward CUDA](cuda_wave.md) kernels
 - [stencils](stencils.md)
-- [integrators](integrators.md) 
 - [boundary](boundary.md)
 ## sensitivity analysis
 - [sensitivity](sensitivity.md) with [backward CUDA](cuda_wave_sensitivity.md) kernels
 ## optimization
 - [regularization](regularization.md)
+- [neural networks](nn.md)
 - [optimization](optimization.md)
-- [uncertainty](uncertainty.md)
+## applications
+- [full waveform inversion](fwi.md)
+- [transient acoustic topology optimization](tato.md)
 ## problem helpers
 - [signals](signals.md)
 - [geometry](geometry.md)
-- [utils](utils.md) 
+- [utils](utils.md)
 - [evals](evals.md)

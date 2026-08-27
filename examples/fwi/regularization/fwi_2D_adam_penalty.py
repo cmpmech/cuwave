@@ -5,7 +5,7 @@ import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
-from cuwave.evals import f1_score, l2_error, pr_auc, precision, recall
+from cuwave.evals import f1_score, l2_error, pr_auc
 from cuwave.geometry import stacked_circles
 from cuwave.optimization import Adam
 from cuwave.regularization import Tikhonov, TotalVariation
@@ -130,9 +130,7 @@ print(
 )
 
 # ------------------------------------ optimization -----------------------------------
-# the penalty covers the padded grid, where the misfit gradient vanishes -- harmless,
-# since both penalties are minimized by a flat field and the pad therefore keeps the
-# background value it starts at
+# the penalty covers the pad too, harmlessly: a flat field minimizes both
 gamma = cp.ones(sim.Nx_padded, dtype=sim.dtype)
 if PENALTY == "tv":
     penalty = TotalVariation(WEIGHT, eps=TV_EPS)

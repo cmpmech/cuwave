@@ -15,10 +15,7 @@ from cuwave.wave import AcousticWave, Source, stable_dt
 # discretization
 SPACE_ORDER = 2  # the adjoint is the exact transpose only at order 2
 PRECISION = "float32"  # "float32" | "float64"
-# "standard" keeps the forward history and is the exact discrete gradient;
-# "superposition" reconstructs it by time reversal -- 3 fields instead of N + 2, at
-# the price of a consistent-not-exact gradient and a scale to pick
-METHOD = "standard"  # "standard" | "superposition"
+METHOD = "standard"  # "standard" | "superposition", the memory-efficient alternative
 SUPERPOSITION_SCALE = 1e4  # aim for a cancellation near 1e4 in float32
 RESOLUTION = (192, 192)
 SAFETY = 0.7  # fraction of the stable time step
@@ -71,9 +68,7 @@ sim = AcousticWave(
     kappa2=BULK_MODULUS2,
 )
 
-# a design FIELD of zeros, not the number 0: the map plotted below is a sensitivity
-# per node, and the interpolation from air (0) to solid (1) lives in the sim's
-# parametrization, so the driver only ever hands over the indicator
+# a design FIELD of zeros, not the number 0: the plot below is a sensitivity per node
 indicator = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
 
 # --------------------------------------- source --------------------------------------
@@ -97,8 +92,7 @@ sensors = cp.stack([box_i.ravel(), box_j.ravel()]).astype(cp.int32)
 # --------------------------------------- solve ---------------------------------------
 def box_energy(sim: AcousticWave) -> Callable:
     """Objective factory: J = 1/2 int_box int_t p^2, the energy leaking into the box."""
-    # Only its derivative reaches the adjoint, so any differentiable cost works; the
-    # prod(dx) dt that turns the sum into an integral belongs here, not in the module.
+    # the prod(dx) dt that makes the sum an integral belongs here, not the module
     scale = float(np.prod(sim.dx)) * sim.dt
 
     def objective(traces):
@@ -116,8 +110,7 @@ else:
     cost, grads, traces, info = superposition_sensitivity(
         sim, source, indicator, sensors, objective, scale=SUPERPOSITION_SCALE
     )
-# how much of the mantissa the B(w, w) - B(u, u) subtraction ate: past ~1e6 in float32
-# the gradient is mostly round-off and SUPERPOSITION_SCALE wants raising
+# past ~1e6 in float32 the gradient is mostly round-off; raise SUPERPOSITION_SCALE
 note = f"\t cancellation {info['cancellation']:.1e}" if info else ""
 cp.cuda.Stream.null.synchronize()
 elapsed = time.time() - tic
@@ -127,8 +120,7 @@ print(
     f" {N:d} steps: {elapsed:.2f}s{note}"
 )
 
-# chain rule: mass = 1 / kappa and stiff = 1 / rho are the two fields the
-# interpolation is linear in, so the Jacobian is a pair of constants
+# chain rule: linear in 1 / kappa and 1 / rho, so the Jacobian is a pair of constants
 d_mass, d_stiff = sim.parametrization_jacobian()
 gradient = (d_mass * grads["mass"] + d_stiff * grads["stiff"]).get()
 

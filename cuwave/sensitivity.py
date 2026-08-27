@@ -1,6 +1,6 @@
 """Adjoint sensitivities in two variants, same arguments and same return.
 
-`sensitivity` stores the forward field -- N + 2 grids -- and is the exact transpose of
+`sensitivity` stores the forward field (N + 2 grids) and is the exact transpose of
 the discretisation. `superposition_sensitivity` reconstructs that field by time
 reversal in three slots instead, trading the memory for a consistent-not-exact
 gradient and a `scale` the caller has to set. Both share the cell weights and the
@@ -28,12 +28,9 @@ from .wave import (
 
 KERNEL_PATH = Path(__file__).parent / "kernels" / "wave_sensitivity.cu"
 
-# one step, so the adjoint lands on the centre of the reconstructed forward triplet the
-# way the exact transpose pairs them; getting it wrong costs a factor five in accuracy
-ADJOINT_DELAY = 1
+ADJOINT_DELAY = 1  # lines the adjoint up with the reconstructed forward triplet
 
-# cancellation past which the B(w, w) - B(u, u) subtraction has eaten too much of the
-# mantissa to trust -- about two decimal digits short of what the precision carries
+# cancellation past which B(w, w) - B(u, u) has eaten too much of the mantissa to trust
 CANCELLATION_LIMIT = {"float32": 1e5, "float64": 1e12}
 
 
@@ -48,12 +45,7 @@ def l2_misfit(observed: cpt.NDArray) -> Callable:
     return objective
 
 
-# W is the cell volume a node owns -- 1 in the interior, 1/2 on a face, 1/4 in a corner
-# -- and the adjoint identity L^T = W L W^-1 puts it on the gradient and 1/W on the
-# adjoint source. Without them a face ring comes out exactly 2x too large per boundary
-# axis. W is never materialised, so it is computed twice, slice-wise for the gradient
-# and per node for the source, and the two have to agree node for node. The Dirichlet
-# case needs no variant of it: see docs/sensitivity.md.
+# W is the cell volume a node owns; docs/sensitivity.md derives it
 def apply_cell_weights(sim: Simulation, field: cpt.NDArray) -> cpt.NDArray:
     """In-place multiply of `field` by the cell weights W."""
     # axes in sequence, so a corner compounds to 1/4 (1/8 in 3D)
@@ -67,8 +59,7 @@ def apply_cell_weights(sim: Simulation, field: cpt.NDArray) -> cpt.NDArray:
 
 def sensor_cell_weights(sim: Simulation, sensors: cpt.NDArray[cp.int32]) -> cpt.NDArray:
     """Cell weights W at the sensor nodes only, as a (num_sensors,) vector."""
-    # the same nested loop as apply_cell_weights rather than a membership test, so the
-    # two agree even on a degenerate axis where Nx[d] - 2 == 1
+    # the nested loop of apply_cell_weights, so the two agree on a degenerate axis too
     w = cp.ones(sensors.shape[1], dtype=sim.dtype)
     for d in range(sim.ndim):
         for index in (1, sim.Nx[d] - 2):
@@ -80,9 +71,7 @@ def require_interior(
     sim: Simulation, position: cpt.NDArray[cp.int32], what: str
 ) -> None:
     """Raise if any node of `position` sits on a ghost node, naming it `what`."""
-    # a ghost node is a slaved mirror carrying no equation, so a sensor on one injects
-    # the objective derivative into nothing and corrupts the gradient over the whole
-    # grid -- and Nx[d] - 1 rather than Nx[d] - 2 is an easy off-by-one to write
+    # a ghost node carries no equation, so a sensor there corrupts the whole gradient
     lo = int(cp.min(position))
     if lo < 1:
         raise ValueError(f"{what} on a ghost node: index {lo} < 1")
@@ -120,8 +109,7 @@ def adjoint_signal(
         delay: entries dropped from the front and zero-padded at the back, which
             starts the adjoint recursion that many steps earlier in its own sequence.
     """
-    # define_excitation supplies the remaining dt^2 source_factor minv, which is
-    # exactly the m the adjoint recursion wants
+    # define_excitation supplies the dt^2 source_factor minv the recursion wants
     signal = cp.asarray(dphi, dtype=sim.dtype)[::-1] / (
         sensor_cell_weights(sim, sensors) * sim.source_factor()
     )
@@ -133,8 +121,7 @@ def adjoint_signal(
 # ----------------------------------- kernel helpers ----------------------------------
 def define_gradient(sim: Simulation, kernels: cp.RawModule, mat: dict) -> Callable:
     """Closure accumulating both gradient densities from a forward triplet and `l1`."""
-    # one kernel for both gradients, and a prebuilt argument list mutated in place: a
-    # launch costs more host time than either gradient body costs on the device
+    # one kernel for both gradients: a launch costs more host time than either body
     gradient_kernel = kernels.get_function("gradient_kernel")
     grid, block = grid_block(sim)
     # the operator without the dt^2 the step folds into it: L, not dt^2 L
@@ -154,12 +141,10 @@ def define_gradient(sim: Simulation, kernels: cp.RawModule, mat: dict) -> Callab
 
 def define_frechet(sim: Simulation, kernels: cp.RawModule, sign: float) -> Callable:
     """Closure accumulating both Frechet densities of one field triplet, times `sign`."""
-    # sign is a compile-time constant of the pass -- it subtracts the forward diagonal
-    # and adds the superposed one -- so it is folded into the factors, not recomputed
+    # sign is fixed per pass, so it is folded into the factors rather than recomputed
     frechet_kernel = kernels.get_function("frechet_kernel")
     grid, block = grid_block(sim)
-    # [ft, f0, N0, f1, N1, s0, ...]: the axis triples follow the (factor, N, stride)
-    # order of wave.axis_geometry, s0 the stride of the *previous* axis
+    # [ft, f0, N0, f1, N1, s0, ...], the axis triples as in wave.axis_geometry
     geom = [sim.dtype(sign / (2.0 * sim.dt) ** 2)]
     for d in range(sim.ndim):
         geom.append(sim.dtype(sign / (2.0 * sim.dx[d]) ** 2))
@@ -218,11 +203,9 @@ def sensitivity(
     gradient_step = define_gradient(sim, sens_kernels, mat)
 
 # ------------------------------------ forward pass -----------------------------------
-    # stepped straight into the history buffer, so the two leading zero slots are
-    # u^-2 / u^-1 and no copy is needed: u^n lives in V[n + 2]
+    # stepped straight into the history, so the leading zeros are u^-2 / u^-1
     V = cp.zeros((sim.N + 2, *sim.Nx_padded), dtype=sim.dtype)
-    # the slot views, made once: V[t] is a host-side slice costing ~1.5 us, more than
-    # the kernel it feeds, and each pass below takes three or four of them per step
+    # the slot views made once: V[t] is a host slice costing more than its own kernel
     slot = [V[t] for t in range(sim.N + 2)]
 
     for t in range(sim.N):
@@ -230,10 +213,7 @@ def sensitivity(
         u = excitation_step(u, source.signal, t)
         u = bc_step(u)
 
-    # the traces are gathered off the history rather than probed per step: every field
-    # is still on the device, and one launch saved per step is a quarter of this pass.
-    # The sensors are interior by require_interior, so ghost mirroring never touches
-    # them and reading after the loop matches reading inside it.
+    # gathered off the history rather than probed per step, saving one launch a step
     um = V[2:].reshape(sim.N, -1)[:, flatten_indices(sim, sensors)]
 
     cost, dphi = objective(um)
@@ -254,8 +234,7 @@ def sensitivity(
         p0 = adjoint_excitation(p0, signal, m)
         p0 = bc_step(p0)
         p1, p0 = p0, p1  # p1 now holds lambda^n
-        # the inertia term pairs lambda^n with the whole u^n .. u^{n-2} triplet, the
-        # stiffness term with u^{n-1} alone -- the middle slot of that same triplet
+        # inertia pairs lambda^n with the whole triplet, stiffness with its middle slot
         gradient_step(g_mass, g_stiff, slot[n], slot[n + 1], slot[n + 2], p1)
 
     apply_cell_weights(sim, g_mass)
@@ -329,14 +308,9 @@ def superposition_sensitivity(
     cost, dphi = objective(um)
 
 # --------------------------------- adjoint excitation --------------------------------
-    # how big the forward diagonal is before the backward pass cancels it: the ratio to
-    # what survives is the factor by which the subtraction lost precision, so a scale
-    # orders too small shows up here instead of quietly returning noise
+    # the forward diagonal before the backward pass cancels it, for `cancellation`
     before = float(cp.linalg.norm(acc_stiff))
-    # the adjoint columns then the forward source reversed, so the backward loop shares
-    # one row index -- and concatenating the two positions makes them one launch rather
-    # than two, sound for a sensor sitting on the source only because excitation_kernel
-    # accumulates with atomicAdd
+    # concatenated into one launch, sound because excitation_kernel uses atomicAdd
     backward_position = cp.concatenate((sensors, source.position), axis=1)
     backward_signal = cp.ascontiguousarray(
         cp.concatenate(
@@ -350,9 +324,7 @@ def superposition_sensitivity(
     backward_excitation = define_excitation(sim, backward_position, kernels, mat)
 
 # ----------------------------------- backward pass -----------------------------------
-    # u0 / u1 hold u^(N-1) / u^(N-2): the reversed recursion walks the forward field
-    # back while the adjoint source is superposed on top, so the one array carries
-    # u + k lambda and B(w, w) is added to the same accumulators
+    # u0 / u1 hold u^(N-1) / u^(N-2), so the one array carries u + k lambda
     u0, u1 = u1, u0
     for t in range(sim.N):
         u2 = fd_step(u0, u1, u2)
@@ -374,10 +346,7 @@ def superposition_sensitivity(
             stacklevel=2,
         )
 
-    # B(u, lambda) = [B(w, w) - B(u, u)] / 2k, then the same signs and cell weights
-    # sensitivity applies: + on the mass term, - on the stiffness one. Scaled in place
-    # -- the accumulators are private to this call, and at the resolutions this variant
-    # exists for a spare temporary is a field.
+    # B(u, lambda) = [B(w, w) - B(u, u)] / 2k, scaled in place to spare a field
     norm = sim.dtype(1.0 / (2.0 * scale))
     apply_cell_weights(sim, acc_mass)
     acc_mass *= norm

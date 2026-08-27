@@ -23,10 +23,7 @@ from cuwave.wave import (
 # discretization
 SPACE_ORDER = 2  # the adjoint is the exact transpose only at order 2
 PRECISION = "float32"  # "float32" | "float64"
-# "standard" keeps the forward history and is the exact discrete gradient;
-# "superposition" reconstructs it by time reversal -- 3 fields instead of N + 2, at
-# the price of a consistent-not-exact gradient and a scale to pick
-METHOD = "standard"  # "standard" | "superposition"
+METHOD = "standard"  # "standard" | "superposition", the memory-efficient alternative
 SUPERPOSITION_SCALE = 1e2  # aim for a cancellation near 1e4 in float32
 RESOLUTION = 240
 SAFETY = 0.99  # fraction of the stable time step
@@ -64,9 +61,7 @@ sim = ScalarWave(
     density=DENSITY,
 )
 
-# the indicator scales inertia and stiffness alike, so it is a density ratio: the
-# wave speed -- and with it the stable dt -- is the same inside the inclusion as out,
-# however violent the contrast
+# a density ratio, so the wave speed is the same inside the inclusion as out
 x, y = grid_coords(Nx, dx, dtype=sim.dtype)
 hole = (x - LENGTH / 2) ** 2 + (y - LENGTH / 2) ** 2 < RADIUS**2
 true_indicator = cp.where(hole, DENSITY0 / DENSITY, 1.0).astype(sim.dtype)
@@ -99,15 +94,13 @@ else:
     cost, grads, traces, info = superposition_sensitivity(
         sim, source, indicator, sensors, objective, scale=SUPERPOSITION_SCALE
     )
-# how much of the mantissa the B(w, w) - B(u, u) subtraction ate: past ~1e6 in float32
-# the gradient is mostly round-off and SUPERPOSITION_SCALE wants raising
+# past ~1e6 in float32 the gradient is mostly round-off; raise SUPERPOSITION_SCALE
 note = f"\t cancellation {info['cancellation']:.1e}" if info else ""
 cp.cuda.Stream.null.synchronize()
 elapsed = time.time() - tic
 print(f"{METHOD}: cost {cost:.4e}\t {N:d} steps: {elapsed:.2f}s{note}")
 
-# chain rule: the module differentiates w.r.t. the two material fields, the
-# parametrization maps them back onto the indicator
+# chain rule from the two material fields back onto the indicator
 d_mass, d_stiff = sim.parametrization_jacobian()
 gradient = (d_mass * grads["mass"] + d_stiff * grads["stiff"]).get()
 

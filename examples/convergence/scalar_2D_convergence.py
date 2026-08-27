@@ -20,10 +20,7 @@ THREADS = (4, 128)
 
 # discretization
 SPACE_ORDERS = (2, 4, 6, 8)
-# nine levels evenly spaced in log from 32 to 512, alternating the ratios 3/2 and 4/3.
-# every one has to divide REFERENCE, so that the reference restricts onto it by strided
-# slicing -- interpolating instead would add an O(dx**2) error to the rate measured here
-LEVELS = (32, 48, 64, 96, 128, 192, 256, 384, 512)  # cells per axis
+LEVELS = (32, 48, 64, 96, 128, 192, 256, 384, 512)  # cells per axis, log-spaced
 REFERENCE = 1536  # cells per axis: 3x the finest level, and a multiple of every one
 REFERENCE_SAFETY = 0.25  # the reference refines in time as well as in space
 REFERENCE_ORDER = 12
@@ -79,8 +76,7 @@ def solve(
     """
     Nx = (n_el + 3,) * DIM
     dx = (LENGTH / n_el,) * DIM
-    # dt divides T exactly, so every run in the sweep lands on the same final time:
-    # simulate returns the field after N steps, at N * dt rather than (N - 1) * dt
+    # dt divides T exactly, so every level lands on the same final time
     N = math.ceil(T / dt_stable)
     dt = T / N
 
@@ -100,8 +96,7 @@ def solve(
         coords = grid_coords(Nx, dx, dtype=sim.dtype)
         indicator[circle(coords, (0.5 * LENGTH,) * DIM, RADIUS)] = GAMMA_HOLE
 
-    # the burst ends at CYCLES / FREQUENCY, far short of T: the log singularity a 2D
-    # point source carries lives only while it fires, so the final field is smooth
+    # the burst ends far short of T, so the final field is smooth
     signal = sineburst(np.arange(N) * dt, AMPLITUDE, FREQUENCY, CYCLES)
     source = point_source(sim, [(0.0, 0.5 * LENGTH)], signal)
 
@@ -159,9 +154,7 @@ plt.show()
 
 levels = np.array(LEVELS, dtype=float)
 for space_order, (_, errors, _) in results.items():
-    # pairwise, not one fitted slope: where a curve floors -- order 2 does, on the
-    # grid-scale content the point source radiates -- a slope averaged over the whole
-    # sweep reports neither the rate before the floor nor the floor itself
+    # pairwise, not one fitted slope, so a curve that floors still shows its rate
     errors = np.array(errors)
     rates = np.log(errors[:-1] / errors[1:]) / np.log(levels[1:] / levels[:-1])
     print(

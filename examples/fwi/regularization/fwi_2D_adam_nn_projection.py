@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from cuwave.evals import f1_score, l2_error, pr_auc, precision, recall
+from cuwave.evals import f1_score, l2_error, pr_auc
 from cuwave.geometry import stacked_circles
 from cuwave.nn import Generator, nn_params
 from cuwave.regularization import Projection, continuation

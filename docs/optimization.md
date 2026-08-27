@@ -30,12 +30,12 @@ $$\textrm{scaling:}\qquad q\leftarrow\gamma_kq,\qquad\gamma_k=\frac{s_k^\top y_k
 $$\textrm{forward (oldest to newest):}\qquad\beta_i=\rho_i\,y_i^\top r,\qquad r\leftarrow r+\left(\alpha_i-\beta_i\right)s_i$$
 starting the forward pass from $r=q$ and yielding $r\approx H\,g$ with $H\approx\left(\partial^2C/\partial x^2\right)^{-1}$, hence the quasi-Newton update $x\leftarrow x-\eta\,r$ with the step size `lr` $\eta$
 
-The scaling $\gamma_k$ of the newest pair is the initial inverse Hessian $H_0=\gamma_k\mathbf{I}$ the recursion starts from ([Nocedal & Wright 2006](https://doi.org/10.1007/978-0-387-40065-5), eq. 7.20) and it is what puts the step into the units of the design: without it the returned direction has the size of the *gradient*, whose scale is set by the physics of the problem, and the step length is left to $\eta$ -- which is then wrong as soon as the first pair enters
+The scaling $\gamma_k$ of the newest pair is the initial inverse Hessian $H_0=\gamma_k\mathbf{I}$ the recursion starts from ([Nocedal & Wright 2006](https://doi.org/10.1007/978-0-387-40065-5), eq. 7.20) and it is what puts the step into the units of the design: without it the returned direction has the size of the *gradient*, whose scale is set by the physics of the problem, and the step length is left to $\eta$ — which is then wrong as soon as the first pair enters
 
 ### Line search
 `search` accepts the proposal $x_\textrm{new}$ of `step` only where it decreases the objective by the margin the Armijo (or sufficient-decrease) condition asks for ([Nocedal & Wright 2006](https://doi.org/10.1007/978-0-387-40065-5), eq. 3.4), halving the step until it does
 $$p=x_\textrm{new}-x,\qquad C\left(\Pi\left(x+\alpha p\right)\right)\le C\left(x\right)+c_1\alpha\,g^\top p$$
-starting from $\alpha=1$ and multiplying $\alpha$ by `shrink` on every rejection, with the constant $c_1$ `armijo` and the projection $\Pi$ `project` -- the box constraints, which the search applies to every trial and hence to the design it returns. A trial is one evaluation of the objective and no sensitivity analysis, which for a wave problem is about a third of the cost of the gradient it backtracks on
+starting from $\alpha=1$ and multiplying $\alpha$ by `shrink` on every rejection, with the constant $c_1$ `armijo` and the projection $\Pi$ `project` — the box constraints, which the search applies to every trial and hence to the design it returns. A trial is one evaluation of the objective and no sensitivity analysis, which for a wave problem is about a third of the cost of the gradient it backtracks on
 
 The recursion keeps $g^\top p<0$, so the margin is negative and the condition is a genuine decrease. It is nevertheless a condition that may not be met: below the floor `min_alpha` the search stops and returns the last trial, decrease or not, leaving it to the driver to notice through the returned $\alpha$
 
@@ -47,4 +47,4 @@ Without a pair the recursion returns the gradient itself and $\gamma_k$ never sc
 | update | `step(x, grad)` | records the pair of the preceding step, applies the recursion and returns the new design |
 | line search | `search(x, grad, cost, f, project=lambda x: x)` | backtracks the proposal of `step` until the Armijo condition holds against `cost`, evaluating the objective through `f(design)`, and returns `(design, cost, alpha, trials)` |
 
-Pairs of non-positive curvature $y^\top s\le0$ are skipped, since they would flip the sign of $\rho$ and with it the direction 
+Pairs of non-positive curvature $y^\top s\le0$ are skipped, since they would flip the sign of $\rho$ and with it the direction

@@ -17,18 +17,12 @@ from cuwave.wave import ScalarWave, grid_coords, simulate, stable_dt
 DIM = 2  # fixed
 PRECISION = "float64"  # float32 floors the relative error near 1e-7
 THREADS = (4, 128)
-# "standard" keeps the forward history -- N + 2 grids, which is what caps REFERENCE
-# below -- and is the exact transpose; "superposition" runs in three slots instead and
-# lifts that cap, at the price of a consistent-not-exact gradient and a scale to pick
-METHOD = "standard"  # "standard" | "superposition"
+METHOD = "standard"  # "standard" | "superposition", the memory-efficient alternative
 SUPERPOSITION_SCALE = 1e6  # aim for a cancellation near 1e6 in float64
 
 # discretization
 SPACE_ORDERS = (2, 4, 6, 8)
-# every level has to divide REFERENCE, so that the reference restricts onto it by
-# strided slicing, and be a multiple of SENSOR_DIVISOR, so that the sensors land on
-# nodes at the same physical points on all of them
-LEVELS = (32, 48, 64, 96, 128, 192)  # cells per axis
+LEVELS = (32, 48, 64, 96, 128, 192)  # cells per axis, log-spaced
 REFERENCE = 384  # cells per axis: 2x the finest level, and a multiple of every one
 REFERENCE_SAFETY = 0.5  # the reference refines in time as well as in space
 REFERENCE_ORDER = 12
@@ -48,10 +42,7 @@ SENSOR_DIVISOR = 16  # sensors at k * LENGTH / this along the left edge, k = 1 .
 
 # geometry
 RADIUS = 0.1
-# a staircased inclusion is only O(dx)-consistent across the levels and would cap
-# every order there; a finite transition width resolves on all of them. 0.0 is the
-# sharp disk of examples/sensitivity/scalar_sensitivity_2D.py
-SMOOTHING = 0.02
+SMOOTHING = 0.02  # a finite width resolves on every level; 0.0 is a sharp disk
 
 # postprocessing
 COLORS = ("k", "b", "g", "r")  # one per entry of SPACE_ORDERS
@@ -108,9 +99,7 @@ def gradient_of(
         density=DENSITY,
     )
 
-    # the indicator scales inertia and stiffness alike, so it is a density ratio: the
-    # wave speed -- and with it the stable dt -- is the same inside the inclusion as
-    # out, however violent the contrast
+    # a density ratio, so the wave speed is the same inside the inclusion as out
     x, y = grid_coords(Nx, dx, dtype=sim.dtype)
     r = cp.sqrt((x - 0.5 * LENGTH) ** 2 + (y - 0.5 * LENGTH) ** 2)
     if SMOOTHING:
@@ -119,14 +108,12 @@ def gradient_of(
         inside = r < RADIUS
     true_indicator = (1.0 + (DENSITY0 / DENSITY - 1.0) * inside).astype(sim.dtype)
 
-# --------------------------------------- source --------------------------------------
     signal = ricker(np.arange(N) * dt, AMPLITUDE, FREQUENCY)
     source = point_source(sim, [(0.0, 0.5 * LENGTH)], signal)
     # fixed physical points, so the misfit is the same functional on every level
     rows = np.arange(1, SENSOR_DIVISOR) * (n_el // SENSOR_DIVISOR) + 1
     sensors = cp.array([np.full(rows.size, 1), rows], dtype=cp.int32)
 
-# -------------------------------------- measure --------------------------------------
     _, observed = simulate(sim, source, true_indicator, sensors=sensors)
     indicator = cp.ones(sim.Nx_padded, dtype=sim.dtype)
     objective = l2_misfit(observed)
@@ -142,16 +129,12 @@ def gradient_of(
     cp.cuda.Stream.null.synchronize()
     toc = time.time()
 
-    # chain rule: the module differentiates w.r.t. the two material fields, the
-    # parametrization maps them back onto the indicator
+    # chain rule from the two material fields back onto the indicator
     d_mass, d_stiff = sim.parametrization_jacobian()
     gradient = d_mass * grads["mass"] + d_stiff * grads["stiff"]
-    # the gradients come back over the *padded* grid, so the interior is taken against
-    # the logical Nx: slice(1, -1) would reach into the padding of the fastest axis
+    # against the logical Nx: slice(1, -1) would reach into the padding
     interior = tuple(slice(1, n - 1) for n in Nx)
-    # the nodal gradient is an integral over the node's cell and over a sum the
-    # timestep never weighted, so dt / dx**DIM turns it into the density the levels
-    # share -- without it the comparison measures the units, not the discretization
+    # dt / dx**DIM: nodal integral -> density, so the levels are comparable
     return (
         gradient[interior].copy() * (dt / np.prod(dx)),
         toc - tic,
