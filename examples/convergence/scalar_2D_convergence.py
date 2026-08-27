@@ -26,6 +26,7 @@ SPACE_ORDERS = (2, 4, 6, 8)
 LEVELS = (32, 48, 64, 96, 128, 192, 256, 384, 512)  # cells per axis
 REFERENCE = 1536  # cells per axis: 3x the finest level, and a multiple of every one
 REFERENCE_SAFETY = 0.25  # the reference refines in time as well as in space
+REFERENCE_ORDER = 12
 SAFETY = 0.99  # fraction of the stable time step, which every run takes in full
 
 # physics
@@ -53,7 +54,6 @@ if any(REFERENCE % n_el for n_el in LEVELS):
 if len(COLORS) < len(SPACE_ORDERS):
     raise ValueError(f"{len(COLORS)} colors for {len(SPACE_ORDERS)} space orders")
 
-order_max = max(SPACE_ORDERS)
 interior = (slice(1, -1),) * DIM  # the returned field still carries its ghost ring
 
 print(
@@ -116,11 +116,11 @@ def solve(
 
 # ------------------------------------- reference -------------------------------------
 dt_reference = REFERENCE_SAFETY * stable_dt(
-    (LENGTH / REFERENCE,) * DIM, WAVESPEED, order_max
+    (LENGTH / REFERENCE,) * DIM, WAVESPEED, REFERENCE_ORDER
 )
-truth, elapsed, N = solve(order_max, REFERENCE, dt_reference)
+truth, elapsed, N = solve(REFERENCE_ORDER, REFERENCE, dt_reference)
 print(
-    f"reference: {REFERENCE + 1}^{DIM} nodes at order {order_max}, "
+    f"reference: {REFERENCE + 1}^{DIM} nodes at order {REFERENCE_ORDER}, "
     f"{N} steps, {elapsed:.2f} s"
 )
 

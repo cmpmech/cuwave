@@ -11,8 +11,8 @@ def weights(R: int) -> npt.NDArray[np.float64]:
     return np.linalg.solve(A, rhs)
 
 
-def face_coefficients(R: int) -> npt.NDArray[np.float64]:
-    """Cumulative tail sums of `weights(R)`: the reduced-order coefficients near a face."""
+def cell_coefficients(R: int) -> npt.NDArray[np.float64]:
+    """Cumulative tail sums of `weights(R)`: the coefficients of the cell flux at radius `R`."""
     w = weights(R)
     return np.array([w[R + 1 + k :].sum() for k in range(R)])
 
@@ -22,7 +22,7 @@ def preamble(space_order: int) -> str:
     R = space_order // 2
     table = np.zeros((R, R))
     for r in range(1, R + 1):
-        table[r - 1, :r] = face_coefficients(r)
+        table[r - 1, :r] = cell_coefficients(r)
     rows = ", ".join(
         "{" + ", ".join(repr(float(v)) for v in row) + "}" for row in table
     )

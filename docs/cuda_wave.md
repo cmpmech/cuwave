@@ -8,7 +8,7 @@
 | `-DNDIM=1\|2\|3`              | `sim.ndim`                                                            | selects the number of stencil axes                            |
 | `-DUSE_FLOAT`                 | `precision == "float32"`                                              | `real_t = float`, otherwise `double`                          |
 | `-DUSE_DAMPING`               | `sim.compile_flags`, once `build_materials` was given a damping field | compiles the damping term and its two extra kernel parameters |
-| `STENCIL_RADIUS`, `OP_COEFFS` | `stencils.preamble(space_order)`                                      | the radius $R$ and the face-coefficient table                 |
+| `STENCIL_RADIUS`, `OP_COEFFS` | `stencils.preamble(space_order)`                                      | the radius $R$ and the cell-coefficient table                 |
 | `--use_fast_math`             | always                                                                |                                                               |
 
 The stencil table is **prepended to the source text** rather than passed as a `-D`, because `RawModule` caches on the code string: a different `space_order` is then a different module automatically, without the order having to appear in the options
@@ -18,10 +18,10 @@ The stencil table is **prepended to the source text** rather than passed as a `-
 #define STENCIL_RADIUS 2
 #define OP_COEFFS { {1.0, 0.0}, {1.25, -0.08333333333333333} }
 ```
-which are the two face-flux stencils, written out — note they approximate the derivative on the cell **face** $x_{i+1/2}$, not on the node $x_i$
+which are the two cell-flux stencils, written out — note they approximate the derivative at the **cell** midpoint $x_{i+1/2}$, not on the node $x_i$
 $$\textrm{row 1 (radius 1, order 2):}\qquad D_i^+=u_{i+1}-u_i$$
 $$\textrm{row 2 (radius 2, order 4):}\qquad D_i^+=\frac{5}{4}\left(u_{i+1}-u_i\right)-\frac{1}{12}\left(u_{i+2}-u_{i-1}\right)$$
-with $D_i^+/\Delta x\approx\partial u/\partial x$ at $x_{i+1/2}$, and $D_i^-=D_{i-1}^+$ the flux through the opposite face
+with $D_i^+/\Delta x\approx\partial u/\partial x$ at $x_{i+1/2}$, and $D_i^-=D_{i-1}^+$ the flux through the opposite cell
 ## finite difference helpers
 
 ### OP_W, OP_C
@@ -38,15 +38,15 @@ compute $\nabla\cdot(k\nabla u)$ at $i$  (`idx`)
 **input args**
 `u1`: array of $u$; `stiff`: array of $k$; `idx`: index; `s`: stride along axis; `uc`: `u1[idx]`; `sc`: `sc[idx]`; `factor`: condensed prefactor $2\Delta t^2/h^2$ from `step_factors` (see below), with $h$ as node distance in axis; `r`: radius of finite difference scheme in axis
 **internal args**
-`sp, sm`: `stiff` at the two neighbours $k_{i\pm1}$; `gp, gm`: face stiffnesses $k_{i\pm\frac{1}{2}}$ as the *halved* harmonic mean of `sc` with `sp`/`sm`; `Dp, Dm`: the two face fluxes $D_i^+, D_i^-$, initialized with the $k=1$ term that every radius shares and completed in the loop
+`sp, sm`: `stiff` at the two neighbours $k_{i\pm1}$; `gp, gm`: cell stiffnesses $k_{i\pm\frac{1}{2}}$ as the *halved* harmonic mean of `sc` with `sp`/`sm`; `Dp, Dm`: the two cell fluxes $D_i^+, D_i^-$, initialized with the $k=1$ term that every radius shares and completed in the loop
 **how?**
 - approximation of outer gradient (flux divergence)
 $$\nabla\cdot(k\nabla u)|_i\approx \frac{1}{h} (k_{i+\frac{1}{2}}\nabla u_{i+\frac{1}{2}}-k_{i-\frac{1}{2}}\nabla u_{i-\frac{1}{2}})$$
-- $k_{i+\frac{1}{2}}, k_{i-\frac{1}{2}}$ approximated via harmonic mean (`stiff`) — the series average, which keeps the flux single-valued across a material jump; putting $k$ on the face is what lets the scheme avoid ever differentiating it
+- $k_{i+\frac{1}{2}}, k_{i-\frac{1}{2}}$ approximated via harmonic mean (`stiff`) — the series average, which keeps the flux single-valued across a material jump; putting $k$ on the cell is what lets the scheme avoid ever differentiating it
 - approximation of inner gradients with higher order finite differences
 $$\nabla_{i+\frac{1}{2}}\approx \frac{1}{h}\sum_{k=1}^r w_{r,k}(u_{i+k}-u_{i-(k-1)})$$
 $$\nabla_{i-\frac{1}{2}}\approx \frac{1}{h}\sum_{k=1}^r w_{r,k}(u_{i+(k-1)}-u_{i-k})$$
- - `factor` captures the condensed factor $\frac{1}{h^2}$ of the two nested differences, the $\Delta t^2$ of the time step (and $c_0^2$ for `ScalarWave`), plus the **2** that `gp, gm` are missing (they are $k_ik_{i\pm1}/(k_i+k_{i\pm1})$, so the effective face stiffness is the full harmonic mean $2k_ik_{i\pm1}/(k_i+k_{i\pm1})$)
+ - `factor` captures the condensed factor $\frac{1}{h^2}$ of the two nested differences, the $\Delta t^2$ of the time step (and $c_0^2$ for `ScalarWave`), plus the **2** that `gp, gm` are missing (they are $k_ik_{i\pm1}/(k_i+k_{i\pm1})$, so the effective cell stiffness is the full harmonic mean $2k_ik_{i\pm1}/(k_i+k_{i\pm1})$)
 ## boundary helpers
 
 ### BC_PARAMS, BC_GEOM

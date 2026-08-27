@@ -77,7 +77,7 @@ __device__ __forceinline__ real_t stiffness_gradient_axis(
       Dm += OP_W(r, k) * (u1[idx + (k - 1) * s] - u1[idx - k * s]);
     }
   return factor * (dgp * Dp * (l1[idx + s] - lc) +
-                   dgm * Dm * (lc - l1[idx - s])); // both faces of the node
+                   dgm * Dm * (lc - l1[idx - s])); // both cells of the node
 }
 
 // -------------------------------------- kernels
@@ -108,7 +108,7 @@ gradient_kernel(real_t *__restrict__ g_mass, real_t *__restrict__ g_stiff,
   // dJ/dmass: no neighbour and no material load
   g_mass[idx] -= inv_dt2 * lc * (u2[idx] - 2.f * uc + u0[idx]);
 
-  // dJ/dstiff: wave.cu's harmonic face mean differentiated in place
+  // dJ/dstiff: wave.cu's harmonic cell mean differentiated in place
   const real_t sc = stiff[idx];
 #if NDIM == 1
   const real_t g =
