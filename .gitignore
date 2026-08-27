@@ -6,6 +6,7 @@ dist/
 examples/docs/
 .zed/
 .obsidian/
+*.pdf
 
 # ADD later
 tests/

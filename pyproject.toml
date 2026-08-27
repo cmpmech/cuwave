@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
-# Only the example drivers plot; the solver itself never imports matplotlib.
+# Only the drivers and `cuwave.postprocessing` plot; the solver never imports matplotlib.
 examples = ["matplotlib>=3.7"]
 # Only `cuwave.nn` needs torch; the solver and its adjoints are cupy throughout.
 nn = ["torch>=2.0"]

@@ -12,12 +12,14 @@ from cuwave.regularization import Tikhonov, TotalVariation
 from cuwave.signals import sineburst
 from cuwave.utils import (
     Sensors,
+    interior_slice,
     line,
     measure,
     misfit,
     misfit_gradient,
     resample,
     shots,
+    threshold,
 )
 from cuwave.wave import ScalarWave, grid_coords, stable_dt
 
@@ -166,8 +168,8 @@ print(f"{ITERS}/{ITERS}: normalized misfit {misfits[-1] / misfits[0]:.4e}")
 print(f"elapsed time: {time.time() - tic:.1f}s")
 
 # ------------------------------------- evaluation ------------------------------------
-interior = tuple(slice(1, n - 1) for n in Nx)
-segmented = cp.where(gamma < THRESHOLD, GAMMA_VOID, 1.0).astype(sim.dtype)
+interior = interior_slice(sim)
+segmented = threshold(gamma, THRESHOLD, GAMMA_VOID, 1.0, sim.dtype)
 reference, recovered = truth[interior], gamma[interior]
 thresholded = segmented[interior]
 compare = lambda metric, **kwargs: (

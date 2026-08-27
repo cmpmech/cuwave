@@ -8,8 +8,13 @@ Every helper takes the `coords` that `grid_coords` returns and an optional `out`
 |---|---|---|
 | 2D shape | `ellipse(coords, center, radii, angle=0.0, out=None)` | interior of the ellipse with semi-axes `radii`, rotated by `angle` radians |
 | 2D shape | `circle(coords, center, radius, out=None)` | interior of the circle, the isotropic `ellipse` |
+| 2D shape | `box(coords, center, sizes, out=None)` | interior of the axis-aligned box with side lengths `sizes`, its boundary included |
 | random field | `random_ellipses(coords, count, radii, bounds, angle=(0, pi), overlap=True, rng=None, attempts=100, out=None)` | `count` ellipses at uniformly random centers, semi-axes and orientations, optionally rejected until none overlap |
 | graded row | `stacked_circles(coords, count, radius, span, center, axis=0, ratio=0.5, order="descending", out=None)` | a row of geometrically shrinking circles, evenly gapped along one axis and tangent to both ends of `span` |
+
+| nodes | `nodes(mask)` | the `(ndim, count)` grid indices `mask` selects, the layout [sensitivity](sensitivity.md) and `simulate` take |
+
+`nodes` is the one member that consumes a mask rather than building one, and it is what makes a region usable as a sensor array: a target box is marked by coordinate like any other shape and then handed to the solver as the nodes that tile it, with no separate index arithmetic to keep in step
 
 Masks are boolean, so the material contrast is the driver's to choose: `cp.where(mask, GAMMA_VOID, 1.0)` for a two-phase indicator, or an arithmetic blend for a smoothed one
 

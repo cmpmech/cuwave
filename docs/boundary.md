@@ -35,12 +35,18 @@ The layer multiplies the indicator, so **the formulation decides what gets rando
 | `ScalarWave` | the density $\rho=\gamma\rho_0$, and with it the impedance | the impedance, at $c\equiv c_0$ everywhere |
 | `AcousticWave` | $1/\rho$ and $1/\kappa$ alike | the wave speed $c=\sqrt{\kappa/\rho}$ |
 
+Setting a wave-speed layer up on `AcousticWave` means holding the two densities equal and putting the two bulk moduli either side of the background, the same `contrast` $\varepsilon$ serving as the material contrast
+
+$$\rho_1=\rho_2=\rho,\qquad\kappa_{1,2}=\frac{\rho c_0^2}{1\pm\varepsilon},\qquad\gamma_0=\frac{1}{2}$$
+
+so the interior runs at $c_0$ and the layer's $\pm\varepsilon$ swing in $\gamma$ moves the slowness $1/c^2$ by $\mp\varepsilon^2$ about $1/c_0^2$. The wave speed then ranges over $c_0/\sqrt{1+\varepsilon^2}$ to $c_0/\sqrt{1-\varepsilon^2}$, and it is that upper end `stable_dt` has to be given — a symmetric perturbation of the slowness is a lopsided one of the wave speed, so the layer costs timestep as well as cells
+
 Prefer the wave speed where the setup allows it. Randomizing the impedance alone still backscatters, but every scatterer sits at the traveltime the background gives it, so the return keeps more coherence than a layer that distorts the traveltimes as well
 
 The taper is what makes the layer usable at all: a perturbation that switched on at full strength would put a coherent specular reflector at the inner edge, which is the echo the layer exists to remove. Everything else is thickness — the layer has to be many wavelengths deep before the backscatter accumulates, and a dozen is a reasonable starting point. `correlation` tunes the scatterer size and is a weak lever for a narrowband source, where a value near the half wavelength is as good as any; the multi-scale zones [Shen & Clapp 2015](https://doi.org/10.1190/geo2014-0542.1) build are aimed at the broadband low-frequency wavefield of an inversion, where one scale cannot serve every wavelength
 
 This is not a low-reflection boundary, and reaching for it as one will disappoint: it trades a coherent echo for an incoherent coda of the same order, and the price of even that is grid — the layer is added *outside* the region of interest, so a dozen wavelengths per face is a domain several times the cells. What it buys instead is losslessness. A damping sponge absorbs far better and is rejected outright by both [sensitivity](sensitivity.md) variants, whereas a random layer leaves the operator exactly time-reversible, so the memory-efficient gradient still applies and the leftover coda averages out of a gradient stacked over shots rather than biasing it
 
-`examples/forward/scalar_2D_absorbingbcs.py` is the demonstration: a layer on both faces of one axis and a reflecting wall on the other, so a single snapshot carries the coherent echo and its absence side by side
+`examples/forward/acoustic_2D_absorbing_bcs.py` is the demonstration and `examples/forward/scalar_2D_absorbing_bcs.py` its impedance-only counterpart: a layer on both faces of one axis and a reflecting wall on the other, so one snapshot carries the specular echo the reflecting axis returns beside the coda the lined axis returns in its place
 
 An inversion has to freeze the layer: it is part of the indicator, so `misfit_gradient` returns a gradient over those nodes too, and the driver masks them rather than letting the optimizer redesign its own boundary

@@ -12,7 +12,37 @@ from .wave import Simulation, Source, simulate
 TOL = 1e-6  # for `distribute`, so exact-boundary coordinates survive rounding
 
 
+# -------------------------------------- helpers --------------------------------------
+def _reparametrize(sim: Simulation, grads: dict[str, cpt.NDArray]) -> cpt.NDArray:
+    """Chain d(cost)/d(mass, stiff) onto the indicator with `parametrization_jacobian`."""
+    d_mass, d_stiff = sim.parametrization_jacobian()
+    return d_mass * grads["mass"] + d_stiff * grads["stiff"]
+
+
 # -------------------------------------- general --------------------------------------
+def interior_slice(sim: Simulation) -> tuple[slice, ...]:
+    """Index tuple selecting the interior nodes, dropping the ghost ring and the padding."""
+    return tuple(slice(1, n - 1) for n in sim.Nx)
+
+
+def threshold(
+    field: cpt.NDArray,
+    eta: float = 0.5,
+    low: float = 0.0,
+    high: float = 1.0,
+    dtype: npt.DTypeLike | None = None,
+) -> cpt.NDArray:
+    """Snap a grey design to `low` below the threshold `eta` and `high` above it.
+
+    `dtype` defaults to the dtype of `field`, since `cp.where` against python floats
+    otherwise promotes a float32 design to float64 and the kernels read it as garbage.
+    """
+    snapped = cp.where(field < eta, low, high)
+    if dtype is None:
+        dtype = field.dtype if field.dtype.kind == "f" else snapped.dtype
+    return snapped.astype(dtype)
+
+
 def resample(
     signal: cpt.NDArray | npt.NDArray,
     dt: float,
@@ -240,7 +270,6 @@ def misfit_gradient(
         (cost, gradient), the gradient a field over the padded grid, already
         reparametrized from (mass, stiff) onto `indicator`.
     """
-    d_mass, d_stiff = sim.parametrization_jacobian()
     cost = 0.0
     gradient = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
     for source, data in zip(sources, observed):
@@ -248,5 +277,57 @@ def misfit_gradient(
             sim, source, indicator, sensors.nodes, sensors.objective(objective(data))
         )
         cost += shot_cost
-        gradient += d_mass * grads["mass"] + d_stiff * grads["stiff"]
+        gradient += _reparametrize(sim, grads)
     return cost, gradient
+
+
+# ---------------------------------------- tato ---------------------------------------
+def energy(sim: Simulation) -> Callable:
+    """Objective factory: J = 1/2 int_region int_t p^2, the energy reaching the sensors."""
+    scale = float(np.prod(sim.dx)) * sim.dt
+
+    def objective(traces):
+        return 0.5 * scale * float(cp.sum(traces**2)), scale * traces
+
+    return objective
+
+
+def response(
+    sim: Simulation,
+    source: Source,
+    indicator: cpt.NDArray,
+    sensors: cpt.NDArray[cp.int32],
+    objective: Callable,
+) -> tuple[float, cpt.NDArray]:
+    """The cost `response_gradient` returns, without its gradient: one forward pass.
+
+    Returns:
+        (cost, wavefield), the field at the last step over the logical grid, so the
+        design a cost was read from is plotted together with the wave that scored it.
+    """
+    wavefield, traces = simulate(sim, source, indicator, sensors=sensors)
+    return objective(traces)[0], wavefield
+
+
+def response_gradient(
+    sim: Simulation,
+    source: Source,
+    indicator: cpt.NDArray,
+    sensors: cpt.NDArray[cp.int32],
+    objective: Callable,
+) -> tuple[float, cpt.NDArray]:
+    """Cost of one shot and its derivative with respect to `indicator`.
+
+    Args:
+        sim: the simulation the forward and adjoint passes both step.
+        source: the shot to differentiate, its position interior nodes only.
+        indicator: the design field the gradient is taken with respect to.
+        sensors: (ndim, num_sensors) interior grid indices the objective reads.
+        objective: takes the (N, num_sensors) record, returns (cost, dcost/dtraces).
+
+    Returns:
+        (cost, gradient), the gradient a field over the padded grid, already
+        reparametrized from (mass, stiff) onto `indicator`.
+    """
+    cost, grads, _, _ = sensitivity(sim, source, indicator, sensors, objective)
+    return cost, _reparametrize(sim, grads)

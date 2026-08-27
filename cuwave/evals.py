@@ -111,6 +111,18 @@ def roc_auc(field: cpt.NDArray, truth: cpt.NDArray) -> float:
     return (ranks - 0.5 * positives * (positives + 1)) / (positives * negatives)
 
 
+def non_discreteness(field: cpt.NDArray, region: cpt.NDArray | None = None) -> float:
+    """Sigmund's greyness measure `mean(4 x (1 - x))`, 0 for a design already 0/1.
+
+    Takes no truth, so it also scores a topology optimization result, where the number
+    that matters is how far the grey design the optimizer saw is from the thresholded
+    one that gets built.
+    """
+    x = cp.asarray(field)
+    x = x if region is None else x[region]
+    return float(cp.mean(4.0 * x * (1.0 - x))) if x.size else NAN
+
+
 def l2_error(field: cpt.NDArray, truth: cpt.NDArray, relative: bool = True) -> float:
     """L2 norm of the reconstruction error, normalized by the norm of `truth`."""
     field, truth = _flatten_pair(field, truth)

@@ -26,3 +26,4 @@ Common **helpers** ease the creation of driver files for applied problem setups
 - [geometry](geometry.md)
 - [utils](utils.md)
 - [evals](evals.md)
+- [postprocessing](postprocessing.md)

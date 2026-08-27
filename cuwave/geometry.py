@@ -54,6 +54,20 @@ def circle(
     return ellipse(coords, center, (radius, radius), out=out)
 
 
+def box(
+    coords: Sequence[cpt.NDArray],
+    center: Sequence[float],
+    sizes: Sequence[float],
+    out: cpt.NDArray[cp.bool_] | None = None,
+) -> cpt.NDArray[cp.bool_]:
+    """Interior of the axis-aligned box with side lengths `sizes`, boundary included"""
+    inside = None
+    for x, c, size in zip(coords, center, sizes):
+        slab = cp.abs(x - c) <= 0.5 * size
+        inside = slab if inside is None else inside & slab
+    return _accumulate(inside, out)
+
+
 def random_ellipses(
     coords: Sequence[cpt.NDArray],
     count: int,
@@ -161,3 +175,7 @@ def stacked_circles(
         circle(coords, origin, r, out)
     return out
 
+
+def nodes(mask: cpt.NDArray[cp.bool_]) -> cpt.NDArray[cp.int32]:
+    """The (ndim, count) grid indices `mask` selects, as the kernels take them"""
+    return cp.stack(cp.nonzero(mask)).astype(cp.int32)

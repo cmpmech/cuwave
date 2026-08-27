@@ -7,13 +7,15 @@
 Possible applications include
 
 - [**nondestructive testing via full waveform inversion**](https://www.sciencedirect.com/science/article/pii/S0045782523000166)
-- [**transient acoustic topology optimization**](https://doi.org/10.1007/s00158-025-04237-y)
-<picture>
+- <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".assets/tato-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset=".assets/tato-light.png">
-  <img align="right" width="30%" src=".assets/tato-light.png">
-</picture>
+  <img align="right" width="25%" src=".assets/tato-light.png" alt="transient acoustic topology optimization">
+  </picture>
+  <a href="https://doi.org/10.1007/s00158-025-04237-y"><strong>transient acoustic topology optimization</strong></a>
+  <a href="https://doi.org/10.1007/s00158-025-04237-y" tabindex="-1"><img align="middle" width="6.25%" src=".assets/spacer.png" alt=""></a>
 - [**analog neural networks**](https://www.science.org/doi/10.1126/sciadv.aay6946)
+
+<br clear="right">
 
 ## Documentation
 - see the [documentation](docs/Home.md) for how the code works

@@ -202,7 +202,7 @@ def sensitivity(
     excitation_step = define_excitation(sim, source.position, kernels, mat)
     gradient_step = define_gradient(sim, sens_kernels, mat)
 
-# ------------------------------------ forward pass -----------------------------------
+    # ------------------------------------ forward pass -----------------------------------
     # stepped straight into the history, so the leading zeros are u^-2 / u^-1
     V = cp.zeros((sim.N + 2, *sim.Nx_padded), dtype=sim.dtype)
     # the slot views made once: V[t] is a host slice costing more than its own kernel
@@ -218,11 +218,11 @@ def sensitivity(
 
     cost, dphi = objective(um)
 
-# --------------------------------- adjoint excitation --------------------------------
+    # --------------------------------- adjoint excitation --------------------------------
     signal = adjoint_signal(sim, dphi, sensors)
     adjoint_excitation = define_excitation(sim, sensors, kernels, mat)
 
-# ----------------------------------- backward pass -----------------------------------
+    # ----------------------------------- backward pass -----------------------------------
     P = cp.zeros((2, *sim.Nx_padded), dtype=sim.dtype)
     p0, p1 = P[0], P[1]
     g_mass = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
@@ -295,7 +295,7 @@ def superposition_sensitivity(
     acc_stiff = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
     um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
 
-# ------------------------------------ forward pass -----------------------------------
+    # ------------------------------------ forward pass -----------------------------------
     # records the traces and subtracts the forward diagonal B(u, u)
     for t in range(sim.N):
         u2 = fd_step(u0, u1, u2)
@@ -307,7 +307,7 @@ def superposition_sensitivity(
 
     cost, dphi = objective(um)
 
-# --------------------------------- adjoint excitation --------------------------------
+    # --------------------------------- adjoint excitation --------------------------------
     # the forward diagonal before the backward pass cancels it, for `cancellation`
     before = float(cp.linalg.norm(acc_stiff))
     # concatenated into one launch, sound because excitation_kernel uses atomicAdd
@@ -323,7 +323,7 @@ def superposition_sensitivity(
     )
     backward_excitation = define_excitation(sim, backward_position, kernels, mat)
 
-# ----------------------------------- backward pass -----------------------------------
+    # ----------------------------------- backward pass -----------------------------------
     # u0 / u1 hold u^(N-1) / u^(N-2), so the one array carries u + k lambda
     u0, u1 = u1, u0
     for t in range(sim.N):

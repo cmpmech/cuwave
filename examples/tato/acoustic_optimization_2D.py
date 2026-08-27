@@ -1,18 +1,26 @@
 import math
 import time
-from collections.abc import Callable
 
 import cupy as cp
 import cupy.typing as cpt
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Rectangle
 
+from cuwave.evals import non_discreteness
+from cuwave.geometry import box, nodes
 from cuwave.optimization import Adam
+from cuwave.postprocessing import markers, outline, show
 from cuwave.regularization import DensityFilter, Projection
-from cuwave.sensitivity import sensitivity
 from cuwave.signals import sineburst
-from cuwave.wave import AcousticWave, Source, grid_coords, simulate, stable_dt
+from cuwave.utils import (
+    energy,
+    interior_slice,
+    point_source,
+    response,
+    response_gradient,
+    threshold,
+)
+from cuwave.wave import AcousticWave, grid_coords, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # discretization
@@ -48,10 +56,12 @@ RMIN = 0.2
 ETA = 0.5
 BETA0, BETA_GROWTH, BETA_STEP, BETA_MAX = 1.0, 2.0, 8, 64.0
 
+# evaluation
+THRESHOLD = 0.5  # the projection maps onto [0, 1], so its midpoint is the cut
+
 # --------------------------------------- setup ---------------------------------------
 Nx = RESOLUTION
 dx = tuple(LENGTHS[d] / (Nx[d] - 3) for d in range(len(Nx)))
-to_index = lambda coord: tuple(int(round(coord[d] / dx[d])) + 1 for d in range(len(Nx)))
 
 wavespeeds = np.sqrt(np.array([BULK_MODULUS1 / DENSITY1, BULK_MODULUS2 / DENSITY2]))
 dt = SAFETY * stable_dt(dx, np.max(wavespeeds), SPACE_ORDER)
@@ -80,39 +90,17 @@ sim = AcousticWave(
 
 # --------------------------------------- source --------------------------------------
 t = np.linspace(0, (N - 1) * dt, N)
-signal = sineburst(t, AMPLITUDE, FREQUENCY, CYCLES) / np.prod(dx)
-src_j = to_index((SOURCE_X, SOURCE_Y))[1]
-source = Source(
-    cp.array([[1], [src_j]], dtype=cp.int32),
-    cp.asarray(signal[:, None], dtype=sim.dtype),
+source = point_source(
+    sim, (SOURCE_X, SOURCE_Y), sineburst(t, AMPLITUDE, FREQUENCY, CYCLES)
 )
 
-half = TARGET_SIZE / 2
-lo_i, lo_j = to_index((TARGET_CENTER[0] - half, TARGET_CENTER[1] - half))
-hi_i, hi_j = to_index((TARGET_CENTER[0] + half, TARGET_CENTER[1] + half))
-box_i, box_j = cp.meshgrid(
-    cp.arange(lo_i, hi_i + 1), cp.arange(lo_j, hi_j + 1), indexing="ij"
-)
-sensors = cp.stack([box_i.ravel(), box_j.ravel()]).astype(cp.int32)
-
-x, y = grid_coords(Nx, dx, dtype=sim.dtype)
-region = (cp.abs(x - DESIGN_CENTER[0]) <= DESIGN_SIZE / 2) & (
-    cp.abs(y - DESIGN_CENTER[1]) <= DESIGN_SIZE / 2
-)
-
+coords = grid_coords(Nx, dx, dtype=sim.dtype)
+sensors = nodes(box(coords, TARGET_CENTER, (TARGET_SIZE, TARGET_SIZE)))
+region = box(coords, DESIGN_CENTER, (DESIGN_SIZE, DESIGN_SIZE))
+print(f"{sensors.shape[1]} target nodes over {int(region.sum())} design nodes")
 
 # ------------------------------------ optimization -----------------------------------
-def box_energy(sim: AcousticWave) -> Callable:
-    """Objective factory: J = 1/2 int_box int_t p^2, the energy leaking into the box."""
-    scale = float(np.prod(sim.dx)) * sim.dt
-
-    def objective(traces):
-        return 0.5 * scale * float(cp.sum(traces**2)), scale * traces
-
-    return objective
-
-
-objective = box_energy(sim)
+objective = energy(sim)
 density_filter = DensityFilter(RMIN / min(dx), sim.Nx_padded, dtype=sim.dtype)
 projection = Projection(BETA0, ETA)
 beta_of = lambda i: min(BETA0 * BETA_GROWTH ** (i // BETA_STEP), BETA_MAX)
@@ -134,11 +122,9 @@ tic = time.time()
 for iteration in range(ITERATIONS):
     projection.set(beta=beta_of(iteration))
     design, filtered = physical(variables)
-    cost, grads, _, _ = sensitivity(sim, source, design, sensors, objective)
+    cost, gradient = response_gradient(sim, source, design, sensors, objective)
 
-    # chain rule: material fields -> indicator -> projection -> filter -> variables
-    d_mass, d_stiff = sim.parametrization_jacobian()
-    gradient = d_mass * grads["mass"] + d_stiff * grads["stiff"]
+    # chain rule: indicator -> projection -> filter -> variables
     gradient = density_filter.grad(
         variables, projection.grad(filtered, gradient * region)
     )
@@ -149,42 +135,42 @@ for iteration in range(ITERATIONS):
         f"iteration {iteration}: noise {cost:.4e}  "
         f"{10 * math.log10(cost / history[0]):+.2f} dB  beta {projection.beta:.0f}"
     )
+cp.cuda.Stream.null.synchronize()
+print(f"{ITERATIONS:d} iterations of {N:d} steps: {time.time() - tic:.1f}s")
 
+# ------------------------------------- evaluation ------------------------------------
 projection.set(beta=beta_of(ITERATIONS))
 design, _ = physical(variables)
-wavefield, traces = simulate(sim, source, design, sensors=sensors)
-history.append(objective(traces)[0])
+final = threshold(design, THRESHOLD, dtype=sim.dtype)
 
 cp.cuda.Stream.null.synchronize()
+grey_cost, _ = response(sim, source, design, sensors, objective)
+final_cost, wavefield = response(sim, source, final, sensors, objective)
+history.append(grey_cost)
+cp.cuda.Stream.null.synchronize()
+
+# the thresholded design is the one that can be built, so it is the one that is reported
 print(
-    f"noise {history[0]:.4e} -> {history[-1]:.4e}  "
-    f"({10 * math.log10(history[-1] / history[0]):+.2f} dB)  "
-    f"{ITERATIONS:d} iterations of {N:d} steps: {time.time() - tic:.1f}s"
+    f"\nnoise {history[0]:.4e} -> {grey_cost:.4e} grey -> {final_cost:.4e} thresholded  "
+    f"({10 * math.log10(final_cost / history[0]):+.2f} dB)"
 )
+print(
+    f"\tdiscretization price {10 * math.log10(final_cost / grey_cost):+.2f} dB  "
+    f"at non-discreteness {non_discreteness(design, region):.3f}"
+)
+print(f"\tsolid fraction {float(design[region].sum()) / int(region.sum()):.3f}")
 
 # ----------------------------------- postprocessing ----------------------------------
-interior = tuple(slice(1, n - 1) for n in Nx)
-final = design[interior].get()
-wavefield = wavefield[interior].get()
-
-scale = 0.5 * np.max(np.abs(wavefield)) + 1e-30
-material = np.zeros((*final.shape, 4))
-material[..., 3] = final
+interior = interior_slice(sim)
+scale = 0.5 * float(cp.max(cp.abs(wavefield[interior]))) + 1e-30
 
 fig, axes = plt.subplots(1, 2, figsize=(7, 3))
 axes[0].semilogy(history, "k")
-axes[1].imshow(wavefield.T, origin="lower", cmap="seismic", vmin=-scale, vmax=scale)
-axes[1].imshow(material.transpose(1, 0, 2), origin="lower")
-axes[1].add_patch(
-    Rectangle(
-        (lo_i - 1.5, lo_j - 1.5),
-        hi_i - lo_i + 1,
-        hi_j - lo_j + 1,
-        fill=False,
-        edgecolor="k",
-    )
+show(axes[1], field=wavefield[interior], indicator=final[interior], scale=scale)
+outline(
+    axes[1], sensors.min(axis=1).get(), sensors.max(axis=1).get(), origin=1, color="k"
 )
-axes[1].plot(0, src_j - 1, "ko", markersize=4)
+markers(axes[1], (SOURCE_X, SOURCE_Y), dx=dx, origin=1, nodes=6, color="k")
 axes[1].set_aspect("equal")
 axes[1].axis("off")
 fig.tight_layout()
