@@ -6,13 +6,15 @@ coordinates: an axes is the grid at one pixel per node, and a marker is sized in
 so the same call gives the same figure at any resolution and any dpi
 """
 
+import io
+
 import cupy.typing as cpt
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
-from matplotlib.patches import FancyArrowPatch
+from PIL import Image
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -95,15 +97,28 @@ def show(
 
 
 def save(fig: Figure, path: str) -> None:
-    """Write `fig` to `path` on a transparent background, as the docs figures want"""
-    fig.savefig(path, transparent=True)
+    """Write `fig` to `path` on a transparent background, palettized where it can be.
+
+    A colormapped field holds a few hundred distinct colors, so 32 bits per pixel is
+    mostly waste: a figure that came out fully opaque is written as an 8-bit palette
+    instead. One carrying transparency keeps RGBA, since a palette entry has a single
+    alpha and cannot hold the intermediate ones of an antialiased marker.
+    """
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", transparent=True)
+    image = Image.open(buffer)
+    if image.mode != "RGBA" or image.getchannel("A").getextrema()[0] == 255:
+        image = image.convert("RGB").quantize(
+            colors=256, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE
+        )
+    image.save(path, optimize=True)
 
 
 # ------------------------------------- annotation ------------------------------------
 def marker_points(ax: Axes, nodes: float = 6.0) -> float:
     """Marker size in points spanning `nodes` grid nodes, which points alone do not"""
     low, high = ax.get_xlim()
-    return nodes * 72.0 * _panel_width(ax) / (high - low)
+    return nodes * 80.0 * _panel_width(ax) / (high - low)
 
 
 def markers(
@@ -162,30 +177,5 @@ def outline(
             fill=False,
             edgecolor=color,
             linewidth=linewidth,
-        )
-    )
-
-
-def arrow(
-    fig: Figure,
-    left: Axes,
-    right: Axes,
-    color: str = "gray",
-    scale: float = 20.0,
-    inset: float = 0.25,
-) -> None:
-    """Horizontal arrow across the gap between two panels, in figure coordinates"""
-    a, b = left.get_position(), right.get_position()
-    span = b.x0 - a.x1
-    y = 0.5 * (a.y0 + a.y1)
-    fig.add_artist(
-        FancyArrowPatch(
-            (a.x1 + inset * span, y),
-            (b.x0 - inset * span, y),
-            transform=fig.transFigure,
-            arrowstyle="-|>",
-            mutation_scale=scale,
-            color=color,
-            linewidth=0.1 * scale,
         )
     )

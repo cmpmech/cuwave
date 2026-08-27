@@ -11,8 +11,7 @@
 | marker size | `marker_points(ax, nodes=6.0)` | the size in points that spans `nodes` grid nodes on `ax` |
 | transducers | `markers(ax, positions, dx=None, origin=0, nodes=6.0, color="silver", **style)` | dots at grid node indices, or at physical coordinates when `dx` is given |
 | region | `outline(ax, low, high, origin=0, color="silver", linewidth=1.5)` | a rectangle around the nodes `low` to `high`, marking a target or a design region |
-| between panels | `arrow(fig, left, right, color="gray", scale=20.0, inset=0.25)` | a horizontal arrow across the gap between two panels, in figure coordinates |
-| write | `save(fig, path)` | writes the figure on a transparent background, so one run gives a light and a dark variant of the same plot |
+| write | `save(fig, path)` | writes the figure on a transparent background, reduced to an 8-bit palette when it came out opaque, so one run gives a light and a dark variant of the same plot |
 
 A driver plotting an interior slice passes `origin=1`, since node 1 is the origin of the domain and becomes cell 0 of the plotted array; a driver plotting the whole logical grid leaves `origin` at 0. The half-cell offset from a cell corner to its center is applied inside `markers` and `outline`, so a dot lands on its node rather than on the corner below it
 
@@ -23,3 +22,5 @@ $$\textrm{points}=n_\textrm{nodes}\cdot 72\cdot\frac{w}{x_\textrm{max}-x_\textrm
 with the axes width `w` in inches and its node-index limits, holds a dot at a fixed fraction of the grid at any resolution and any dpi. `nodes` is still a per-figure choice like a colormap — a very wide figure is displayed smaller and wants a larger dot — but the guarantee is that the choice means the same thing in every figure
 
 `scale` defaults to the peak amplitude of `field`, which a point source dominates: its injection node is orders of magnitude above the wave it launched, so the propagating field washes out. Pass a percentile of the field instead, or dim the default with `saturation`, whenever the figure has a source in it
+
+`save` palettizes because a field figure is pathological for a full-color PNG: the colormap contributes a few hundred distinct colors, and the speckle of a noisy indicator defeats the row filters, so a $2000\times500$ wave field costs megabytes at 32 bits per pixel and a third of that at 8. The reduction is skipped whenever a transparent pixel is present — the padding around a marked-up panel, or the antialiased edge of a dot — because a palette entry carries one alpha and would return those edges jagged

@@ -6,8 +6,9 @@ the module is compiled. `define_boundary` turns the markers into the launch
 closures once `compile_kernels` has run, which is why `simulate` needs no
 separate preparation phase.
 
-`random_layer` opens the domain from the other side: it perturbs the material
-rather than the ghost ring, so it needs no kernel and no marker of its own.
+`random_layer` opens the domain from the other side: it randomizes the material
+behind a face rather than the ghost ring, so it needs no kernel and no marker of
+its own.
 """
 
 from __future__ import annotations
@@ -115,13 +116,14 @@ def define_boundary(
 
 def random_layer(
     sim: Simulation,
+    indicator: cpt.NDArray,
     width: int,
-    contrast: float = 0.5,
+    correlation: int,
+    bounds: tuple[float, float] = (0.0, 1.0),
     faces: Sequence[int] | None = None,
-    correlation: int = 1,
     rng: int | np.random.Generator | None = None,
 ) -> cpt.NDArray:
-    """Multiplicative random field over the `width` nodes inside a face, 1 elsewhere.
+    """Copy of `indicator` with the `width` nodes behind each face redrawn at random.
 
     A reflecting face behind a randomized layer scatters the incoming wave back
     incoherently instead of absorbing it, so the operator stays lossless and the
@@ -129,19 +131,20 @@ def random_layer(
 
     Args:
         sim: the simulation whose padded grid the layer is built on.
+        indicator: the design field, read for the background and left untouched.
         width: layer thickness in nodes, measured inward from the wall node.
-        contrast: peak relative perturbation, reached at the wall and tapered to 0
-            at the inner edge so the layer front is not a coherent reflector.
+        correlation: grain size in nodes, one value drawn per grain; a grain much
+            below half the dominant wavelength is averaged out and barely scatters.
+        bounds: the range the grains are drawn uniformly from, in indicator units.
         faces: the `2 * axis + side` codes to line, or None for every face.
-        correlation: scatterer size in nodes, 1 drawing one value per node.
         rng: seed or generator, so a driver reproduces its layer.
 
     Returns:
-        a field over the padded grid, multiplying whatever `sim` reads the indicator
-        as -- the impedance under `ScalarWave`, the wave speed under `AcousticWave`.
+        a field over the padded grid, `indicator` outside the layer and the draw
+        inside it, so the parametrization decides what `bounds` means physically.
     """
-    if not 0.0 <= contrast < 1.0:
-        raise ValueError(f"contrast must lie in [0, 1) to stay positive: {contrast}")
+    if bounds[0] >= bounds[1]:
+        raise ValueError(f"bounds must be an increasing (low, high) pair: {bounds}")
     if width < 1:
         raise ValueError(f"width must be at least one node: {width}")
     if correlation < 1:
@@ -159,26 +162,24 @@ def random_layer(
                 f"Nx={sim.Nx[d]}"
             )
 
-    taper = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
+    layer = cp.zeros(sim.Nx_padded, dtype=bool)
     interior = cp.ones(sim.Nx_padded, dtype=bool)
     for d in range(sim.ndim):
         shape = [1] * sim.ndim
         shape[d] = sim.Nx_padded[d]
-        index = cp.arange(sim.Nx_padded[d], dtype=sim.dtype).reshape(shape)
+        index = cp.arange(sim.Nx_padded[d]).reshape(shape)
         interior &= (index >= 1) & (index <= sim.Nx[d] - 2)
         for side in (0, 1):
             if 2 * d + side in faces:
                 wall = 1 if side == 0 else sim.Nx[d] - 2
-                ramp = cp.clip(1.0 - cp.abs(index - wall) / width, 0.0, 1.0)
-                # max, so a corner is perturbed once rather than by each of its faces
-                taper = cp.maximum(taper, ramp)
+                layer |= cp.abs(index - wall) < width
     # the ghost ring is slaved to its mirror and the padding tail is never read
-    taper *= interior
+    layer &= interior
 
-    # one draw for the whole grid, coarsened and repeated back up to `correlation`
+    # one draw per grain, repeated back up to `correlation` and trimmed to the grid
     coarse = tuple((n + correlation - 1) // correlation for n in sim.Nx_padded)
-    xi = np.random.default_rng(rng).uniform(-1.0, 1.0, size=coarse)
+    xi = np.random.default_rng(rng).uniform(*bounds, size=coarse)
     for d in range(sim.ndim):
         xi = np.repeat(xi, correlation, axis=d)
     trim = tuple(slice(n) for n in sim.Nx_padded)
-    return 1.0 + contrast * taper * cp.asarray(xi[trim], dtype=sim.dtype)
+    return cp.where(layer, cp.asarray(xi[trim], dtype=sim.dtype), indicator)

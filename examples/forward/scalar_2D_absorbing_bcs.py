@@ -22,22 +22,25 @@ SAFETY = 0.99  # fraction of the stable time step
 LENGTH = 1
 WAVESPEED = 0.5
 DENSITY = 1
-T = 3.2  # the front has reflected off axis 1 and dissolved into the axis 0 layers
+T = 2.0  # the coda has re-entered the domain, so it shows next to the reflecting arcs
 
-# layer, absorbing the low and high faces of axis 0 while axis 1 stays reflecting
-WIDTH = 250  # 150  # 150  # 150  # layer thickness in nodes, about twelve wavelengths
-CONTRAST = 0.5
-CORRELATION = 6  # 6  # 6  # scatterer size in nodes
+# layer, opening the low and high faces of axis 0 while axis 1 stays reflecting
+THICKNESS = 2.0  # layer thickness in dominant wavelengths
+GRAIN = 0.5  # scatterer size in dominant wavelengths
+BOUNDS = (0.2, 1.8)  # impedance range, since gamma leaves the wave speed at WAVESPEED
 SEED = 0
 
 # source
 AMPLITUDE = 1e8
 CYCLES = 5
-FREQUENCY = 20  # bounded by WAVESPEED / (20.0 * min(dx))
+FREQUENCY = 10  # bounded by WAVESPEED / (20.0 * min(dx))
 
 # --------------------------------------- setup ---------------------------------------
-Nx = (RESOLUTION + 2 * WIDTH, RESOLUTION)
+wavelength = WAVESPEED / FREQUENCY
 dx = (LENGTH / (RESOLUTION - 3),) * DIM
+width = round(THICKNESS * wavelength / dx[0])
+correlation = round(GRAIN * wavelength / dx[0])
+Nx = (RESOLUTION + 2 * width, RESOLUTION)
 dt = SAFETY * stable_dt(dx, WAVESPEED, SPACE_ORDER)
 N = math.ceil(T / dt)
 
@@ -52,12 +55,18 @@ sim = ScalarWave(
     wavespeed=WAVESPEED,
     density=DENSITY,
 )
-indicator = cp.ones(sim.Nx_padded, dtype=sim.dtype)
-indicator *= random_layer(
-    sim, WIDTH, CONTRAST, faces=(0, 1), correlation=CORRELATION, rng=SEED
+indicator = random_layer(
+    sim,
+    cp.ones(sim.Nx_padded, dtype=sim.dtype),
+    width,
+    correlation,
+    BOUNDS,
+    faces=(0, 1),
+    rng=SEED,
 )
 
-print(f"{WAVESPEED / (FREQUENCY * max(dx)):.0f} points per wavelength")
+print(f"{wavelength / max(dx):.0f} points per wavelength")
+print(f"layer {width} nodes of {correlation}-node grains")
 
 # --------------------------------------- helper --------------------------------------
 t_np = np.linspace(0, (N - 1) * dt, N)
@@ -77,7 +86,7 @@ print(f"elapsed time {toc - tic:.2f} s  ({(toc - tic) / N * 1e3:.4f} ms/step)")
 
 # ----------------------------------- postprocessing ----------------------------------
 # ghost nodes and the layer are both outside the physical domain
-interior = tuple(slice(w + 1, n - 1 - w) for w, n in zip((WIDTH, 0), Nx))
+interior = tuple(slice(w + 1, n - 1 - w) for w, n in zip((width, 0), Nx))
 u_np = u[interior].get()
 scale = float(np.max(np.abs(u_np)))
 
