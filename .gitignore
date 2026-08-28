@@ -4,6 +4,7 @@ __pycache__/
 build/
 dist/
 examples/docs/
+examples/analog_nn/minecraft_mobs_audio/
 .zed/
 .obsidian/
 *.pdf

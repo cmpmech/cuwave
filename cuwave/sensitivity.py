@@ -1,9 +1,11 @@
-"""Adjoint sensitivities in two variants, same arguments and same return.
+"""Adjoint sensitivities in three variants, same arguments and same return.
 
 `sensitivity` stores the forward field (N + 2 grids) and is the exact transpose of
-the discretisation. `superposition_sensitivity` reconstructs that field by time
-reversal in three slots instead, trading the memory for a consistent-not-exact
-gradient and a `scale` the caller has to set. Both share the cell weights and the
+the discretisation. `reconstruction_sensitivity` rebuilds that field by a reverse
+march instead, storing only the strip a damping layer makes irreversible, and stays
+exact wherever the strip shields it. `superposition_sensitivity` reconstructs it in
+three slots with no strip at all, trading exactness and a `scale` the caller has to
+set for a footprint independent of N. All three share the cell weights and the
 adjoint excitation below; docs/sensitivity.md carries the derivations.
 """
 
@@ -13,6 +15,7 @@ from pathlib import Path
 
 import cupy as cp
 import cupy.typing as cpt
+import cupyx.scipy.ndimage as ndi
 
 from .boundary import define_boundary
 from .wave import (
@@ -21,6 +24,7 @@ from .wave import (
     compile_kernels,
     define_excitation,
     define_get_signal,
+    define_set_signal,
     define_step_method,
     flatten_indices,
     grid_block,
@@ -84,12 +88,48 @@ def require_interior(
             )
 
 
-def require_lossless(damping: cpt.NDArray | None) -> None:
-    """Raise if `damping` is set: neither variant has a damped adjoint."""
-    if damping is not None:
+def require_lossless(sim: Simulation) -> None:
+    """Raise if `sim.damping` is set: reconstructing by time reversal needs losslessness."""
+    if sim.damping is not None:
         raise NotImplementedError(
-            "the adjoint of a damped step is not that step run backwards; the "
-            "reverse-time passes here need a lossless, self-adjoint operator"
+            "superposition_sensitivity rebuilds the forward field by running it "
+            "backwards, which only a lossless operator allows; use sensitivity"
+        )
+
+
+def reconstruction_nodes(
+    sim: Simulation,
+) -> tuple[cpt.NDArray[cp.int32], cpt.NDArray[cp.bool_]]:
+    """Nodes a reverse march has to replay, and where its gradient stays exact.
+
+    Which nodes those are is decided by `sim.damping`, so the caller states neither.
+
+    Returns:
+        (strip, valid) -- the (ndim, num) grid indices to record and replay each step,
+        and the mask over the padded grid where the reconstructed triplet carries the
+        whole stencil `gradient_kernel` reads.
+    """
+    # the reverse step of a node reaches this far, so a strip that thin shields it
+    radius = sim.space_order // 2
+    interior = cp.zeros(sim.Nx_padded, dtype=cp.bool_)
+    interior[tuple(slice(1, n - 1) for n in sim.Nx)] = True
+    if sim.damping is None:
+        damped = cp.zeros_like(interior)
+        reach = damped
+    else:
+        damped = interior & (sim.damping > 0)
+        reach = ndi.binary_dilation(damped, iterations=radius, brute_force=True)
+    strip = cp.stack(cp.nonzero(interior & ~damped & reach)).astype(cp.int32)
+    return strip, interior & ~reach
+
+
+def require_reconstructable(sim: Simulation, valid: cpt.NDArray[cp.bool_]) -> None:
+    """Raise if `sim.damping` leaves no lossless interior for a reverse march to rebuild."""
+    if not bool(cp.any(valid)):
+        raise ValueError(
+            f"damping and its {sim.space_order // 2}-node reach cover every interior "
+            f"node, so there is nothing to reconstruct; damp only the faces with "
+            f"boundary.sponge, or use sensitivity"
         )
 
 
@@ -168,7 +208,6 @@ def sensitivity(
     indicator: cpt.NDArray,
     sensors: cpt.NDArray[cp.int32],
     objective: Callable,
-    damping: cpt.NDArray | None = None,
 ) -> tuple[float, dict[str, cpt.NDArray], cpt.NDArray, dict]:
     """Cost and its gradients d(cost)/d(mass, stiff) over the padded grid.
 
@@ -181,15 +220,15 @@ def sensitivity(
             The derivative drives the adjoint field, so any differentiable cost works
             -- reparametrize by chain rule at the call site with
             `sim.parametrization_jacobian()`.
-        damping: not supported, and rejected: the adjoint of a damped step is not
-            that step run backwards.
+
+    A `sim.damping` field is stepped by the same kernel in both passes, since marching
+    the adjoint backwards is what transposes the damped recursion.
 
     Returns:
         (cost, {"mass": ..., "stiff": ...}, traces, info), the gradients fields over
         the padded grid, `traces` the (N, num_sensors) record the cost was read from,
         and `info` empty -- this variant has nothing to report.
     """
-    require_lossless(damping)
     require_interior(sim, sensors, "sensor")
     require_interior(sim, source.position, "source")
 
@@ -242,6 +281,117 @@ def sensitivity(
     return cost, {"mass": g_mass, "stiff": g_stiff}, um, {}
 
 
+def reconstruction_sensitivity(
+    sim: Simulation,
+    source: Source,
+    indicator: cpt.NDArray,
+    sensors: cpt.NDArray[cp.int32],
+    objective: Callable,
+) -> tuple[float, dict[str, cpt.NDArray], cpt.NDArray, dict]:
+    """Cost and its gradients as `sensitivity`, storing a boundary strip and not the field.
+
+    The lossless recursion is symmetric in its two outer slots, so the same step kernel
+    run with them swapped marches the forward field backwards. Damping breaks that, so
+    the nodes a damped one reaches are recorded each step and replayed on the way back:
+    the reverse march then never reads an irreversible node, and the gradient stays the
+    exact transpose wherever the strip shields it. This is the variant to reach for once
+    the history no longer fits and the domain is open, since `superposition_sensitivity`
+    refuses a damping field outright.
+
+    Args:
+        sim: the simulation both passes step, damped or lossless. Damping covering
+            every interior node is rejected -- nothing is left to rebuild from.
+        source: the shot to differentiate, its position interior nodes only.
+        indicator: the design field the materials are built from.
+        sensors: (ndim, num_sensors) interior grid indices.
+        objective: takes the (N, num_sensors) record, returns (cost, dcost/dtraces).
+
+    Returns:
+        (cost, {"mass": ..., "stiff": ...}, traces, info) as `sensitivity`, the
+        gradients zeroed outside the region the strip shields, and `info` carrying the
+        `strip` node count and the `drift` the reverse march accumulated.
+    """
+    require_interior(sim, sensors, "sensor")
+    require_interior(sim, source.position, "source")
+    strip, valid = reconstruction_nodes(sim)
+    require_reconstructable(sim, valid)
+    num_strip = strip.shape[1]
+
+    mat = sim.build_materials(indicator)
+    kernels = compile_kernels(sim)
+    sens_kernels = compile_kernels(sim, KERNEL_PATH)
+
+    fd_step = define_step_method(sim, kernels, mat)
+    bc_step = define_boundary(sim, kernels)
+    excitation_step = define_excitation(sim, source.position, kernels, mat)
+    get_signal = define_get_signal(sim, sensors, kernels)
+    gradient_step = define_gradient(sim, sens_kernels, mat)
+    if num_strip:
+        record_strip = define_get_signal(sim, strip, kernels)
+        replay_strip = define_set_signal(sim, strip, kernels)
+
+    U = cp.zeros((3, *sim.Nx_padded), dtype=sim.dtype)
+    u0, u1, u2 = U[0], U[1], U[2]
+    um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
+    # two leading zero rows, so row t + 2 is u^t and the initial states need no branch
+    strip_store = cp.zeros((sim.N + 2, num_strip), dtype=sim.dtype)
+
+    # ------------------------------------ forward pass -----------------------------------
+    for t in range(sim.N):
+        u2 = fd_step(u0, u1, u2)
+        u2 = excitation_step(u2, source.signal, t)
+        u2 = bc_step(u2)
+        get_signal(u2, um, t)
+        if num_strip:
+            record_strip(u2, strip_store, t + 2)
+        u0, u1, u2 = u1, u2, u0
+
+    cost, dphi = objective(um)
+
+    # --------------------------------- adjoint excitation --------------------------------
+    signal = adjoint_signal(sim, dphi, sensors)
+    adjoint_excitation = define_excitation(sim, sensors, kernels, mat)
+
+    # ----------------------------------- backward pass -----------------------------------
+    P = cp.zeros((2, *sim.Nx_padded), dtype=sim.dtype)
+    p0, p1 = P[0], P[1]
+    g_mass = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
+    g_stiff = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
+
+    # the forward rotation left the last three states live, which is the whole seed
+    a, b, c = u2, u0, u1
+    seed = float(cp.linalg.norm(c[valid]))
+
+    for m in range(sim.N):
+        n = sim.N - 1 - m
+        p0 = fd_step(p0, p1, p0)
+        p0 = adjoint_excitation(p0, signal, m)
+        p0 = bc_step(p0)
+        p1, p0 = p0, p1  # p1 now holds lambda^n
+        # inertia pairs lambda^n with the whole triplet, stiffness with its middle slot
+        gradient_step(g_mass, g_stiff, a, b, c, p1)
+        if n < 1:
+            break
+        # read backwards, so the source rides two steps ahead of the state it rebuilds
+        c = fd_step(b, a, c)
+        c = excitation_step(c, source.signal, n - 1)
+        if num_strip:
+            replay_strip(c, strip_store, n - 1)
+        c = bc_step(c)
+        a, b, c = c, a, b
+
+    apply_cell_weights(sim, g_mass)
+    apply_cell_weights(sim, g_stiff)
+    # assigned, not multiplied, so a NaN outside cannot survive as 0 * NaN
+    outside = ~valid
+    g_mass[outside] = 0.0
+    g_stiff[outside] = 0.0
+    # the march ends on the initial state, which is zero, so what is left is round-off
+    drift = float(cp.linalg.norm(a[valid])) / seed if seed > 0.0 else float("inf")
+    info = {"strip": num_strip, "drift": drift}
+    return cost, {"mass": g_mass, "stiff": g_stiff}, um, info
+
+
 def superposition_sensitivity(
     sim: Simulation,
     source: Source,
@@ -249,7 +399,6 @@ def superposition_sensitivity(
     sensors: cpt.NDArray[cp.int32],
     objective: Callable,
     scale: float = 1.0,
-    damping: cpt.NDArray | None = None,
 ) -> tuple[float, dict[str, cpt.NDArray], cpt.NDArray, dict]:
     """Cost and its gradients as `sensitivity`, in three field slots instead of N + 2.
 
@@ -261,20 +410,21 @@ def superposition_sensitivity(
     both, with the measurements.
 
     Args:
-        sim: the simulation both passes step, which must be lossless.
+        sim: the simulation both passes step, which must be lossless -- a `damping`
+            field is rejected, since the time reversal needs one. `sensitivity`
+            takes one.
         source: the shot to differentiate, its position interior nodes only.
         indicator: the design field the materials are built from.
         sensors: (ndim, num_sensors) interior grid indices.
         objective: takes the (N, num_sensors) record, returns (cost, dcost/dtraces).
         scale: the superposition k, trading the k**2 bias against round-off. Set it
             from `info["cancellation"]`, aiming near 1e4 in float32 or 1e6 in float64.
-        damping: not supported, and rejected: time reversal needs a lossless operator.
 
     Returns:
         (cost, {"mass": ..., "stiff": ...}, traces, info) as `sensitivity`, with
         `info` carrying `scale` and the `cancellation` the subtraction cost.
     """
-    require_lossless(damping)
+    require_lossless(sim)
     require_interior(sim, sensors, "sensor")
     require_interior(sim, source.position, "source")
 

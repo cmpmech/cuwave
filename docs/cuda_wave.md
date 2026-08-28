@@ -7,7 +7,7 @@
 | ----------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------- |
 | `-DNDIM=1\|2\|3`              | `sim.ndim`                                                            | selects the number of stencil axes                            |
 | `-DUSE_FLOAT`                 | `precision == "float32"`                                              | `real_t = float`, otherwise `double`                          |
-| `-DUSE_DAMPING`               | `sim.compile_flags`, once `build_materials` was given a damping field | compiles the damping term and its two extra kernel parameters |
+| `-DUSE_DAMPING`               | `sim.compile_flags`, once `Simulation.damping` is set | compiles the damping term and its two extra kernel parameters |
 | `STENCIL_RADIUS`, `OP_COEFFS` | `stencils.preamble(space_order)`                                      | the radius $R$ and the cell-coefficient table                 |
 | `--use_fast_math`             | always                                                                |                                                               |
 
@@ -111,3 +111,9 @@ write row `t_index` of the $(N,\textrm{num\_sensors})$ record `um` from the curr
 **how?**
 - a plain gather, `um[offset + idx] = u[lin_index[idx]]`, the mirror image of `excitation_kernel` (no atomic needed, since two sensors on the same node write the same value to different slots)
 - called after the buffer swap, so it records the field just computed, $u^{n+1}$
+
+### set_signal_kernel
+Same parallelization and input args as `get_signal_kernel` with the two arrays swapping roles, `u[lin_index[idx]] = um[offset + idx]`, so the record is read and the field written
+**how?**
+- assignment rather than the `atomicAdd` of `excitation_kernel`, because it restores a recorded state instead of adding a contribution to one: the node ends at the stored value whatever it held before
+- the primitive the reverse march of `reconstruction_sensitivity` replays its boundary strip through, see [sensitivity](sensitivity.md)

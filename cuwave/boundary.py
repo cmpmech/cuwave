@@ -6,8 +6,8 @@ the module is compiled. `define_boundary` turns the markers into the launch
 closures once `compile_kernels` has run, which is why `simulate` needs no
 separate preparation phase.
 
-`random_layer` opens the domain from the other side: it randomizes the material
-behind a face rather than the ghost ring, so it needs no kernel and no marker of
+`sponge` opens the domain from the other side: it dissipates in the material behind
+a face rather than acting on the ghost ring, so it needs no kernel and no marker of
 its own.
 """
 
@@ -114,46 +114,19 @@ def define_boundary(
     return bc_step
 
 
-def random_layer(
-    sim: Simulation,
-    indicator: cpt.NDArray,
-    width: int,
-    correlation: int,
-    bounds: tuple[float, float] = (0.0, 1.0),
-    faces: Sequence[int] | None = None,
-    rng: int | np.random.Generator | None = None,
-) -> cpt.NDArray:
-    """Copy of `indicator` with the `width` nodes behind each face redrawn at random.
+def _canonical_faces(ndim: int, faces: Sequence[int] | None) -> tuple[int, ...]:
+    """Expand `None` to every face and check the codes fit `ndim`."""
+    faces = tuple(range(2 * ndim) if faces is None else faces)
+    if any(f not in range(2 * ndim) for f in faces):
+        raise ValueError(f"face codes run to {2 * ndim - 1} in {ndim}D: {faces}")
+    return faces
 
-    A reflecting face behind a randomized layer scatters the incoming wave back
-    incoherently instead of absorbing it, so the operator stays lossless and the
-    time reversal `superposition_sensitivity` needs survives (Shen & Clapp 2015).
 
-    Args:
-        sim: the simulation whose padded grid the layer is built on.
-        indicator: the design field, read for the background and left untouched.
-        width: layer thickness in nodes, measured inward from the wall node.
-        correlation: grain size in nodes, one value drawn per grain; a grain much
-            below half the dominant wavelength is averaged out and barely scatters.
-        bounds: the range the grains are drawn uniformly from, in indicator units.
-        faces: the `2 * axis + side` codes to line, or None for every face.
-        rng: seed or generator, so a driver reproduces its layer.
-
-    Returns:
-        a field over the padded grid, `indicator` outside the layer and the draw
-        inside it, so the parametrization decides what `bounds` means physically.
-    """
-    if bounds[0] >= bounds[1]:
-        raise ValueError(f"bounds must be an increasing (low, high) pair: {bounds}")
+def _validate_layer(sim: Simulation, width: int, faces: Sequence[int] | None) -> tuple:
+    """Check a layer fits behind `faces` and expand `None` to every face."""
     if width < 1:
         raise ValueError(f"width must be at least one node: {width}")
-    if correlation < 1:
-        raise ValueError(f"correlation must be at least one node: {correlation}")
-    faces = tuple(range(2 * sim.ndim) if faces is None else faces)
-    if any(f not in range(2 * sim.ndim) for f in faces):
-        raise ValueError(
-            f"face codes run to {2 * sim.ndim - 1} in {sim.ndim}D: {faces}"
-        )
+    faces = _canonical_faces(sim.ndim, faces)
     for d in range(sim.ndim):
         sides = sum(2 * d + side in faces for side in (0, 1))
         if sides * width >= sim.Nx[d] - 2:
@@ -161,25 +134,99 @@ def random_layer(
                 f"{sides} layer(s) of {width} nodes leave no interior on axis {d}: "
                 f"Nx={sim.Nx[d]}"
             )
+    return faces
 
-    layer = cp.zeros(sim.Nx_padded, dtype=bool)
+
+def _layer_taper(sim: Simulation, width: int, faces: Sequence[int]) -> cpt.NDArray:
+    """Linear ramp over the `width` nodes behind `faces`, 1 on the wall and 0 inside."""
+    taper = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
     interior = cp.ones(sim.Nx_padded, dtype=bool)
     for d in range(sim.ndim):
         shape = [1] * sim.ndim
         shape[d] = sim.Nx_padded[d]
-        index = cp.arange(sim.Nx_padded[d]).reshape(shape)
+        index = cp.arange(sim.Nx_padded[d], dtype=sim.dtype).reshape(shape)
         interior &= (index >= 1) & (index <= sim.Nx[d] - 2)
         for side in (0, 1):
             if 2 * d + side in faces:
                 wall = 1 if side == 0 else sim.Nx[d] - 2
-                layer |= cp.abs(index - wall) < width
+                ramp = cp.clip(1.0 - cp.abs(index - wall) / width, 0.0, 1.0)
+                # max, so a corner is graded once rather than by each of its faces
+                taper = cp.maximum(taper, ramp)
     # the ghost ring is slaved to its mirror and the padding tail is never read
-    layer &= interior
+    return taper * interior
 
-    # one draw per grain, repeated back up to `correlation` and trimmed to the grid
-    coarse = tuple((n + correlation - 1) // correlation for n in sim.Nx_padded)
-    xi = np.random.default_rng(rng).uniform(*bounds, size=coarse)
-    for d in range(sim.ndim):
-        xi = np.repeat(xi, correlation, axis=d)
-    trim = tuple(slice(n) for n in sim.Nx_padded)
-    return cp.where(layer, cp.asarray(xi[trim], dtype=sim.dtype), indicator)
+
+def pad_for_sponge(
+    Nx: tuple[int, ...],
+    dx: tuple[float, ...],
+    thickness: float,
+    faces: Sequence[int] | None = None,
+) -> tuple[tuple[int, ...], int, tuple[float, ...], tuple[slice, ...]]:
+    """Grow a region of interest `Nx` by a sponge layer of physical `thickness`.
+
+    The layer is grid the simulation carries but the application does not own, so what a
+    driver needs back is where its region of interest ends up: `origin` shifts the
+    coordinates it places transducers and defects at, and `region` selects it out of the
+    grown grid for a design mask or a figure.
+
+    Args:
+        Nx: logical grid points per axis of the region of interest, ghost nodes included.
+        dx: grid spacing per axis.
+        thickness: layer depth in physical units, taken in nodes off the finest axis so
+            that no face comes out thinner than asked for.
+        faces: the `2 * axis + side` codes to line, or None for every face.
+
+    Returns:
+        (Nx, width, origin, region) -- the grown extent to build the simulation on, the
+        layer `width` in nodes to hand `sponge`, the physical origin of the region of
+        interest per axis, and the index tuple selecting its interior nodes.
+    """
+    if thickness <= 0.0:
+        raise ValueError(f"thickness must be positive: {thickness}")
+    faces = _canonical_faces(len(Nx), faces)
+    width = round(thickness / min(dx))
+    if width < 1:
+        raise ValueError(f"thickness {thickness} is under one node at dx {min(dx)}")
+    pads = [
+        tuple(width if 2 * d + side in faces else 0 for side in (0, 1))
+        for d in range(len(Nx))
+    ]
+    grown = tuple(n + lo + hi for n, (lo, hi) in zip(Nx, pads))
+    origin = tuple(lo * h for (lo, _), h in zip(pads, dx))
+    region = tuple(slice(lo + 1, n - 1 - hi) for (lo, hi), n in zip(pads, grown))
+    return grown, width, origin, region
+
+
+def sponge(
+    sim: Simulation,
+    indicator: cpt.NDArray,
+    width: int,
+    beta: float,
+    faces: Sequence[int] | None = None,
+) -> cpt.NDArray:
+    """Damping field ramping to `beta` over the `width` nodes behind a face, 0 elsewhere.
+
+    The price is losslessness: the field is rejected by `superposition_sensitivity`,
+    whose reverse-time reconstruction needs an operator it can run backwards, and it is
+    what `reconstruction_sensitivity` records a strip of in order to march past it.
+
+    Args:
+        sim: the simulation the field is built for, whose `dt` and inertia scale it.
+        indicator: the design field, read for the inertia the damping is scaled by.
+        width: layer thickness in nodes, measured inward from the wall node.
+        beta: peak `d * dt / 2m` at the wall, the dimensionless decay per step.
+        faces: the `2 * axis + side` codes to line, or None for every face.
+
+    Returns:
+        the field to set as `Simulation.damping`, over the padded grid, ramped
+        quadratically so the layer front is not a coherent reflector.
+    """
+    if beta < 0.0:
+        raise ValueError(f"beta must be non-negative: {beta}")
+    faces = _validate_layer(sim, width, faces)
+    stiff, minv = sim.parametrization(indicator)
+    minv = 1.0 / stiff if minv is None else minv
+    taper = _layer_taper(sim, width, faces)
+    return cp.ascontiguousarray(
+        (2.0 * beta * taper**2 / (sim.dt * minv)).astype(sim.dtype)
+    )

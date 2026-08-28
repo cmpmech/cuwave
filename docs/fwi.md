@@ -18,6 +18,7 @@ with the simulated traces $u_r^t$ and the measured `observed` $u_{r,\textrm{obs}
 |---|---|
 | `examples/fwi/fwi_2D_adam.py` | the reference inversion: `Adam`, no regularization, a synthetic measurement simulated at a higher order than it is inverted at |
 | `examples/fwi/fwi_2D_lbfgs.py` | `Lbfgs` with the Armijo line search in place of `Adam` |
+| `examples/fwi/fwi_2D_adam_sponge.py` | a [sponge](boundary.md) on the left and right edges, so the specimen is unbounded across the transducer array; the pad is added outside the region of interest and frozen out of the design |
 | `examples/fwi/regularization/fwi_2D_adam_penalty.py` | a `TotalVariation` or `Tikhonov` term added to the objective |
 | `examples/fwi/regularization/fwi_2D_adam_projection.py` | `DensityFilter` and `Projection` on the design, with a continuation schedule |
 | `examples/fwi/regularization/fwi_2D_adam_nn.py` | the design reparametrized by a [generator](nn.md) |

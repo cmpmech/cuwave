@@ -255,6 +255,7 @@ def misfit_gradient(
     sensors: Sensors,
     observed: Sequence[cpt.NDArray],
     objective: Callable = l2_misfit,
+    adjoint: Callable = sensitivity,
 ) -> tuple[float, cpt.NDArray]:
     """Misfit summed over the shots and its derivative with respect to `indicator`.
 
@@ -265,6 +266,8 @@ def misfit_gradient(
         sensors: the receiver array the objective is evaluated on.
         observed: the measured traces, one (N, count) record per shot.
         objective: factory taking one record and returning `objective(traces)`.
+        adjoint: which variant computes each shot, `reconstruction_sensitivity`
+            where the stored history no longer fits.
 
     Returns:
         (cost, gradient), the gradient a field over the padded grid, already
@@ -273,7 +276,7 @@ def misfit_gradient(
     cost = 0.0
     gradient = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
     for source, data in zip(sources, observed):
-        shot_cost, grads, _, _ = sensitivity(
+        shot_cost, grads, _, _ = adjoint(
             sim, source, indicator, sensors.nodes, sensors.objective(objective(data))
         )
         cost += shot_cost
@@ -315,6 +318,7 @@ def response_gradient(
     indicator: cpt.NDArray,
     sensors: cpt.NDArray[cp.int32],
     objective: Callable,
+    adjoint: Callable = sensitivity,
 ) -> tuple[float, cpt.NDArray]:
     """Cost of one shot and its derivative with respect to `indicator`.
 
@@ -324,10 +328,12 @@ def response_gradient(
         indicator: the design field the gradient is taken with respect to.
         sensors: (ndim, num_sensors) interior grid indices the objective reads.
         objective: takes the (N, num_sensors) record, returns (cost, dcost/dtraces).
+        adjoint: which variant computes the gradient, `reconstruction_sensitivity`
+            where the stored history no longer fits.
 
     Returns:
         (cost, gradient), the gradient a field over the padded grid, already
         reparametrized from (mass, stiff) onto `indicator`.
     """
-    cost, grads, _, _ = sensitivity(sim, source, indicator, sensors, objective)
+    cost, grads, _, _ = adjoint(sim, source, indicator, sensors, objective)
     return cost, _reparametrize(sim, grads)

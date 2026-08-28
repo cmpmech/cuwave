@@ -108,32 +108,30 @@ class Simulation:
 class PressureWave(Simulation):
     """Scalar wave equation base: nodal `stiff`/`minv` material fields, optional damping."""
 
-    damped = False  # or damping field
+    damping: cpt.NDArray | None = None  # nodal field d, or None for a lossless operator
+
     derive_inertia = False  # set where m == k (rho scaling): minv derived from stiff
 
     @property
     def compile_flags(self) -> tuple[str, ...]:
         """`-DUSE_DAMPING` when a damping field is set, else no extra flags."""
-        return ("-DUSE_DAMPING",) if self.damped else ()
+        return ("-DUSE_DAMPING",) if self.damping is not None else ()
 
-    def build_materials(
-        self, indicator: cpt.NDArray, damping: cpt.NDArray | None = None
-    ) -> dict:
-        """Turn `indicator` (and optional `damping`) into the kernel's material dict."""
-        self.damped = damping is not None
+    def build_materials(self, indicator: cpt.NDArray) -> dict:
+        """Turn `indicator` into the kernel's material dict, `damping` included."""
         stiff, minv = self.parametrization(indicator)
         # mirrored in place, so a caller's ghost ring is normalised to Neumann
         mat = {"stiff": mirror_ghosts(self, stiff)}
         mat["minv"] = None if minv is None else mirror_ghosts(self, minv)
-        if self.damped:
-            mat["damping"] = damping
+        if self.damping is not None:
+            mat["damping"] = self.damping
         return mat
 
     def step_kernel_args(self, mat: dict) -> tuple:
         """Material and damping arguments for the finite-difference step kernel."""
         minv = mat["stiff"] if self.derive_inertia else mat["minv"]
         args = (mat["stiff"], minv, np.int32(self.derive_inertia))
-        if self.damped:
+        if self.damping is not None:
             args += (mat["damping"], self.dtype(self.dt))
         return args
 
@@ -145,6 +143,10 @@ class PressureWave(Simulation):
         weight = field.ravel()[lin_index]
         if self.derive_inertia:
             weight = 1.0 / weight
+        if self.damping is not None:
+            # the damped update divides by 1 + beta, so the added source has to share it
+            beta = 0.5 * weight * mat["damping"].ravel()[lin_index] * self.dt
+            weight = weight / (1.0 + beta)
         return (self.dtype(self.dt**2 * self.source_factor()) * weight).astype(
             self.dtype
         )
@@ -326,11 +328,31 @@ def define_get_signal(
     return get_signal_step
 
 
+def define_set_signal(
+    sim: Simulation, sensors: cpt.NDArray[cp.int32], kernels: cp.RawModule
+) -> Callable:
+    """Closure writing `u` at `sensors` back from row `t_index` of the record `um`."""
+    set_signal_kernel = kernels.get_function("set_signal_kernel")
+    threads = 256
+    num_sensors = sensors.shape[1]
+    blocks = (num_sensors + threads - 1) // threads
+    lin_index = flatten_indices(sim, sensors)
+    args = [None, None, np.int32(0), lin_index, np.int32(num_sensors)]
+
+    # assignment rather than the atomicAdd of define_excitation, so it restores a state
+    def set_signal_step(u, um, t_index):
+        args[0], args[1] = u, um
+        args[2] = np.int32(t_index * num_sensors)
+        set_signal_kernel((blocks,), (threads,), args)
+        return u
+
+    return set_signal_step
+
+
 def simulate(
     sim: Simulation,
     source: Source,
     indicator: cpt.NDArray,
-    damping: cpt.NDArray | None = None,
     sensors: cpt.NDArray[cp.int32] | None = None,
     record_every: int | None = None,
 ) -> cpt.NDArray | tuple:
@@ -340,7 +362,6 @@ def simulate(
         sim: the simulation to step, which fixes the grid and the kernels compiled.
         source: the shot to inject, its signal an (N, num_sources) record.
         indicator: the design field the materials are built from.
-        damping: optional damping field, which switches on `-DUSE_DAMPING`.
         sensors: (ndim, num_sensors) grid indices to record at, or None for no record.
         record_every: snapshot the interior field every this many steps, or None.
 
@@ -351,7 +372,7 @@ def simulate(
     U = cp.zeros((2, *sim.Nx_padded), dtype=sim.dtype)
     u0, u1 = U[0], U[1]
 
-    mat = sim.build_materials(indicator, damping)
+    mat = sim.build_materials(indicator)
     kernels = compile_kernels(sim)
     fd_step = define_step_method(sim, kernels, mat)
     bc_step = define_boundary(sim, kernels)

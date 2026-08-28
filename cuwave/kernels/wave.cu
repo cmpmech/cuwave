@@ -206,4 +206,16 @@ __global__ void get_signal_kernel(const real_t *__restrict__ u,
   }
 }
 
+// ------------------------------------------------------------------------------------
+__global__ void set_signal_kernel(real_t *__restrict__ u,
+                                  const real_t *__restrict__ um,
+                                  const int offset,
+                                  const int *__restrict__ lin_index,
+                                  const int num_sensors) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < num_sensors) {
+    u[lin_index[idx]] = um[offset + idx];
+  }
+}
+
 } // extern "C"

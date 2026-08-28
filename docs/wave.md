@@ -41,17 +41,19 @@ A specialization adds the physics: it turns one design field `indicator` $\gamma
 
 | member             | signature                                  | description                                                                                                                                                    |
 | ------------------ | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| materials          | `build_materials(indicator, damping=None)` | evaluates the parametrization on $\gamma$ and returns the nodal fields the kernels read, mirroring their ghost ring into the value the reflecting wall implies |
+| materials          | `build_materials(indicator)` | evaluates the parametrization on $\gamma$ and returns the nodal fields the kernels read, `damping` among them, mirroring their ghost ring into the value the reflecting wall implies |
 | coefficients       | `parametrization(indicator)`               | maps $\gamma$ onto the coefficient fields, returning `None` for the one the kernel derives                                                                     |
 | derivative         | `parametrization_jacobian()`               | the pair $\left(\partial m/\partial\gamma,\,\partial k/\partial\gamma\right)$ the [sensitivity](sensitivity.md) analysis contracts the adjoint with            |
 | per-axis factors   | `step_factors()`                           | the constant multiplying the flux difference along each axis                                                                                                   |
 | source scaling     | `source_factor()`                          | the constant the excitation carries on top of $\Delta t^2/m$                                                                                                   |
 | kernel arguments   | `step_kernel_args(mat)`                    | packs the material fields into the argument tuple of the step kernel                                                                                           |
-| excitation weights | `excitation_weights(mat, lin_index)`       | evaluates $\Delta t^2/m$ at the source nodes only, so a derived inertia field is never formed over the whole grid                                              |
-| kernel options     | `compile_flags`                            | adds `-DUSE_DAMPING` once `build_materials` was given a damping field                                                                                          |
+| excitation weights | `excitation_weights(mat, lin_index)`       | evaluates $\Delta t^2/m$ at the source nodes only, so a derived inertia field is never formed over the whole grid, carrying the damped update's divisor $1/\left(1+\beta\right)$ with $\beta=d\,\Delta t/2m$ so the injected impulse does not depend on $d$                                              |
+| kernel options     | `compile_flags`                            | adds `-DUSE_DAMPING` once `damping` is set                                                                                          |
 ### PressureWave
 $$m\ddot{u}+d\dot{u}-\nabla\cdot\left(k\nabla u\right)=f$$
 with the inertia $m$, the damping $d$ and the stiffness $k$, stored as the nodal fields `minv` $=1/m$, `damping` and `stiff` $=k$, since the kernel only ever needs the inverse inertia
+
+`damping` is a constructor field and not a per-call argument, so every path that takes a `Simulation` — `simulate`, `sensitivity` and the [utils](utils.md) glue over them — steps the same operator and no two call sites can disagree about it. `None` is the lossless default, and is what `superposition_sensitivity` requires
 
 `derive_inertia` marks the parametrizations in which $m=k$, so that the fields carry the impedance only and the wave speed sits in `step_factors`: `minv` is then recovered from `stiff` in the kernel, saving one field pass per step and one grid field of memory
 
@@ -106,6 +108,7 @@ def fd_step(u0, u1, u2):
 | `define_boundary`    | `boundary.py`    | one per condition   | `bc_step(u)`                                     |
 | `define_excitation`  | `wave.py`        | `excitation_kernel` | `excitation_step(u, signal, t_index)`            |
 | `define_get_signal`  | `wave.py`        | `get_signal_kernel` | `get_signal_step(u, um, t_index)`                |
+| `define_set_signal`  | `wave.py`        | `set_signal_kernel` | `set_signal_step(u, um, t_index)`                |
 | `define_gradient`    | `sensitivity.py` | `gradient_kernel`   | `gradient_step(g_mass, g_stiff, u0, u1, u2, l1)` |
 
 Conventions shared by all of them
@@ -125,6 +128,10 @@ Flat 1D launch of 256 threads, one thread per source, adding the current signal 
 The mirror image of the excitation, one thread per sensor, writing row `t_index` of the recording
 
 `simulate` calls it after the buffer swap, so the recorded row is the field that was just computed
+### define_set_signal
+The inverse of `define_get_signal`, one thread per node, writing the field back from row `t_index` of a record
+
+Only the reverse march of the [sensitivity](sensitivity.md) analysis needs it, to replay a recorded boundary strip, which is why it assigns where the excitation adds
 ### define_boundary
 see [boundary](boundary.md)
 ### define_gradient

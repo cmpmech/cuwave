@@ -1,12 +1,14 @@
 import math
 import time
+from dataclasses import replace
 
 import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
-from cuwave.boundary import random_layer
+from cuwave.boundary import pad_for_sponge, sponge
 from cuwave.signals import sineburst
+from cuwave.utils import interior_slice
 from cuwave.wave import ScalarWave, Source, simulate, stable_dt
 
 # -------------------------------------- settings -------------------------------------
@@ -14,7 +16,7 @@ from cuwave.wave import ScalarWave, Source, simulate, stable_dt
 DIM = 2  # fixed
 PRECISION = "float32"
 THREADS = (4, 128)
-SPACE_ORDER = 2  # a randomly rough layer does not suit the wide high-order flux
+SPACE_ORDER = 4
 RESOLUTION = 500
 SAFETY = 0.99  # fraction of the stable time step
 
@@ -22,25 +24,22 @@ SAFETY = 0.99  # fraction of the stable time step
 LENGTH = 1
 WAVESPEED = 0.5
 DENSITY = 1
-T = 2.0  # the coda has re-entered the domain, so it shows next to the reflecting arcs
+T = 5.0
 
-# layer, opening the low and high faces of axis 0 while axis 1 stays reflecting
-THICKNESS = 2.0  # layer thickness in dominant wavelengths
-GRAIN = 0.5  # scatterer size in dominant wavelengths
-BOUNDS = (0.2, 1.8)  # impedance range, since gamma leaves the wave speed at WAVESPEED
-SEED = 0
+# sponge
+FACES = (0, 1)
+THICKNESS = 4.0  # layer thickness in dominant wavelengths
+BETA = 0.05  # peak damping
 
 # source
-AMPLITUDE = 1e8
-CYCLES = 5
-FREQUENCY = 10  # bounded by WAVESPEED / (20.0 * min(dx))
+AMPLITUDE, FREQUENCY, CYCLES = 1e8, 10, 5
 
 # --------------------------------------- setup ---------------------------------------
 wavelength = WAVESPEED / FREQUENCY
 dx = (LENGTH / (RESOLUTION - 3),) * DIM
-width = round(THICKNESS * wavelength / dx[0])
-correlation = round(GRAIN * wavelength / dx[0])
-Nx = (RESOLUTION + 2 * width, RESOLUTION)
+Nx, width, _, domain = pad_for_sponge(
+    (RESOLUTION,) * DIM, dx, THICKNESS * wavelength, FACES
+)
 dt = SAFETY * stable_dt(dx, WAVESPEED, SPACE_ORDER)
 N = math.ceil(T / dt)
 
@@ -55,18 +54,11 @@ sim = ScalarWave(
     wavespeed=WAVESPEED,
     density=DENSITY,
 )
-indicator = random_layer(
-    sim,
-    cp.ones(sim.Nx_padded, dtype=sim.dtype),
-    width,
-    correlation,
-    BOUNDS,
-    faces=(0, 1),
-    rng=SEED,
-)
+indicator = cp.ones(sim.Nx_padded, dtype=sim.dtype)
+sim = replace(sim, damping=sponge(sim, indicator, width, BETA, faces=FACES))
 
 print(f"{wavelength / max(dx):.0f} points per wavelength")
-print(f"layer {width} nodes of {correlation}-node grains")
+print(f"sponge of {width} nodes on {len(FACES)} of {2 * DIM} faces at beta {BETA}")
 
 # --------------------------------------- helper --------------------------------------
 t_np = np.linspace(0, (N - 1) * dt, N)
@@ -79,19 +71,23 @@ source = Source(source_pos, signal)
 # --------------------------------------- solve ---------------------------------------
 cp.cuda.Stream.null.synchronize()
 tic = time.time()
-u = simulate(sim, source, indicator, record_every=None)
+u = simulate(sim, source, indicator)
 cp.cuda.Stream.null.synchronize()
 toc = time.time()
 print(f"elapsed time {toc - tic:.2f} s  ({(toc - tic) / N * 1e3:.4f} ms/step)")
 
 # ----------------------------------- postprocessing ----------------------------------
-# ghost nodes and the layer are both outside the physical domain
-interior = tuple(slice(w + 1, n - 1 - w) for w, n in zip((width, 0), Nx))
-u_np = u[interior].get()
-scale = float(np.max(np.abs(u_np)))
+full_np = u[interior_slice(sim)].get()
+u_np = u[domain].get()
+scale = float(np.max(np.abs(full_np)))
 
-fig, ax = plt.subplots(figsize=(5, 5))
-ax.pcolormesh(u_np.T, cmap="seismic", vmin=-scale, vmax=scale)
+offset = tuple(s.start - 1 for s in domain)
+axes = [np.arange(n + 1) + o for n, o in zip(u_np.shape, offset)]
+
+fig, ax = plt.subplots(figsize=(5 * full_np.shape[0] / full_np.shape[1], 5))
+shade = dict(cmap="seismic", vmin=-scale, vmax=scale)
+ax.pcolormesh(full_np.T, alpha=0.5, **shade)
+ax.pcolormesh(*axes, u_np.T, **shade)
 ax.set_aspect("equal")
 ax.axis("off")
 fig.subplots_adjust(left=0, right=1, top=1, bottom=0)

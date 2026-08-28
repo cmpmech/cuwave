@@ -10,7 +10,8 @@ A condition is a declarative marker naming a kernel and nothing more, so a setup
 | launch | `BoundaryCondition.define(sim, kernels, faces)` | returns `step(u)`, applying this condition to every face of `faces` in one launch |
 | reflecting | `Neumann` | zero flux, $\partial u/\partial n=0$, the default on every face |
 | absorbing pressure | `Dirichlet` | zero field, $u=0$, the pressure-release or free-surface wall |
-| random absorber | `random_layer(sim, indicator, width, correlation, bounds=(0.0, 1.0), faces=None, rng=None)` | a copy of `indicator` with the `width` nodes behind the named faces redrawn at random, for a driver to hand `simulate` in its place |
+| layout | `pad_for_sponge(Nx, dx, thickness, faces=None)` | grows a region of interest by a layer of physical `thickness` behind the named faces, returning the extent to build the simulation on, the layer width in nodes, and where the region of interest ends up |
+| dissipating absorber | `sponge(sim, indicator, width, beta, faces=None)` | a damping field ramping to `beta` over the `width` nodes behind the named faces and zero elsewhere, for a driver to set as `Simulation.damping` |
 | normalization | `canonical_boundary(boundary, ndim)` | expands the shorthands — `None`, one condition, one per axis — into the `((low, high),) * ndim` form `Simulation` stores |
 | dispatch | `define_boundary(sim, kernels)` | groups the faces by condition and returns `bc_step(u)`, which runs one launch per **distinct** condition |
 
@@ -18,45 +19,22 @@ Both walls are the discrete method of images and act on the ghost ring only, mir
 
 Grouping by condition rather than by face is what keeps the common case cheap: a uniform boundary is one launch however many faces it covers, and a mixed one costs one launch per distinct condition rather than $2\,\textrm{ndim}$. The faces travel as a bitmask, so no device array has to be allocated or kept alive for the dispatch
 
-Only these two *conditions* are implemented. A true absorbing or radiating condition would need state on the boundary layer rather than a ghost mirror, so it does not fit the marker-plus-kernel shape and is left out rather than approximated — `random_layer` opens the domain in the material instead, which is why it is a field builder and not a `BoundaryCondition`
+Only these two *conditions* are implemented. A true absorbing or radiating condition would need state on the boundary layer rather than a ghost mirror, so it does not fit the marker-plus-kernel shape and is left out rather than approximated — `sponge` opens the domain in the material instead, dissipating the outgoing wave behind a face that stays reflecting, which is why it is a field builder and not a `BoundaryCondition`
 
-## random layer
+## sponge
 
-**A random layer** absorbs by scattering rather than by dissipating: the `width` nodes behind a reflecting face carry a randomized material, so what comes back out of them is an incoherent coda instead of a specular echo, following [Shen & Clapp 2015](https://doi.org/10.1190/geo2014-0542.1)
+**A sponge** absorbs by dissipating: the `width` nodes behind a reflecting face carry a damping field, so the outgoing wave loses its energy there rather than returning at all
 
-$$\gamma\left(\mathbf{x}\right)\sim\mathcal{U}\left(\gamma_\textrm{lo},\gamma_\textrm{hi}\right)\qquad\textrm{one draw per grain of }\ell^{\,\textrm{ndim}}\textrm{ nodes}$$
+$$\beta\left(\mathbf{x}\right)=\beta_\textrm{wall}\,w\left(\mathbf{x}\right)^2,\qquad d=\frac{2m\beta}{\Delta t}$$
 
-with the `bounds` $\left(\gamma_\textrm{lo},\gamma_\textrm{hi}\right)$ the draw spans, the grain size `correlation` $\ell$ sharing one value across a block of that many nodes per axis, and the generator `rng` a driver fixes so its layer reproduces. Outside the layer the field is the `indicator` handed in, untouched, so the layer is written into a design field rather than multiplied onto it
+with the peak decay per step `beta` $\beta_\textrm{wall}$ reached at the wall node, the taper $w$ rising linearly from 0 at the inner edge of the layer, and the inertia $m$ the parametrization gives — the field is scaled by it, so one `beta` means the same decay whichever formulation is in use. [forward CUDA](cuda_wave.md) carries the $\beta$ the kernel actually reads
 
-The layer replaces the indicator, so **the formulation decides what gets randomized** and one call serves both
+`beta` has an **optimum** rather than a monotone benefit: too small and the wave crosses the layer and returns off the wall behind it, too large and the damping gradient reflects it on the way in. The optimum sits at $\beta_\textrm{wall}\approx0.05$ and **stays there as the layer thickens**, so thicken the layer and leave `beta` alone. A one-wavelength layer is the exception and wants about twice that, since the same energy has half as many nodes to go into. Thickness is the currency — it buys roughly a factor of five per doubling — and `beta` only spends it well or badly
 
-| formulation | $\gamma$ scales | the layer randomizes |
-|---|---|---|
-| `ScalarWave` | the density $\rho=\gamma\rho_0$, and with it the impedance | the impedance, at $c\equiv c_0$ everywhere |
-| `AcousticWave` | $1/\rho$ and $1/\kappa$ alike | the wave speed $c=\sqrt{\kappa/\rho}$ |
+What a sponge leaves is a small reflection per pass rather than a clean cut, so what becomes of that leakage decides whether it matters. **A face left reflecting traps it**: the leaked wave returns to graze the sponge again and again, and the residual grows with the length of the record instead of settling. Lining every face is worth far more than tuning the one face that is lined, so open them all where the setup allows it — and where it does not, read a long record with the accumulation in mind
 
-Prefer the wave speed. Randomizing the impedance alone still backscatters, but every scatterer sits at the traveltime the background gives it, so the return keeps more coherence than a layer that distorts the traveltimes as well
+The price is losslessness: a damped operator cannot be run backwards, so of the [sensitivity](sensitivity.md) variants `superposition_sensitivity` refuses one outright, while `sensitivity` takes a sponge and `reconstruction_sensitivity` records the layer it cannot reverse and replays it. Setting `Simulation.damping` therefore also picks the gradient, which is why the field is a constructor argument rather than something a call site passes. Where the operator has to stay reversible throughout there is no layer to reach for, only grid: pad the domain far enough that the wall echo arrives after the record ends
 
-`AcousticWave` reaches it with equal densities and the two phases placed at the wave speeds the layer is to span, so the draw covers the whole indicator range and the interior is one point inside it
+The layer is grid the simulation carries and the application does not own, which is arithmetic every driver would otherwise repeat. `pad_for_sponge` does it once: it converts a physical thickness into nodes off the finest axis, grows only the axes whose faces are named, and hands back the width `sponge` wants along with the part that is easy to get wrong — the physical origin the region of interest has moved to, and the index tuple that selects it back out of the grown grid for a design mask or a figure. A transducer coordinate that misses that shift lands inside the boundary layer
 
-$$\rho_1=\rho_2=\rho,\qquad\kappa_1=\rho c_\textrm{min}^2,\qquad\kappa_2=\rho c_\textrm{max}^2,\qquad\gamma_0=\frac{c_\textrm{min}^{-2}-c_0^{-2}}{c_\textrm{min}^{-2}-c_\textrm{max}^{-2}}$$
-
-with `bounds` then $\left(0,1\right)$, the interior at $\gamma_0$, and $c_\textrm{max}$ the speed `stable_dt` has to be given
-
-### the knobs
-
-`correlation` decides whether the layer works at all, because a wave averages the material over its own wavelength: grains much finer than that average into a constant and let the wavefront through coherently, however large the contrast. **Take the grain near half the dominant wavelength.** The single-node draw that serves reverse time migration is far too fine for the long wavelengths of an inversion, and matching $\ell$ to the wavelength instead is the point of [Shen & Clapp 2015](https://doi.org/10.1190/geo2014-0542.1). One grain size serves a narrowband source; a broadband one has low-frequency components that outrun any single scale
-
-`bounds` should be as wide as the timestep tolerates, and **wide asymmetrically**: the slow half of the range does the scattering, since a slower layer holds more wavelengths across the same nodes, while only the fast end enters the CFL condition. A range symmetric about the background wastes both — it pays for a fast tail and forfeits the slow one
-
-`width` matters least. One dominant wavelength per face already gets most of the effect and two is comfortable; beyond that the layer delays the coda rather than weakening it. There is no taper, and none is wanted: the draw is uniform, so a long wavelength sees the layer's mean and its front is not a coherent reflector to begin with, while ramping the contrast in would only dilute the scattering over the nodes it covers
-
-### what it buys
-
-**A random layer cannot reduce the reflected energy**, and reaching for it as a low-reflection boundary will disappoint. It is lossless by construction — which is the reason it exists — so everything that enters the layer comes back out, and all that changes is that it comes back incoherent. Judge it by stacking realizations rather than by amplitude: a specular echo survives that average untouched, while a scattered one falls towards $1/\sqrt{M}$ over $M$ draws. That incoherence is what buys the gradient. A damping sponge absorbs far better and is rejected outright by both [sensitivity](sensitivity.md) variants, whereas a random layer leaves the operator exactly time-reversible and its coda decorrelates from the adjoint field instead of biasing the gradient
-
-Where it earns its keep is a **thin** pad. At one to two wavelengths per face a random layer leaves a cleaner gradient than a reflecting wall the same distance out, and redrawing it every iteration — the same stack, spread over the optimization instead of over one figure — takes most of what remains. Past about four wavelengths the ranking inverts: a plain reflecting pad that far out returns its echo after the residual has died away, so randomizing it only injects noise. Reach for the layer where memory is the binding constraint, which is the case it was built for, and for plain padding where grid is cheap
-
-`examples/forward/acoustic_2D_absorbing_bcs.py` is the demonstration and `examples/forward/scalar_2D_absorbing_bcs.py` its impedance-only counterpart: a layer on both faces of one axis and a reflecting wall on the other, so one snapshot carries the specular echo the reflecting axis returns beside the coda the lined axis returns in its place
-
-An inversion has to freeze the layer: it is part of the indicator, so `misfit_gradient` returns a gradient over those nodes too, and the driver masks them rather than letting the optimizer redesign its own boundary. Redrawing it per iteration is the cheaper half of the same idea, since a fresh realization each time is the stack that averages the coda out
+`examples/forward/scalar_2D_sponge.py` is the demonstration: it lines the two faces of axis 0 and leaves axis 1 reflecting, so one figure carries the absorbed faces beside the reflecting ones. `examples/fwi/fwi_2D_adam_sponge.py` is the same boundary under an inversion, where the layer also has to be frozen out of the design
