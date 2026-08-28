@@ -7,6 +7,9 @@ exact wherever the strip shields it. `superposition_sensitivity` reconstructs it
 three slots with no strip at all, trading exactness and a `scale` the caller has to
 set for a footprint independent of N. All three share the cell weights and the
 adjoint excitation below; docs/sensitivity.md carries the derivations.
+
+`source_sensitivity` shares those arguments but differentiates with respect to
+the source signal rather than the material, which needs no forward field at all.
 """
 
 import warnings
@@ -501,3 +504,75 @@ def superposition_sensitivity(
     acc_stiff *= -norm
     info = {"scale": scale, "cancellation": cancellation}
     return cost, {"mass": acc_mass, "stiff": acc_stiff}, um, info
+
+
+def source_sensitivity(
+    sim: Simulation,
+    source: Source,
+    indicator: cpt.NDArray,
+    sensors: cpt.NDArray[cp.int32],
+    objective: Callable,
+) -> tuple[float, cpt.NDArray, cpt.NDArray, dict]:
+    """Cost and its gradient d(cost)/d(source.signal), the adjoint field at the source.
+
+    Args:
+        sim: the simulation the forward and adjoint passes both step.
+        source: the shot to differentiate, its position interior nodes only.
+        indicator: the design field the materials are built from, held fixed here.
+        sensors: (ndim, num_sensors) interior grid indices.
+        objective: takes the (N, num_sensors) record, returns (cost, dcost/dtraces).
+
+    The cost is linear in the signal, so the gradient pairs no forward field against
+    the adjoint one and this variant stores neither: four grids, whatever N is.
+
+    Returns:
+        (cost, gradient, traces, info), the gradient the (N, num_sources) derivative
+        with respect to `source.signal`, `traces` the (N, num_sensors) record the cost
+        was read from, and `info` empty; this variant has nothing to report.
+    """
+    require_interior(sim, sensors, "sensor")
+    require_interior(sim, source.position, "source")
+
+    mat = sim.build_materials(indicator)
+    kernels = compile_kernels(sim)
+
+    fd_step = define_step_method(sim, kernels, mat)
+    bc_step = define_boundary(sim, kernels)
+    excitation_step = define_excitation(sim, source.position, kernels, mat)
+    get_signal = define_get_signal(sim, sensors, kernels)
+    probe = define_get_signal(sim, source.position, kernels)
+
+    # ------------------------------------ forward pass -----------------------------------
+    U = cp.zeros((2, *sim.Nx_padded), dtype=sim.dtype)
+    u0, u1 = U[0], U[1]
+    um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
+
+    for t in range(sim.N):
+        u0 = fd_step(u0, u1, u0)
+        u0 = excitation_step(u0, source.signal, t)
+        u0 = bc_step(u0)
+        u1, u0 = u0, u1
+        get_signal(u1, um, t)
+
+    cost, dphi = objective(um)
+
+    # --------------------------------- adjoint excitation --------------------------------
+    signal = adjoint_signal(sim, dphi, sensors)
+    adjoint_excitation = define_excitation(sim, sensors, kernels, mat)
+
+    # ----------------------------------- backward pass -----------------------------------
+    P = cp.zeros((2, *sim.Nx_padded), dtype=sim.dtype)
+    p0, p1 = P[0], P[1]
+    lam = cp.zeros((sim.N, source.position.shape[1]), dtype=sim.dtype)
+
+    for m in range(sim.N):
+        n = sim.N - 1 - m
+        p0 = fd_step(p0, p1, p0)
+        p0 = adjoint_excitation(p0, signal, m)
+        p0 = bc_step(p0)
+        p1, p0 = p0, p1  # p1 now holds lambda^n
+        probe(p1, lam, n)  # row n rather than row m, so the record runs forward in time
+
+    # the transpose of adjoint_signal: over W and source_factor, and not reversed
+    gradient = lam * sensor_cell_weights(sim, source.position) * sim.source_factor()
+    return cost, gradient, um, {}

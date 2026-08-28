@@ -163,6 +163,25 @@ def point_source(
     )
 
 
+def collect_source(
+    sim: Simulation, coords: npt.ArrayLike, columns: cpt.NDArray
+) -> cpt.NDArray:
+    """Transpose of `point_source`: an (N, num * 2**ndim) node gradient onto `coords`.
+
+    Args:
+        sim: the simulation the columns were injected into.
+        coords: (num, ndim) physical coordinates the source was built from.
+        columns: the derivative with respect to the node columns `point_source` made.
+
+    Returns:
+        the (N, num) derivative with respect to the signal of each coordinate.
+    """
+    _, weights = distribute(sim, coords)
+    columns = columns.reshape(columns.shape[0], len(weights), -1)
+    # cast, since dividing a float32 record by a float64 cell volume would promote it
+    return (columns * weights).sum(2) / sim.dtype(np.prod(sim.dx))
+
+
 def shots(
     sim: Simulation, coords: npt.ArrayLike, signal: cpt.NDArray | npt.NDArray
 ) -> list[Source]:

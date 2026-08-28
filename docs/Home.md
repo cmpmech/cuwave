@@ -20,6 +20,7 @@ Common **helpers** ease the creation of driver files for applied problem setups
 - [optimization](optimization.md)
 ## applications
 - [full waveform inversion](fwi.md)
+- [source inversion](source_inversion.md)
 - [transient acoustic topology optimization](tato.md)
 ## problem helpers
 - [signals](signals.md)

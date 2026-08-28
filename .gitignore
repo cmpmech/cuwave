@@ -9,7 +9,3 @@ examples/analog_nn/minecraft_mobs_audio/
 .obsidian/
 *.pdf
 
-# ADD later
-tests/
-.claude/
-CLAUDE.md

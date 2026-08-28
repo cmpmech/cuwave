@@ -22,11 +22,14 @@ Three variants compute it, with the same arguments and the same return. `sensiti
 | strip gradient | `reconstruction_sensitivity(sim, source, indicator, sensors, objective)` | the same, marching the forward field backwards behind a recorded strip rather than storing it |
 | reconstructed region | `reconstruction_nodes(sim)` | the strip nodes that variant records each step, and the mask over which its gradient is exact |
 | low-memory gradient | `superposition_sensitivity(sim, source, indicator, sensors, objective, scale=1.0)` | the same, in three field slots, at a `scale` the caller sets |
+| source gradient | `source_sensitivity(sim, source, indicator, sensors, objective)` | the cost and its derivative with respect to `source.signal` instead of the material, in four grids and no history |
 | cell weights | `apply_cell_weights(sim, field)` | in-place multiply by the cell volume $W$ each node owns |
 | cell weights | `sensor_cell_weights(sim, sensors)` | the same $W$ at the sensor nodes only, as a `(num_sensors,)` vector |
 | adjoint source | `adjoint_signal(sim, dphi, sensors, scale=1.0, delay=0)` | the objective derivative reversed in time and scaled into the excitation the backward pass injects |
 
-All three return `(cost, {"mass": ..., "stiff": ...}, traces, info)`, the gradients as fields over the padded grid. `objective` takes the `(N, num_sensors)` record and returns the cost with its derivative, so **any** differentiable cost works: only the derivative reaches the adjoint
+All three material variants return `(cost, {"mass": ..., "stiff": ...}, traces, info)`, the gradients as fields over the padded grid. `objective` takes the `(N, num_sensors)` record and returns the cost with its derivative, so **any** differentiable cost works: only the derivative reaches the adjoint
+
+`source_sensitivity` differentiates the same cost with respect to the **emission** rather than the material, so it returns one $(N,\,\textrm{num sources})$ array in place of the pair and is the exact inverse of `adjoint_signal`: that helper divides the objective derivative by $W\sigma$ on the way into the sensors, and the source gradient multiplies the adjoint field by $W\sigma$ on the way out of the source, with the source scaling `source_factor` $\sigma$. Being linear in the signal, the cost pairs no forward field against the adjoint one there, which is what removes the history entirely; see [source inversion](source_inversion.md)
 
 The gradients come back with respect to the two material fields, never the design. Contracting them onto the indicator is one line at the call site, with the pair `sim.parametrization_jacobian()` that [wave](wave.md) supplies
 

@@ -12,6 +12,7 @@ Sources and receivers are placed by **coordinate**, not by node index, and multi
 | coordinates | `line(start, stop, count)` | `count` coordinates evenly spaced from `start` to `stop`, endpoints included |
 | interpolation | `distribute(sim, coords)` | the `(nodes, weights)` of the surrounding cell corners, raising for a coordinate outside the domain |
 | source | `point_source(sim, coords, signal)` | a `Source` firing `signal` at `coords`, divided by the cell volume so the amplitude does not depend on the spacing |
+| source chain rule | `collect_source(sim, coords, columns)` | the transpose of `point_source`: an $(N,\,\textrm{num}\cdot2^\textrm{ndim})$ node gradient contracted onto the signal of each coordinate |
 | shot list | `shots(sim, coords, signal)` | one single-coordinate `Source` per coordinate, which is the shot list of an inversion |
 | stacking | `stack(sources)` | concatenates positions and signal columns, firing several shots in a single simulation |
 | receivers | `Sensors(sim, coords)` | precomputes the interpolation once; `traces(record)` reduces a node record onto receivers and `scatter(dphi)` is its transpose |
