@@ -31,19 +31,20 @@ DESIGN_X = (2.5, 7.5)
 # optimization
 CLIPS_PER_CLASS = -1  # -1 for every clip the dataset holds
 BATCH_SIZE = 1
-EPOCHS = 100
+EPOCHS = 240
+BINARY_FROM = 120  # epoch the forward switches to the design that will be built
 LR = 2e-2
 DESIGN_START = 0.5
 DESIGN_NOISE = 0.1  # breaks the symmetry a flat start would leave the probes in
 AMPLITUDE_PENALTY = (
-    0.1  # rewards energy reaching the probes, so the loss can go negative
+    0.7  # rewards energy reaching the probes, so the loss can go negative
 )
 
 # regularization
-RMIN = 0.075  # metres, so the smallest feature does not shrink with RESOLUTION
+RMIN = 0.2  # metres, so a feature is a scatterer rather than a grey interface
 ETA = 0.5
-BETA, BETA_MAX, STAGES = 1.0, 64.0, 4
-SCHEME = "staircase"  # the ramp has to finish while the cosine schedule can still move
+BETA, BETA_MAX, STAGES = 1.0, 128.0, 5
+SCHEME = "staircase"  # the ramp has to finish before the binary phase starts
 
 # evaluation
 THRESHOLD = 0.5  # the projection maps onto [0, 1], so its midpoint is the cut
@@ -56,7 +57,8 @@ design[x_lo:x_hi, region[1]] = 1.0
 
 density_filter = DensityFilter(RMIN / min(sim.dx), sim.Nx_padded, dtype=sim.dtype)
 projection = Projection(BETA, ETA)
-betas = continuation(SCHEME, EPOCHS, BETA, BETA_MAX, STAGES)
+betas = continuation(SCHEME, BINARY_FROM, BETA, BETA_MAX, STAGES)
+betas += [BETA_MAX] * (EPOCHS - BINARY_FROM)
 
 
 def physical(variables):
@@ -88,7 +90,7 @@ noise = DESIGN_NOISE * (cp.asarray(rng.random(sim.Nx_padded), dtype=sim.dtype) -
 variables = (DESIGN_START + noise) * design
 optimizer = Adam(lr=LR)
 d_mass, d_stiff = sim.parametrization_jacobian()
-loss_history, acc_history = [], []
+loss_history, acc_history, margin_history = [], [], []
 grad_scale = None
 
 cp.cuda.Stream.null.synchronize()
@@ -98,13 +100,21 @@ for epoch in range(EPOCHS):
     # sharpening scales the projection adjoint by ~beta, so the step size is recaptured
     if epoch == 0 or betas[epoch] != betas[epoch - 1]:
         grad_scale = None
-    optimizer.lr = LR * 0.5 * (1.0 + math.cos(math.pi * epoch / EPOCHS))
+    # the binary phase steps on a different design, so Adam and its schedule restart
+    if epoch == BINARY_FROM:
+        optimizer, grad_scale = Adam(lr=LR), None
+    first = 0 if epoch < BINARY_FROM else BINARY_FROM
+    span = BINARY_FROM if epoch < BINARY_FROM else EPOCHS - BINARY_FROM
+    optimizer.lr = LR * 0.5 * (1.0 + math.cos(math.pi * (epoch - first) / span))
     order = rng.permutation(samples)
 
-    loss_sum, correct = 0.0, 0
+    loss_sum, correct, margins = 0.0, 0, []
     for start in range(0, samples, BATCH_SIZE):
         batch = order[start : start + BATCH_SIZE]
         gamma, filtered = physical(variables)
+        # the forward runs on the design that will be built, the adjoint on the grey one
+        if epoch >= BINARY_FROM:
+            gamma = threshold(gamma, THRESHOLD, dtype=sim.dtype)
 
         gradient = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
         for i in batch:
@@ -116,7 +126,9 @@ for epoch in range(EPOCHS):
             weight = float(class_weights[label])
             gradient += weight * (d_mass * grads["mass"] + d_stiff * grads["stiff"])
             loss_sum += weight * cost
-            correct += int(probabilities(sensors.traces(um)).argmax() == label)
+            probs = probabilities(sensors.traces(um))
+            correct += int(probs.argmax() == label)
+            margins.append(float(probs[label] - cp.max(cp.delete(probs, label))))
         gradient /= len(batch)
 
         # chain rule: indicator -> projection -> filter -> variables
@@ -130,9 +142,11 @@ for epoch in range(EPOCHS):
 
     loss_history.append(loss_sum / samples)
     acc_history.append(correct / samples)
+    margin_history.append(float(np.mean(margins)))
     print(
         f"epoch {epoch}: loss {loss_history[-1]:.4f}  "
-        f"accuracy {acc_history[-1]:.2f}  beta {projection.beta:.0f}"
+        f"accuracy {acc_history[-1]:.2f}  margin {margin_history[-1]:+.3f}  "
+        f"beta {projection.beta:.0f}"
     )
 cp.cuda.Stream.null.synchronize()
 print(f"{EPOCHS} epochs of {samples} clips of {N} steps: {time.time() - tic:.1f}s")
@@ -161,9 +175,10 @@ print(f"saved {material.shape} material mask to {MATERIAL.name}")
 fig, axes = plt.subplots(2, 2, figsize=(8, 6))
 axes[0, 0].plot(loss_history, "k")
 axes[0, 0].set_title("loss")
-axes[0, 1].plot(acc_history, "k")
+axes[0, 1].plot(acc_history, "k", label="accuracy")
+axes[0, 1].plot(margin_history, "C3", label="margin")
 axes[0, 1].set_ylim(0, 1)
-axes[0, 1].set_title("accuracy")
+axes[0, 1].legend(loc="lower right")
 show(axes[1, 0], indicator=final[region], cmap="binary")
 axes[1, 0].set_aspect("equal")
 axes[1, 0].axis("off")
