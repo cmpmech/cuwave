@@ -2,7 +2,7 @@
 # numpy dataset for the analog wave-network classifier (hostile / neutral / passive).
 # clips are written flat into minecraft_mobs_audio/ with an index prefix so that
 # on-disk order matches the row order of minecraft_mobs.npz. downloaded
-# audio is for local research/training use only -- ship this script and your trained
+# audio is for local research/training use only: ship this script and your trained
 # model, not the audio. decoding .ogg requires libsndfile with Ogg Vorbis support
 # (the common case via the soundfile wheels); otherwise `apt install libsndfile1`.
 
@@ -37,7 +37,7 @@ CLIPS_PER_MOB = 1  # -1 for every clip the wiki lists
 
 # folder name (derived from the wiki category) -> behavior class. one representative mob
 # per class is active; uncomment the rest to grow the dataset (villager is passive in the
-# game, so a genuinely neutral mob -- enderman -- represents the neutral class here)
+# game, so a genuinely neutral mob, enderman, represents the neutral class here)
 MOB_CLASS = {
     # hostile
     "creeper": "hostile",

@@ -25,7 +25,7 @@ Sources and receivers are placed by **coordinate**, not by node index, and multi
 
 The two applications get the same pair twice: `misfit` / `misfit_gradient` sums over a shot list against measured data for [fwi](fwi.md), `response` / `response_gradient` scores one shot against a design objective for [tato](tato.md). Both route the chain rule from $(m,k)$ onto the indicator through the same private `_reparametrize`, so a new `Simulation` subclass changes neither
 
-`response` returns the field alongside the cost because the thresholded design is re-simulated precisely to be looked at — the number and the picture come from the same solve, and cannot drift apart
+`response` returns the field alongside the cost because the thresholded design is re-simulated precisely to be looked at: the number and the picture come from the same solve, and cannot drift apart
 
 Both gradients take the adjoint variant itself as an argument, so a sponged run swaps in `reconstruction_sensitivity` without touching the objective, the shot loop or the chain rule; see [sensitivity](sensitivity.md) on which variant fits
 

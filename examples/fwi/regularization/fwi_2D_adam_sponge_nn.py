@@ -6,6 +6,7 @@ import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from torch import nn
 
 from cuwave.boundary import pad_for_sponge, sponge
 from cuwave.evals import f1_score, l2_error, pr_auc
@@ -55,8 +56,9 @@ GAMMA_VOID = 1e-4
 VOID_YRANGE, VOID_X = (0.1, 0.5), 0.5
 
 # neural network
-CHANNELS = [16, 16, 16, 8, 1]
+CHANNELS = [32, 32, 16, 8, 1]
 KERNEL = 5
+ACTIVATION = nn.Tanh  # over the GELU default, which stalls in a bad basin more often
 SEED = 0  # result should be independent of SEED -> check over multiple seeds
 LEARNABLE_INPUT = False
 OUTPUT_BIAS = 3.0
@@ -156,6 +158,7 @@ generator = Generator(
     CHANNELS,
     RESOLUTION,
     kernel=KERNEL,
+    activation=ACTIVATION,
     dim=len(RESOLUTION),
     output_bias=OUTPUT_BIAS,
     learnable=LEARNABLE_INPUT,

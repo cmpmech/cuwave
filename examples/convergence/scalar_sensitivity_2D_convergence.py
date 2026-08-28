@@ -79,7 +79,7 @@ def gradient_of(
         dt_stable: upper bound on the timestep, which `T` is then divided into.
 
     Returns:
-        (gradient, elapsed, N) -- the interior nodes of d(cost)/d(gamma) as a density,
+        (gradient, elapsed, N): the interior nodes of d(cost)/d(gamma) as a density,
         the wall time of the sensitivity alone, and the number of steps taken.
     """
     Nx = (n_el + 3,) * DIM

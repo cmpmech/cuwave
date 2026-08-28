@@ -177,7 +177,7 @@ def pad_for_sponge(
         faces: the `2 * axis + side` codes to line, or None for every face.
 
     Returns:
-        (Nx, width, origin, region) -- the grown extent to build the simulation on, the
+        (Nx, width, origin, region): the grown extent to build the simulation on, the
         layer `width` in nodes to hand `sponge`, the physical origin of the region of
         interest per axis, and the index tuple selecting its interior nodes.
     """

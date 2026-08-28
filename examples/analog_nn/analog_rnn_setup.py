@@ -25,12 +25,12 @@ DATASET = Path(__file__).parent / "minecraft_mobs.npz"
 MATERIAL = Path(__file__).parent / "analog_rnn_material.npy"
 
 # geometry: source on the left wall, three probes on the right wall (one per class)
-LENGTHS = (200.0, 100.0)
-SOURCE = [(10.0, 50.0)]
-SENSOR = [(190.0, 25.0), (190.0, 50.0), (190.0, 75.0)]
+LENGTHS = (10.0, 5.0)
+SOURCE = [(0.5, 2.5)]
+SENSOR = [(9.5, 1.25), (9.5, 2.5), (9.5, 3.75)]
 
 # discretization
-RESOLUTION = (600, 300)  # 1200 x 600 and 3000 x 1500 fit too, at 8x and 125x the time
+RESOLUTION = (600, 300)  # finer resolves more of the clip, at proportionally more steps
 SPACE_ORDER = 2  # above 2 the adjoint is only consistent, and a binary design is rough
 PRECISION = "float32"
 THREADS = (4, 64)
@@ -38,14 +38,14 @@ SAFETY = 0.99  # fraction of the stable time step
 T = 1.5  # matches the clip length the dataset is padded to
 
 # physics
-# air, foam -- 13x the impedance of air, so the design transmits instead of mirroring
+# air, foam: 13x the impedance of air, so the design transmits instead of mirroring
 RHO1, RHO2 = 1.204, 30.0
 KAPPA1, KAPPA2 = 1.419e5, 9.72e5  # foam bulk modulus, c2 ~ 180 m/s
 AMPLITUDE = 1e3
 POINTS_PER_WAVELENGTH = 10
 
 # boundary: sponged on every face, so the probe energies are not degenerate
-SPONGE_THICKNESS = 10.0  # metres, so it does not need rescaling with RESOLUTION
+SPONGE_THICKNESS = 0.5  # metres, so it does not need rescaling with RESOLUTION
 BETA = 0.05  # peak sponge damping d * dt / 2m
 
 # --------------------------------------- setup ---------------------------------------
@@ -87,15 +87,26 @@ sensors = Sensors(sim, [(x0 + x, y0 + y) for x, y in SENSOR])
 
 strip, _ = reconstruction_nodes(sim)
 footprint = (N + 2) * strip.shape[1] * np.dtype(sim.dtype).itemsize
+bins = int(2.0 * f_max * T) // 2 + 1  # rfft bins of a clip that fit under f_max
+
+# the grid cannot propagate what it cannot resolve, so the band decides what the medium hears
+spectra = np.abs(np.fft.rfft(np.load(DATASET)["X"], axis=1)) ** 2
+retained = spectra[:, :bins].sum(axis=1) / spectra.sum(axis=1)
+if retained.min() < 0.1:
+    raise ValueError(
+        f"f_max={f_max:.0f} Hz keeps only {retained.min():.1%} of a clip: the source "
+        f"would be the recording's noise floor, so shorten LENGTHS"
+    )
+
 print(f"{Nx[0]} x {Nx[1]} nodes, {N} steps, {f_max:.0f} Hz max resolvable")
+print(f"source keeps {100 * retained.min():.0f}-{100 * retained.max():.0f}% of a clip")
 print(f"adjoint strip {strip.shape[1]} nodes, {footprint / 1e6:.0f} MB")
 
 
 # --------------------------------------- source --------------------------------------
 def load_source(clip: npt.NDArray[np.float32]) -> Source:
-    """Band-compress `clip` into [0, `f_max`] and inject it at `SOURCE`."""
-    # the clips carry almost no energy below f_max, so low-passing keeps only residue
-    bins = int(2.0 * f_max * T) // 2 + 1
+    """Low-pass `clip` to the resolvable [0, `f_max`] and inject it at `SOURCE`."""
+    # the same time base either side, so the cut is at f_max of the recording as well
     wave = np.fft.irfft(np.fft.rfft(clip)[:bins], N)
     return point_source(sim, source_coords, AMPLITUDE * wave / np.max(np.abs(wave)))
 

@@ -18,7 +18,7 @@ The stencil table is **prepended to the source text** rather than passed as a `-
 #define STENCIL_RADIUS 2
 #define OP_COEFFS { {1.0, 0.0}, {1.25, -0.08333333333333333} }
 ```
-which are the two cell-flux stencils, written out — note they approximate the derivative at the **cell** midpoint $x_{i+1/2}$, not on the node $x_i$
+which are the two cell-flux stencils, written out. Note that they approximate the derivative at the **cell** midpoint $x_{i+1/2}$, not on the node $x_i$
 $$\textrm{row 1 (radius 1, order 2):}\qquad D_i^+=u_{i+1}-u_i$$
 $$\textrm{row 2 (radius 2, order 4):}\qquad D_i^+=\frac{5}{4}\left(u_{i+1}-u_i\right)-\frac{1}{12}\left(u_{i+2}-u_{i-1}\right)$$
 with $D_i^+/\Delta x\approx\partial u/\partial x$ at $x_{i+1/2}$, and $D_i^-=D_{i-1}^+$ the flux through the opposite cell
@@ -42,7 +42,7 @@ compute $\nabla\cdot(k\nabla u)$ at $i$  (`idx`)
 **how?**
 - approximation of outer gradient (flux divergence)
 $$\nabla\cdot(k\nabla u)|_i\approx \frac{1}{h} (k_{i+\frac{1}{2}}\nabla u_{i+\frac{1}{2}}-k_{i-\frac{1}{2}}\nabla u_{i-\frac{1}{2}})$$
-- $k_{i+\frac{1}{2}}, k_{i-\frac{1}{2}}$ approximated via harmonic mean (`stiff`) — the series average, which keeps the flux single-valued across a material jump; putting $k$ on the cell is what lets the scheme avoid ever differentiating it
+- $k_{i+\frac{1}{2}}, k_{i-\frac{1}{2}}$ approximated via harmonic mean (`stiff`): the series average, which keeps the flux single-valued across a material jump; putting $k$ on the cell is what lets the scheme avoid ever differentiating it
 - approximation of inner gradients with higher order finite differences
 $$\nabla_{i+\frac{1}{2}}\approx \frac{1}{h}\sum_{k=1}^r w_{r,k}(u_{i+k}-u_{i-(k-1)})$$
 $$\nabla_{i-\frac{1}{2}}\approx \frac{1}{h}\sum_{k=1}^r w_{r,k}(u_{i+(k-1)}-u_{i-k})$$

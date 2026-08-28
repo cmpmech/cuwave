@@ -21,7 +21,7 @@ from cuwave.wave import simulate
 
 # -------------------------------------- settings -------------------------------------
 CLASS = 0  # the first clip of this class is the one played through the medium
-SNAPSHOT = 0.5  # seconds into the run the field is drawn at
+SNAPSHOT = 1  # 0.5  # seconds into the run the field is drawn at
 DESIGN = True  # False plays the same clip through free field, as the reference
 SATURATION = 0.2  # fraction of the peak the field colormap runs to
 

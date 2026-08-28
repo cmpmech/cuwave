@@ -56,7 +56,7 @@ with $n$ = `iters`; an unknown `scheme` raises
 
 A ramp is needed because the two ends of the map are useless on their own: at large $\beta$ the derivative vanishes away from the threshold and the design barely moves, at small $\beta$ it moves but converges grey. The price is a cost function that changes between iterations, so the history need not decrease across a step in $\beta$ and stored curvature pairs refer to the previous map
 
-Whether the ramp pays depends on the iteration budget — `examples/fwi_2D_adam_projection.py` and `examples/fwi_2D_lbfgs_projection.py` sweep all four schemes on the same inversion and note the outcome at the bottom of each file
+Whether the ramp pays depends on the iteration budget: `examples/fwi_2D_adam_projection.py` and `examples/fwi_2D_lbfgs_projection.py` sweep all four schemes on the same inversion and note the outcome at the bottom of each file
 
 ### SIMP
 `SIMP` (solid isotropic material with penalization) raises the design to the power `p`, so that intermediate values buy less material property per unit of the volume budget and the optimizer is driven towards $0/1$, following [Bendsøe 1989](https://doi.org/10.1007/BF01650949) and [Bendsøe & Sigmund 1999](https://doi.org/10.1007/s004190050248)
@@ -89,7 +89,7 @@ with the penalty weight `alpha`, the optional prior `x_ref` (zero if omitted) an
 Order `1` penalizes jumps between neighboring cells and hence smears interfaces, whereas order `0` merely pulls the design towards `x_ref`
 
 ### TotalVariation
-`TotalVariation` penalizes the $L_1$ norm of the design gradient, which — unlike `Tikhonov` of order `1` — permits sharp interfaces while suppressing oscillations, following [Rudin, Osher & Fatemi 1992](https://doi.org/10.1016/0167-2789(92)90242-F) in the smoothed variant of [Acar & Vogel 1994](https://doi.org/10.1088/0266-5611/10/6/003)
+`TotalVariation` penalizes the $L_1$ norm of the design gradient, which, unlike `Tikhonov` of order `1`, permits sharp interfaces while suppressing oscillations, following [Rudin, Osher & Fatemi 1992](https://doi.org/10.1016/0167-2789(92)90242-F) in the smoothed variant of [Acar & Vogel 1994](https://doi.org/10.1088/0266-5611/10/6/003)
 $$R(x)=\alpha\sum_e\sqrt{\sum_d\left(D_dx\right)_e^2+\epsilon^2},\qquad\frac{\partial R}{\partial x}=\alpha\sum_dD_d^\top\left(\frac{D_dx}{\sqrt{\sum_{d'}\left(D_{d'}x\right)^2+\epsilon^2}}\right)$$
 with the same $D_d$ as above and the smoothing `eps` keeping the derivative bounded where the design is locally flat
 

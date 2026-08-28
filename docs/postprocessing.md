@@ -1,6 +1,6 @@
 # Postprocessing
 
-**Postprocessing** draws the bare field figures a driver produces — the wave, the design over it, and the transducers that made it — so the drivers carry the physics and not the axes bookkeeping
+**Postprocessing** draws the bare field figures a driver produces (the wave, the design over it, and the transducers that made it), so the drivers carry the physics and not the axes bookkeeping
 
 `matplotlib` is imported here and nowhere else in the package, the way torch is confined to [nn](nn.md), and it stays an optional extra in `pyproject.toml`. Everything works in **node index** coordinates rather than physical ones: an axes is the grid at one pixel per node, so a marker, an outline and the field itself are placed by the same integers the kernels use
 
@@ -19,8 +19,8 @@ A driver plotting an interior slice passes `origin=1`, since node 1 is the origi
 
 **A marker size in points does not track the grid**, which is why `marker_points` exists: the same `markersize=4` is a fifth of a 20-node domain and invisible on a 2000-node one. Sizing in nodes instead,
 $$\textrm{points}=n_\textrm{nodes}\cdot 72\cdot\frac{w}{x_\textrm{max}-x_\textrm{min}}$$
-with the axes width `w` in inches and its node-index limits, holds a dot at a fixed fraction of the grid at any resolution and any dpi. `nodes` is still a per-figure choice like a colormap — a very wide figure is displayed smaller and wants a larger dot — but the guarantee is that the choice means the same thing in every figure
+with the axes width `w` in inches and its node-index limits, holds a dot at a fixed fraction of the grid at any resolution and any dpi. `nodes` is still a per-figure choice like a colormap (a very wide figure is displayed smaller and wants a larger dot), but the guarantee is that the choice means the same thing in every figure
 
 `scale` defaults to the peak amplitude of `field`, which a point source dominates: its injection node is orders of magnitude above the wave it launched, so the propagating field washes out. Pass a percentile of the field instead, or dim the default with `saturation`, whenever the figure has a source in it
 
-`save` palettizes because a field figure is pathological for a full-color PNG: the colormap contributes a few hundred distinct colors, and the speckle of a noisy indicator defeats the row filters, so a $2000\times500$ wave field costs megabytes at 32 bits per pixel and a third of that at 8. The reduction is skipped whenever a transparent pixel is present — the padding around a marked-up panel, or the antialiased edge of a dot — because a palette entry carries one alpha and would return those edges jagged
+`save` palettizes because a field figure is pathological for a full-color PNG: the colormap contributes a few hundred distinct colors, and the speckle of a noisy indicator defeats the row filters, so a $2000\times500$ wave field costs megabytes at 32 bits per pixel and a third of that at 8. The reduction is skipped whenever a transparent pixel is present (the padding around a marked-up panel, or the antialiased edge of a dot), because a palette entry carries one alpha and would return those edges jagged

@@ -53,7 +53,7 @@ A specialization adds the physics: it turns one design field `indicator` $\gamma
 $$m\ddot{u}+d\dot{u}-\nabla\cdot\left(k\nabla u\right)=f$$
 with the inertia $m$, the damping $d$ and the stiffness $k$, stored as the nodal fields `minv` $=1/m$, `damping` and `stiff` $=k$, since the kernel only ever needs the inverse inertia
 
-`damping` is a constructor field and not a per-call argument, so every path that takes a `Simulation` — `simulate`, `sensitivity` and the [utils](utils.md) glue over them — steps the same operator and no two call sites can disagree about it. `None` is the lossless default, and is what `superposition_sensitivity` requires
+`damping` is a constructor field and not a per-call argument, so every path that takes a `Simulation` (`simulate`, `sensitivity` and the [utils](utils.md) glue over them) steps the same operator and no two call sites can disagree about it. `None` is the lossless default, and is what `superposition_sensitivity` requires
 
 `derive_inertia` marks the parametrizations in which $m=k$, so that the fields carry the impedance only and the wave speed sits in `step_factors`: `minv` is then recovered from `stiff` in the kernel, saving one field pass per step and one grid field of memory
 

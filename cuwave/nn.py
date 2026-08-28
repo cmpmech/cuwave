@@ -40,7 +40,7 @@ def _block(
     activation: type[nn.Module],
     dim: int,
 ) -> nn.Sequential:
-    """convolve, normalize, activate -- the unit a stack is built from
+    """convolve, normalize, activate: the unit a stack is built from
 
     `GroupNorm(1, channels)` normalizes each sample over channels and space (layer
     normalization).
@@ -58,7 +58,7 @@ class Generator(nn.Module):
 
     Nearest-neighbour upsampling per transition, and the stack ends in a sigmoid, so the
     field is in [0, 1]. The output convolution starts with small random weights and
-    `output_bias`, so the field starts flat at 1 -- where the pixel-wise drivers start.
+    `output_bias`, so the field starts flat at 1, where the pixel-wise drivers start.
 
     Args:
         channels: latent channels, tapering to the one channel of the field.

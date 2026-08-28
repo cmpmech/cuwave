@@ -5,7 +5,7 @@ One forward step of [cuda_wave](cuda_wave.md), written as a residual instead of 
 $$C^t=\frac{m}{\Delta t^2}\left(u^t-2u^{t-1}+u^{t-2}\right)-\nabla\cdot(k\nabla u^{t-1})-b^t=0$$
 Making $J-\sum_t\lambda^t C^t$ stationary in $u$ defines the **adjoint field** $\lambda$: the same three-term recursion, run backwards in time, driven at the sensors by $\partial J/\partial u$ in place of the source
 $$\lambda^{t}=2\lambda^{t+1}-\lambda^{t+2}+\frac{\Delta t^2}{m}\left(\nabla\cdot(k\nabla\lambda^{t+1})+\frac{\partial J}{\partial u^{t}}\right)$$
-so $\lambda$ needs no kernel of its own — `sensitivity.py` steps it with `fd_kernel` and the same boundary kernels. What is left over is $dJ/d\theta=-\sum_t\lambda^t\,\partial C^t/\partial\theta$, one sum per material field, and those two sums are all this file computes
+so $\lambda$ needs no kernel of its own: `sensitivity.py` steps it with `fd_kernel` and the same boundary kernels. What is left over is $dJ/d\theta=-\sum_t\lambda^t\,\partial C^t/\partial\theta$, one sum per material field, and those two sums are all this file computes
 $$\frac{dJ}{dm}\bigg|_i=-\frac{1}{\Delta t^2}\sum_t\lambda_i^t\left(u_i^t-2u_i^{t-1}+u_i^{t-2}\right)$$
 $$\frac{dJ}{dk}\bigg|_i=\sum_t\frac{\partial}{\partial k_i}\left[\lambda^t\cdot\nabla\cdot(k\nabla u^{t-1})\right]$$
 Both are exact derivatives of the **discretization**, not of the PDE. And both differentiate the residual rather than the update, which is why neither carries the $\Delta t^2$ that the forward step folds into $f_d$: the mass term gets it back as `inv_dt2`, and the stiffness term runs on $F_d=f_d/\Delta t^2$, i.e. $2c_0^2/h_d^2$ (`ScalarWave`) or $2/h_d^2$ (`AcousticWave`)
@@ -57,10 +57,10 @@ accumulate the two Frechet integrands of one field triplet, for the superpositio
 $$\frac{dJ}{dm}\bigg|_i=\sum_t\dot u_i\dot\lambda_i,\qquad\frac{dJ}{dk}\bigg|_i=-\sum_t\nabla u_i\cdot\nabla\lambda_i$$
 - being symmetric *and* bilinear, they can be read off the diagonal alone, which is what removes the need to store $u$
 $$B(w,w)-B(u,u)=2\alpha B(u,\lambda)+\alpha^2B(\lambda,\lambda),\qquad w=u+\alpha\lambda$$
-with $\alpha$ the `scale` the caller sets. So the kernel takes **one** triplet rather than two — half the loads of a bilinear version, and the whole point of the trick
+with $\alpha$ the `scale` the caller sets. So the kernel takes **one** triplet rather than two, half the loads of a bilinear version, and the whole point of the trick
 - the two derivatives are plain central differences, both centred on the middle slot
 $$\dot u_i=\frac{u_i^{t}-u_i^{t-2}}{2\Delta t},\qquad\frac{\partial u_i}{\partial x_d}=\frac{u_{i+1}^{t-1}-u_{i-1}^{t-1}}{2h_d}$$
 whose denominators ride in `ft` and `f0, f1, f2` together with the $\pm1$ that subtracts the forward diagonal and adds the superposed one
 - no material field appears at all: $m$, $k$, the $1/2\alpha$ and the cell weights are applied on the host
-- both terms are squares, hence invariant under time reversal — reversing the recursion flips $\dot u$ and leaves $\dot u^2$ alone. That is what lets the reconstructed forward field and the adjoint field share a single array
+- both terms are squares, hence invariant under time reversal: reversing the recursion flips $\dot u$ and leaves $\dot u^2$ alone. That is what lets the reconstructed forward field and the adjoint field share a single array
 - consistent, not exact: this form agrees with `gradient_kernel` only to $O(h^2,\Delta t^2)$. [sensitivity](sensitivity.md) carries the measurements, along with `scale`, the cancellation warning and the one-step adjoint delay

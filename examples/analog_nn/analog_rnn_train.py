@@ -19,19 +19,19 @@ from analog_rnn_setup import (
 
 from cuwave.optimization import Adam
 from cuwave.postprocessing import show
-from cuwave.regularization import DensityFilter, Projection
+from cuwave.regularization import DensityFilter, Projection, continuation
 from cuwave.sensitivity import reconstruction_sensitivity
 from cuwave.utils import threshold
 from cuwave.wave import simulate
 
 # -------------------------------------- settings -------------------------------------
 # geometry: a trainable material square centered in x, spanning the full height
-DESIGN_X = (50.0, 150.0)
+DESIGN_X = (2.5, 7.5)
 
 # optimization
 CLIPS_PER_CLASS = -1  # -1 for every clip the dataset holds
 BATCH_SIZE = 1
-EPOCHS = 200
+EPOCHS = 100
 LR = 2e-2
 DESIGN_START = 0.5
 DESIGN_NOISE = 0.1  # breaks the symmetry a flat start would leave the probes in
@@ -40,9 +40,10 @@ AMPLITUDE_PENALTY = (
 )
 
 # regularization
-RMIN = 1.5  # metres, so the smallest feature does not shrink with RESOLUTION
+RMIN = 0.075  # metres, so the smallest feature does not shrink with RESOLUTION
 ETA = 0.5
-BETA0, BETA_GROWTH, BETA_STEP, BETA_MAX = 1.0, 2.0, 16, 64.0
+BETA, BETA_MAX, STAGES = 1.0, 64.0, 4
+SCHEME = "staircase"  # the ramp has to finish while the cosine schedule can still move
 
 # evaluation
 THRESHOLD = 0.5  # the projection maps onto [0, 1], so its midpoint is the cut
@@ -54,8 +55,8 @@ design = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
 design[x_lo:x_hi, region[1]] = 1.0
 
 density_filter = DensityFilter(RMIN / min(sim.dx), sim.Nx_padded, dtype=sim.dtype)
-projection = Projection(BETA0, ETA)
-beta_of = lambda epoch: min(BETA0 * BETA_GROWTH ** (epoch // BETA_STEP), BETA_MAX)
+projection = Projection(BETA, ETA)
+betas = continuation(SCHEME, EPOCHS, BETA, BETA_MAX, STAGES)
 
 
 def physical(variables):
@@ -93,7 +94,10 @@ grad_scale = None
 cp.cuda.Stream.null.synchronize()
 tic = time.time()
 for epoch in range(EPOCHS):
-    projection.set(beta=beta_of(epoch))
+    projection.set(beta=betas[epoch])
+    # sharpening scales the projection adjoint by ~beta, so the step size is recaptured
+    if epoch == 0 or betas[epoch] != betas[epoch - 1]:
+        grad_scale = None
     optimizer.lr = LR * 0.5 * (1.0 + math.cos(math.pi * epoch / EPOCHS))
     order = rng.permutation(samples)
 
@@ -119,7 +123,7 @@ for epoch in range(EPOCHS):
         gradient = density_filter.grad(
             variables, projection.grad(filtered, gradient * design)
         )
-        # frozen after the first batch, so the step never tracks the loss scale
+        # frozen within a beta level, so the step never tracks the loss scale
         if grad_scale is None:
             grad_scale = float(cp.max(cp.abs(gradient)))
         variables = cp.clip(optimizer.step(variables, gradient / grad_scale), 0.0, 1.0)
@@ -134,7 +138,7 @@ cp.cuda.Stream.null.synchronize()
 print(f"{EPOCHS} epochs of {samples} clips of {N} steps: {time.time() - tic:.1f}s")
 
 # ------------------------------------- evaluation ------------------------------------
-projection.set(beta=beta_of(EPOCHS))
+projection.set(beta=BETA_MAX)
 gamma, _ = physical(variables)
 final = threshold(gamma, THRESHOLD, dtype=sim.dtype)
 

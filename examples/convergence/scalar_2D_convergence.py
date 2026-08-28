@@ -71,7 +71,7 @@ def solve(
         dt_stable: upper bound on the timestep, which `T` is then divided into.
 
     Returns:
-        (u, elapsed, N) -- the interior nodes at `T` shaped (n_el + 1,) * DIM, the
+        (u, elapsed, N): the interior nodes at `T` shaped (n_el + 1,) * DIM, the
         wall time of the time loop, and the number of steps taken.
     """
     Nx = (n_el + 3,) * DIM

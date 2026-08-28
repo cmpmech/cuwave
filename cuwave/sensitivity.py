@@ -105,31 +105,28 @@ def reconstruction_nodes(
     Which nodes those are is decided by `sim.damping`, so the caller states neither.
 
     Returns:
-        (strip, valid) -- the (ndim, num) grid indices to record and replay each step,
-        and the mask over the padded grid where the reconstructed triplet carries the
-        whole stencil `gradient_kernel` reads.
+        (strip, valid): the (ndim, num) grid indices to record and replay each step,
+        the damped ones a lossless node reads across the interface, and the mask of
+        every lossless interior node, which is where the rebuilt triplet is exact.
     """
-    # the reverse step of a node reaches this far, so a strip that thin shields it
+    # the reverse step of a node reaches this far, so a strip that thin feeds it
     radius = sim.space_order // 2
     interior = cp.zeros(sim.Nx_padded, dtype=cp.bool_)
     interior[tuple(slice(1, n - 1) for n in sim.Nx)] = True
     if sim.damping is None:
-        damped = cp.zeros_like(interior)
-        reach = damped
-    else:
-        damped = interior & (sim.damping > 0)
-        reach = ndi.binary_dilation(damped, iterations=radius, brute_force=True)
-    strip = cp.stack(cp.nonzero(interior & ~damped & reach)).astype(cp.int32)
-    return strip, interior & ~reach
+        return cp.zeros((sim.ndim, 0), dtype=cp.int32), interior
+    lossless = interior & ~(sim.damping > 0)
+    reach = ndi.binary_dilation(lossless, iterations=radius, brute_force=True)
+    strip = cp.stack(cp.nonzero(interior & ~lossless & reach)).astype(cp.int32)
+    return strip, lossless
 
 
 def require_reconstructable(sim: Simulation, valid: cpt.NDArray[cp.bool_]) -> None:
     """Raise if `sim.damping` leaves no lossless interior for a reverse march to rebuild."""
     if not bool(cp.any(valid)):
         raise ValueError(
-            f"damping and its {sim.space_order // 2}-node reach cover every interior "
-            f"node, so there is nothing to reconstruct; damp only the faces with "
-            f"boundary.sponge, or use sensitivity"
+            "damping covers every interior node, so there is nothing to reconstruct; "
+            "damp only the faces with boundary.sponge, or use sensitivity"
         )
 
 
@@ -217,8 +214,8 @@ def sensitivity(
         indicator: the design field the materials are built from.
         sensors: (ndim, num_sensors) interior grid indices.
         objective: takes the (N, num_sensors) record, returns (cost, dcost/dtraces).
-            The derivative drives the adjoint field, so any differentiable cost works
-            -- reparametrize by chain rule at the call site with
+            The derivative drives the adjoint field, so any differentiable cost
+            works; reparametrize by chain rule at the call site with
             `sim.parametrization_jacobian()`.
 
     A `sim.damping` field is stepped by the same kernel in both passes, since marching
@@ -227,7 +224,7 @@ def sensitivity(
     Returns:
         (cost, {"mass": ..., "stiff": ...}, traces, info), the gradients fields over
         the padded grid, `traces` the (N, num_sensors) record the cost was read from,
-        and `info` empty -- this variant has nothing to report.
+        and `info` empty; this variant has nothing to report.
     """
     require_interior(sim, sensors, "sensor")
     require_interior(sim, source.position, "source")
@@ -300,7 +297,7 @@ def reconstruction_sensitivity(
 
     Args:
         sim: the simulation both passes step, damped or lossless. Damping covering
-            every interior node is rejected -- nothing is left to rebuild from.
+            every interior node is rejected: nothing is left to rebuild from.
         source: the shot to differentiate, its position interior nodes only.
         indicator: the design field the materials are built from.
         sensors: (ndim, num_sensors) interior grid indices.
@@ -410,7 +407,7 @@ def superposition_sensitivity(
     both, with the measurements.
 
     Args:
-        sim: the simulation both passes step, which must be lossless -- a `damping`
+        sim: the simulation both passes step, which must be lossless: a `damping`
             field is rejected, since the time reversal needs one. `sensitivity`
             takes one.
         source: the shot to differentiate, its position interior nodes only.
