@@ -84,7 +84,7 @@ with the two materials `rho1`/`kappa1` and `rho2`/`kappa2` that $\gamma$ interpo
 $$m\ddot{\mathbf{u}}+d\dot{\mathbf{u}}-\nabla\cdot\boldsymbol{\sigma}=\mathbf{f},\qquad\boldsymbol{\sigma}=\lambda\,\textrm{tr}\left(\boldsymbol{\varepsilon}\right)\mathbf{I}+2\mu\boldsymbol{\varepsilon},\qquad\boldsymbol{\varepsilon}=\frac{1}{2}\left(\nabla\mathbf{u}+\nabla\mathbf{u}^\top\right)$$
 with the Lamé parameters $\lambda$ and $\mu$, solving for the displacement vector $\mathbf{u}$ instead of a scalar
 
-**TODO** not implemented yet
+Assembled cell by cell rather than axis by axis, so it carries its own page: see [elastic](elastic.md)
 
 ## define_\[kernel]
 Every kernel launch in the time loop is prepared by a `define_[kernel]` factory: it is called **once** during setup and returns a closure that launches one compiled kernel

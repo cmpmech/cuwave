@@ -13,9 +13,11 @@ TOL = 1e-6  # for `distribute`, so exact-boundary coordinates survive rounding
 
 
 # -------------------------------------- helpers --------------------------------------
-def _reparametrize(sim: Simulation, grads: dict[str, cpt.NDArray]) -> cpt.NDArray:
+def _reparametrize(
+    sim: Simulation, indicator: cpt.NDArray, grads: dict[str, cpt.NDArray]
+) -> cpt.NDArray:
     """Chain d(cost)/d(mass, stiff) onto the indicator with `parametrization_jacobian`."""
-    d_mass, d_stiff = sim.parametrization_jacobian()
+    d_mass, d_stiff = sim.parametrization_jacobian(indicator)
     return d_mass * grads["mass"] + d_stiff * grads["stiff"]
 
 
@@ -89,17 +91,23 @@ def line(
 
 
 def distribute(
-    sim: Simulation, coords: npt.ArrayLike
+    sim: Simulation, coords: npt.ArrayLike, direction: npt.ArrayLike | None = None
 ) -> tuple[cpt.NDArray[cp.int32], cpt.NDArray]:
-    """Multilinear interpolation of `coords` onto the grid.
+    """Multilinear interpolation of `coords` onto the grid, along `direction`.
+
+    A vector unknown drives and reads along a direction, which enters as a factor on the
+    weights, so `traces` and `scatter` stay exact transposes of one another.
 
     Args:
         sim: the simulation whose grid the coordinates land on.
         coords: (num, ndim) physical coordinates, inside the domain.
+        direction: (ncomp,) or (num, ncomp) components to act along, required where the
+            unknown has more than one.
 
     Returns:
         (nodes, weights) of the surrounding 2**ndim cell corners, shaped
-        (ndim, num * 2**ndim) and (num, 2**ndim).
+        (node_rows, num * 2**ndim * ncomp) and (num, 2**ndim * ncomp), the component
+        running fastest.
     """
     coords = np.atleast_2d(np.asarray(coords, dtype=float))
     if coords.shape[1] != sim.ndim:
@@ -130,14 +138,44 @@ def distribute(
     for d in range(sim.ndim):
         w = offset[d][:, None]
         weights *= np.where(corners[None, :, d] == 1, w, 1.0 - w)
+    if direction is None:
+        if sim.ncomp > 1:
+            raise ValueError(f"a {sim.ncomp}-component unknown needs a direction")
+        return (
+            cp.asarray(nodes.reshape(sim.ndim, -1), dtype=cp.int32),
+            cp.asarray(weights, dtype=sim.dtype),
+        )
+    n = np.atleast_2d(np.asarray(direction, dtype=float))
+    if n.shape[1] != sim.ncomp:
+        raise ValueError(f"direction needs {sim.ncomp} components, not {n.shape[1]}")
+    if len(n) == 1:
+        n = np.repeat(n, len(coords), axis=0)
+    if len(n) != len(coords):
+        raise ValueError(f"{len(n)} directions for {len(coords)} coordinates")
+    weights = (weights[:, :, None] * n[:, None, :]).reshape(len(coords), -1)
+    if sim.node_rows == sim.ndim:
+        # a single component needs no row of its own, so the direction is a scale
+        return (
+            cp.asarray(nodes.reshape(sim.ndim, -1), dtype=cp.int32),
+            cp.asarray(weights, dtype=sim.dtype),
+        )
+    # the component runs fastest, so one column per (coordinate, corner, component)
+    spatial = np.repeat(nodes[:, :, :, None], sim.ncomp, axis=3)
+    component = np.broadcast_to(
+        np.arange(sim.ncomp)[None, None, None, :], (1, *spatial.shape[1:])
+    )
+    rows = np.concatenate((component, spatial), axis=0)
     return (
-        cp.asarray(nodes.reshape(sim.ndim, -1), dtype=cp.int32),
+        cp.asarray(rows.reshape(sim.node_rows, -1), dtype=cp.int32),
         cp.asarray(weights, dtype=sim.dtype),
     )
 
 
 def point_source(
-    sim: Simulation, coords: npt.ArrayLike, signal: cpt.NDArray | npt.NDArray
+    sim: Simulation,
+    coords: npt.ArrayLike,
+    signal: cpt.NDArray | npt.NDArray,
+    direction: npt.ArrayLike | None = None,
 ) -> Source:
     """Build a `Source` injecting `signal` at `coords`, distributed by `distribute`.
 
@@ -150,7 +188,7 @@ def point_source(
         the `Source`, its signal divided by the cell volume so the amplitude is
         independent of the grid spacing.
     """
-    nodes, weights = distribute(sim, coords)
+    nodes, weights = distribute(sim, coords, direction)
     count = weights.shape[0]
     signal = cp.asarray(signal, dtype=sim.dtype)
     if signal.ndim == 1:
@@ -164,7 +202,10 @@ def point_source(
 
 
 def collect_source(
-    sim: Simulation, coords: npt.ArrayLike, columns: cpt.NDArray
+    sim: Simulation,
+    coords: npt.ArrayLike,
+    columns: cpt.NDArray,
+    direction: npt.ArrayLike | None = None,
 ) -> cpt.NDArray:
     """Transpose of `point_source`: an (N, num * 2**ndim) node gradient onto `coords`.
 
@@ -176,17 +217,20 @@ def collect_source(
     Returns:
         the (N, num) derivative with respect to the signal of each coordinate.
     """
-    _, weights = distribute(sim, coords)
+    _, weights = distribute(sim, coords, direction)
     columns = columns.reshape(columns.shape[0], len(weights), -1)
     # cast, since dividing a float32 record by a float64 cell volume would promote it
     return (columns * weights).sum(2) / sim.dtype(np.prod(sim.dx))
 
 
 def shots(
-    sim: Simulation, coords: npt.ArrayLike, signal: cpt.NDArray | npt.NDArray
+    sim: Simulation,
+    coords: npt.ArrayLike,
+    signal: cpt.NDArray | npt.NDArray,
+    direction: npt.ArrayLike | None = None,
 ) -> list[Source]:
     """One single-coordinate `Source` per coordinate: the shot list of an inversion"""
-    return [point_source(sim, c, signal) for c in np.atleast_2d(coords)]
+    return [point_source(sim, c, signal, direction) for c in np.atleast_2d(coords)]
 
 
 def stack(sources: Sequence[Source]) -> Source:
@@ -212,13 +256,20 @@ class Sensors:
     Args:
         sim: the simulation whose grid the receivers land on.
         coords: (count, ndim) physical coordinates of the receivers.
+        direction: (ndim,) or (count, ndim) components each receiver measures along,
+            required where the unknown is a vector.
     """
 
-    def __init__(self, sim: Simulation, coords: npt.ArrayLike) -> None:
+    def __init__(
+        self,
+        sim: Simulation,
+        coords: npt.ArrayLike,
+        direction: npt.ArrayLike | None = None,
+    ) -> None:
         self.sim = sim
         self.coordinates = np.atleast_2d(np.asarray(coords, dtype=float))
         self.count = len(self.coordinates)
-        self.nodes, self.weights = distribute(sim, self.coordinates)
+        self.nodes, self.weights = distribute(sim, self.coordinates, direction)
 
     def traces(self, record: cpt.NDArray) -> cpt.NDArray:
         """(N, count * 2**ndim) node record -> (N, count) receiver traces"""
@@ -299,7 +350,7 @@ def misfit_gradient(
             sim, source, indicator, sensors.nodes, sensors.objective(objective(data))
         )
         cost += shot_cost
-        gradient += _reparametrize(sim, grads)
+        gradient += _reparametrize(sim, indicator, grads)
     return cost, gradient
 
 
@@ -355,4 +406,4 @@ def response_gradient(
         reparametrized from (mass, stiff) onto `indicator`.
     """
     cost, grads, _, _ = adjoint(sim, source, indicator, sensors, objective)
-    return cost, _reparametrize(sim, grads)
+    return cost, _reparametrize(sim, indicator, grads)

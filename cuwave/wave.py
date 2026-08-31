@@ -17,10 +17,11 @@ import cupy.typing as cpt
 import numpy as np
 import numpy.typing as npt
 
-from .boundary import canonical_boundary, define_boundary
+from .boundary import Neumann, canonical_boundary, define_boundary
 from .stencils import preamble, weights
 
 KERNEL_PATH = Path(__file__).parent / "kernels" / "wave.cu"
+SENSITIVITY_PATH = Path(__file__).parent / "kernels" / "wave_sensitivity.cu"
 
 
 # ------------------------------------- utilities -------------------------------------
@@ -63,13 +64,53 @@ class Source:
     signal: cpt.NDArray  # (N, num_sources) time series
 
 
+# W is the cell volume a node owns; docs/sensitivity.md derives it
+def apply_cell_weights(sim: Simulation, field: cpt.NDArray) -> cpt.NDArray:
+    """In-place multiply of `field` by the cell weights W."""
+    # axes in sequence, so a corner compounds to 1/4 (1/8 in 3D)
+    for d in range(sim.ndim):
+        for index in (1, sim.Nx[d] - 2):
+            face = [slice(None)] * sim.ndim
+            face[d] = index
+            field[tuple(face)] *= 0.5
+    return field
+
+
+def sensor_cell_weights(sim: Simulation, sensors: cpt.NDArray[cp.int32]) -> cpt.NDArray:
+    """Cell weights W at the sensor nodes only, as a (num_sensors,) vector."""
+    # the nested loop of apply_cell_weights, so the two agree on a degenerate axis too
+    w = cp.ones(sensors.shape[1], dtype=sim.dtype)
+    for d in range(sim.ndim):
+        for index in (1, sim.Nx[d] - 2):
+            w = cp.where(grid_rows(sim, sensors)[d] == index, w * 0.5, w)
+    return w
+
+
+def grid_rows(
+    sim: Simulation, position: cpt.NDArray[cp.int32]
+) -> cpt.NDArray[cp.int32]:
+    """The `ndim` spatial rows of `position`, dropping a leading component row."""
+    return position[-sim.ndim :]
+
+
 def flatten_indices(
     sim: Simulation, position: cpt.NDArray[cp.int32]
 ) -> cpt.NDArray[cp.int32]:
-    """Collapse (ndim, num) grid indices `position` into flat indices of the padded array."""
+    """Collapse (node_rows, num) indices `position` into flat indices of the field.
+
+    A vector unknown takes a leading component row, folded in as
+    `component * comp_stride`, so the gather and scatter kernels stay scalar.
+    """
+    if position.shape[0] != sim.node_rows:
+        raise ValueError(
+            f"position needs {sim.node_rows} rows for ncomp={sim.ncomp} in "
+            f"{sim.ndim}D, not {position.shape[0]}"
+        )
     lin = cp.zeros(position.shape[1], dtype=cp.int32)
     for d in range(sim.ndim):
-        lin += position[d] * cp.int32(sim.strides[d])
+        lin += grid_rows(sim, position)[d] * cp.int32(sim.strides[d])
+    if sim.ncomp > 1:
+        lin += position[0] * cp.int32(sim.comp_stride)
     return lin
 
 
@@ -85,9 +126,22 @@ class Simulation:
     threads: tuple[int, ...]  # threads per block, per axis
     precision: str = "float32"  # "float32" or "float64"
     space_order: int = 2  # finite difference order: any even number
-    boundary: tuple = None  # ((low, high),) per axis; None is Neumann everywhere
+    boundary: tuple = None  # ((low, high),) per axis; None is the equation's default
+    damping: cpt.NDArray | None = None  # nodal field d, or None for a lossless operator
 
-    compile_flags = ()  # extra nvcc -D flags
+    @property
+    def compile_flags(self) -> tuple[str, ...]:
+        """`-DUSE_DAMPING` when a damping field is set, else no extra flags."""
+        return ("-DUSE_DAMPING",) if self.damping is not None else ()
+
+    kernel_path = KERNEL_PATH  # the forward source this equation compiles
+    sensitivity_path = SENSITIVITY_PATH  # and the adjoint one
+    default_boundary = Neumann  # what `boundary=None` means for this equation
+
+    @property
+    def ncomp(self) -> int:
+        """Field components per node: 1 for a scalar unknown, `ndim` for a vector one."""
+        return 1
 
     def __post_init__(self) -> None:
         """Derive `ndim`, padded shape, strides, dtype, and canonical `boundary`."""
@@ -99,23 +153,29 @@ class Simulation:
             strides[d] = strides[d + 1] * self.Nx_padded[d + 1]
         self.strides = tuple(strides)
         self.dtype = cp.float32 if self.precision == "float32" else cp.float64
-        self.boundary = canonical_boundary(self.boundary, self.ndim)
+        self.boundary = canonical_boundary(
+            self.boundary, self.ndim, self.default_boundary
+        )
         if self.space_order % 2 != 0 or self.space_order < 2:
             raise ValueError("space_order must be an even integer >= 2")
+        self.comp_stride = int(np.prod(self.Nx_padded))
+        self.node_rows = self.ndim + (self.ncomp > 1)
+        self.field_shape = (
+            self.Nx_padded if self.ncomp == 1 else (self.ncomp, *self.Nx_padded)
+        )
+        # flatten_indices accumulates in int32, so the whole field has to address in it
+        if self.ncomp * self.comp_stride >= 2**31:
+            raise ValueError(
+                f"{self.ncomp} x {self.comp_stride} nodes overflow the int32 flat "
+                f"index; coarsen the grid"
+            )
 
 
 @dataclass
 class PressureWave(Simulation):
     """Scalar wave equation base: nodal `stiff`/`minv` material fields, optional damping."""
 
-    damping: cpt.NDArray | None = None  # nodal field d, or None for a lossless operator
-
     derive_inertia = False  # set where m == k (rho scaling): minv derived from stiff
-
-    @property
-    def compile_flags(self) -> tuple[str, ...]:
-        """`-DUSE_DAMPING` when a damping field is set, else no extra flags."""
-        return ("-DUSE_DAMPING",) if self.damping is not None else ()
 
     def build_materials(self, indicator: cpt.NDArray) -> dict:
         """Turn `indicator` into the kernel's material dict, `damping` included."""
@@ -127,6 +187,11 @@ class PressureWave(Simulation):
             mat["damping"] = self.damping
         return mat
 
+    def inverse_inertia(self, indicator: cpt.NDArray) -> cpt.NDArray:
+        """Nodal `1 / m` for `indicator`, derived from the stiffness where `m == k`."""
+        stiff, minv = self.parametrization(indicator)
+        return 1.0 / stiff if minv is None else minv
+
     def step_kernel_args(self, mat: dict) -> tuple:
         """Material and damping arguments for the finite-difference step kernel."""
         minv = mat["stiff"] if self.derive_inertia else mat["minv"]
@@ -134,6 +199,71 @@ class PressureWave(Simulation):
         if self.damping is not None:
             args += (mat["damping"], self.dtype(self.dt))
         return args
+
+    gradient_names = ("mass", "stiff")  # the material fields the adjoint differentiates
+
+    def gradient_fields(self, mat: dict) -> dict[str, cpt.NDArray]:
+        """Zeroed accumulators the adjoint kernels add into, one per material field."""
+        return {
+            name: cp.zeros(self.Nx_padded, dtype=self.dtype)
+            for name in self.gradient_names
+        }
+
+    def adjoint_weights(self, sensors: cpt.NDArray[cp.int32]) -> cpt.NDArray:
+        """Divisor the adjoint source carries: the cell weights W over the source factor."""
+        return sensor_cell_weights(self, sensors) * self.source_factor()
+
+    def finalize_gradients(self, grads: dict, kernels: cp.RawModule) -> dict:
+        """Weight the accumulators by W once the time loop is done."""
+        for field in grads.values():
+            apply_cell_weights(self, field)
+        return grads
+
+    def define_gradient(
+        self, kernels: cp.RawModule, mat: dict, grads: dict
+    ) -> Callable:
+        """Closure accumulating both gradient densities from a forward triplet and `l1`."""
+        # one kernel for both gradients: a launch costs more host time than either body
+        gradient_kernel = kernels.get_function("gradient_kernel")
+        grid, block = grid_block(self)
+        # the operator without the dt^2 the step folds into it: L, not dt^2 L
+        factors = [self.dtype(float(f) / self.dt**2) for f in self.step_factors()]
+        geom = [factors[0], self.Nx[0]]
+        for d in range(1, self.ndim):
+            geom += [factors[d], self.Nx[d], self.strides[d - 1]]
+        args = [grads["mass"], grads["stiff"], None, None, None, None] + [
+            mat["stiff"],
+            self.dtype(1.0 / self.dt**2),
+            *geom,
+        ]
+
+        def gradient_step(u0, u1, u2, l1):
+            args[2], args[3], args[4], args[5] = u0, u1, u2, l1
+            gradient_kernel(grid, block, args)
+
+        return gradient_step
+
+    def define_frechet(
+        self, kernels: cp.RawModule, accs: dict, sign: float
+    ) -> Callable:
+        """Closure accumulating both Frechet densities of one field triplet, times `sign`."""
+        # sign is fixed per pass, so it is folded into the factors rather than recomputed
+        frechet_kernel = kernels.get_function("frechet_kernel")
+        grid, block = grid_block(self)
+        # the stiffness density enters negated, so the epilogue scales both alike
+        geom = [self.dtype(sign / (2.0 * self.dt) ** 2)]
+        for d in range(self.ndim):
+            geom.append(self.dtype(-sign / (2.0 * self.dx[d]) ** 2))
+            geom.append(self.Nx[d])
+            if d:
+                geom.append(self.strides[d - 1])
+        args = [accs["mass"], accs["stiff"], None, None, None] + geom
+
+        def frechet_step(u0, u1, u2):
+            args[2], args[3], args[4] = u0, u1, u2
+            frechet_kernel(grid, block, args)
+
+        return frechet_step
 
     def excitation_weights(
         self, mat: dict, lin_index: cpt.NDArray[cp.int32]
@@ -173,7 +303,7 @@ class ScalarWave(PressureWave):
         """`indicator` is the density-scaling field gamma; `minv` is left to be derived from it."""
         return indicator, None
 
-    def parametrization_jacobian(self) -> tuple[float, float]:
+    def parametrization_jacobian(self, indicator: cpt.NDArray) -> tuple:
         """Both mass and stiffness coefficients are gamma itself, so both derivatives are 1."""
         return 1.0, 1.0
 
@@ -213,7 +343,7 @@ class AcousticWave(PressureWave):
         kappa_inv = 1 / self.kappa1 + indicator * (1 / self.kappa2 - 1 / self.kappa1)
         return rho_inv, 1 / kappa_inv
 
-    def parametrization_jacobian(self) -> tuple[float, float]:
+    def parametrization_jacobian(self, indicator: cpt.NDArray) -> tuple:
         """Derivatives of (mass, stiff) with respect to gamma; both coefficients are affine in it."""
         # affine in gamma as (mass, stiff) = (1 / kappa, 1 / rho), hence constant
         return (
@@ -231,8 +361,9 @@ class AcousticWave(PressureWave):
 
 
 # ----------------------------------- kernel helpers ----------------------------------
-def compile_kernels(sim: Simulation, path: Path = KERNEL_PATH) -> cp.RawModule:
-    """Compile the kernel source at `path` for `sim`, with the stencil table injected as source."""
+def compile_kernels(sim: Simulation, path: Path | None = None) -> cp.RawModule:
+    """Compile `path` for `sim`, defaulting to its own source, stencil table injected."""
+    path = sim.kernel_path if path is None else path
     options = ["--use_fast_math", f"-DNDIM={sim.ndim}", *sim.compile_flags]
     if sim.precision == "float32":
         options.append("-DUSE_FLOAT")
@@ -369,7 +500,7 @@ def simulate(
         the final interior field, followed by the (N, num_sensors) record when
         `sensors` is given and the stacked host snapshots when `record_every` is.
     """
-    U = cp.zeros((2, *sim.Nx_padded), dtype=sim.dtype)
+    U = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
     u0, u1 = U[0], U[1]
 
     mat = sim.build_materials(indicator)
@@ -380,7 +511,7 @@ def simulate(
     if sensors is not None:
         get_signal = define_get_signal(sim, sensors, kernels)
         um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
-    interior = tuple(slice(0, n) for n in sim.Nx)
+    interior = (Ellipsis, *(slice(0, n) for n in sim.Nx))
     snapshots = []
 
     def field(u):

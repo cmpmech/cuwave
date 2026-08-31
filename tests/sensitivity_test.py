@@ -47,7 +47,6 @@ except Exception:  # cupy missing or no GPU
 if HAS_CUDA:
     from cuwave.boundary import Dirichlet, Neumann, pad_for_sponge, sponge
     from cuwave.sensitivity import (
-        apply_cell_weights,
         l2_misfit,
         reconstruction_nodes,
         reconstruction_sensitivity,
@@ -59,6 +58,7 @@ if HAS_CUDA:
     from cuwave.utils import collect_source, point_source
     from cuwave.signals import ricker
     from cuwave.wave import (
+        apply_cell_weights,
         AcousticWave,
         ScalarWave,
         Source,
@@ -137,8 +137,7 @@ def _finite_difference(cost, field, nodes, h=1e-7):
 
 def _damp(sim, indicator, beta):
     """Copy of `sim` damped to a uniform `beta`, whatever inertia its parametrization gives."""
-    stiff, minv = sim.parametrization(indicator)
-    minv = 1.0 / stiff if minv is None else minv
+    minv = sim.inverse_inertia(indicator)
     field = cp.ascontiguousarray((2.0 * beta / sim.dt / minv).astype(sim.dtype))
     return replace(sim, damping=field)
 
@@ -179,8 +178,8 @@ def _problem(sim, frequency, base):
     return source, sensors, indicator, objective
 
 
-def _combine(sim, grads):
-    d_mass, d_stiff = sim.parametrization_jacobian()
+def _combine(sim, grads, indicator=None):
+    d_mass, d_stiff = sim.parametrization_jacobian(indicator)
     return d_mass * grads["mass"] + d_stiff * grads["stiff"]
 
 
@@ -217,8 +216,7 @@ class GradientTest(unittest.TestCase):
         )
         self.assertAlmostEqual(cost / cost_of(), 1.0, places=10, msg="forward mismatch")
 
-        d_mass, d_stiff = sim.parametrization_jacobian()
-        gradient = d_mass * grads["mass"] + d_stiff * grads["stiff"]
+        gradient = _combine(sim, grads, indicator)
 
         nodes = nodes or self._nodes(sim)
         reference = _finite_difference(cost_of, indicator, nodes)
@@ -337,8 +335,7 @@ class GradientTest(unittest.TestCase):
         objective = l2_misfit(cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype))
 
         _, grads, _, _ = sensitivity(sim, source, indicator, sensors, objective)
-        d_mass, d_stiff = sim.parametrization_jacobian()
-        gradient = d_mass * grads["mass"] + d_stiff * grads["stiff"]
+        gradient = _combine(sim, grads, indicator)
         for ghost in ((0, 12), (sim.Nx[0] - 1, 12), (12, 0), (12, sim.Nx[1] - 1)):
             self.assertEqual(float(gradient[ghost]), 0.0)
 

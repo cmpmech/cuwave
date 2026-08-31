@@ -121,7 +121,7 @@ print(
 )
 
 # chain rule: linear in 1 / kappa and 1 / rho, so the Jacobian is a pair of constants
-d_mass, d_stiff = sim.parametrization_jacobian()
+d_mass, d_stiff = sim.parametrization_jacobian(indicator)
 gradient = (d_mass * grads["mass"] + d_stiff * grads["stiff"]).get()
 
 # ----------------------------------- postprocessing ----------------------------------

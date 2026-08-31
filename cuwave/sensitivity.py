@@ -14,7 +14,6 @@ the source signal rather than the material, which needs no forward field at all.
 
 import warnings
 from collections.abc import Callable
-from pathlib import Path
 
 import cupy as cp
 import cupy.typing as cpt
@@ -30,10 +29,9 @@ from .wave import (
     define_set_signal,
     define_step_method,
     flatten_indices,
-    grid_block,
+    grid_rows,
+    sensor_cell_weights,
 )
-
-KERNEL_PATH = Path(__file__).parent / "kernels" / "wave_sensitivity.cu"
 
 ADJOINT_DELAY = 1  # lines the adjoint up with the reconstructed forward triplet
 
@@ -42,6 +40,30 @@ CANCELLATION_LIMIT = {"float32": 1e5, "float64": 1e12}
 
 
 # -------------------------------------- helpers --------------------------------------
+def windowed_misfit(observed: cpt.NDArray, window: cpt.NDArray) -> Callable:
+    """Objective factory: `l2_misfit` restricted to a time window.
+
+    Args:
+        observed: the (N, num_sensors) measured record to fit.
+        window: (N, 1) or (N, num_sensors) weights, zero outside the window kept.
+
+    Returns:
+        the objective `sensitivity` takes, its derivative carrying the window twice
+        so that it stays the exact derivative of the windowed cost.
+    """
+
+    def objective(traces):
+        residual = window * (traces - observed)
+        return 0.5 * float(cp.sum(residual**2)), window * residual
+
+    return objective
+
+
+def _accumulated(accs: dict) -> float:
+    """Norm over every accumulator, so the diagnostic names no material field."""
+    return float(sum(float(cp.linalg.norm(f)) ** 2 for f in accs.values()) ** 0.5)
+
+
 def l2_misfit(observed: cpt.NDArray) -> Callable:
     """Objective factory: J = 1/2 sum (traces - observed)^2, and its derivative."""
 
@@ -52,38 +74,17 @@ def l2_misfit(observed: cpt.NDArray) -> Callable:
     return objective
 
 
-# W is the cell volume a node owns; docs/sensitivity.md derives it
-def apply_cell_weights(sim: Simulation, field: cpt.NDArray) -> cpt.NDArray:
-    """In-place multiply of `field` by the cell weights W."""
-    # axes in sequence, so a corner compounds to 1/4 (1/8 in 3D)
-    for d in range(sim.ndim):
-        for index in (1, sim.Nx[d] - 2):
-            face = [slice(None)] * sim.ndim
-            face[d] = index
-            field[tuple(face)] *= 0.5
-    return field
-
-
-def sensor_cell_weights(sim: Simulation, sensors: cpt.NDArray[cp.int32]) -> cpt.NDArray:
-    """Cell weights W at the sensor nodes only, as a (num_sensors,) vector."""
-    # the nested loop of apply_cell_weights, so the two agree on a degenerate axis too
-    w = cp.ones(sensors.shape[1], dtype=sim.dtype)
-    for d in range(sim.ndim):
-        for index in (1, sim.Nx[d] - 2):
-            w = cp.where(sensors[d] == index, w * 0.5, w)
-    return w
-
-
 def require_interior(
     sim: Simulation, position: cpt.NDArray[cp.int32], what: str
 ) -> None:
     """Raise if any node of `position` sits on a ghost node, naming it `what`."""
     # a ghost node carries no equation, so a sensor there corrupts the whole gradient
-    lo = int(cp.min(position))
+    rows = grid_rows(sim, position)
+    lo = int(cp.min(rows))
     if lo < 1:
         raise ValueError(f"{what} on a ghost node: index {lo} < 1")
     for d in range(sim.ndim):
-        hi = int(cp.max(position[d]))
+        hi = int(cp.max(rows[d]))
         if hi > sim.Nx[d] - 2:
             raise ValueError(
                 f"{what} on a ghost node: axis {d} index {hi} exceeds "
@@ -117,11 +118,22 @@ def reconstruction_nodes(
     interior = cp.zeros(sim.Nx_padded, dtype=cp.bool_)
     interior[tuple(slice(1, n - 1) for n in sim.Nx)] = True
     if sim.damping is None:
-        return cp.zeros((sim.ndim, 0), dtype=cp.int32), interior
+        return cp.zeros((sim.node_rows, 0), dtype=cp.int32), interior
     lossless = interior & ~(sim.damping > 0)
     reach = ndi.binary_dilation(lossless, iterations=radius, brute_force=True)
     strip = cp.stack(cp.nonzero(interior & ~lossless & reach)).astype(cp.int32)
-    return strip, lossless
+    return with_components(sim, strip), lossless
+
+
+def with_components(
+    sim: Simulation, nodes: cpt.NDArray[cp.int32]
+) -> cpt.NDArray[cp.int32]:
+    """Repeat spatial `nodes` once per field component, the component row prepended."""
+    if sim.ncomp == 1:
+        return nodes
+    tiled = cp.tile(nodes, (1, sim.ncomp))
+    row = cp.repeat(cp.arange(sim.ncomp, dtype=cp.int32), nodes.shape[1])
+    return cp.ascontiguousarray(cp.concatenate((row[None, :], tiled), axis=0))
 
 
 def require_reconstructable(sim: Simulation, valid: cpt.NDArray[cp.bool_]) -> None:
@@ -150,55 +162,10 @@ def adjoint_signal(
             starts the adjoint recursion that many steps earlier in its own sequence.
     """
     # define_excitation supplies the dt^2 source_factor minv the recursion wants
-    signal = cp.asarray(dphi, dtype=sim.dtype)[::-1] / (
-        sensor_cell_weights(sim, sensors) * sim.source_factor()
-    )
+    signal = cp.asarray(dphi, dtype=sim.dtype)[::-1] / sim.adjoint_weights(sensors)
     if delay:
         signal = cp.concatenate((signal[delay:], cp.zeros_like(signal[:delay])))
     return cp.ascontiguousarray(sim.dtype(scale) * signal, dtype=sim.dtype)
-
-
-# ----------------------------------- kernel helpers ----------------------------------
-def define_gradient(sim: Simulation, kernels: cp.RawModule, mat: dict) -> Callable:
-    """Closure accumulating both gradient densities from a forward triplet and `l1`."""
-    # one kernel for both gradients: a launch costs more host time than either body
-    gradient_kernel = kernels.get_function("gradient_kernel")
-    grid, block = grid_block(sim)
-    # the operator without the dt^2 the step folds into it: L, not dt^2 L
-    factors = [sim.dtype(float(f) / sim.dt**2) for f in sim.step_factors()]
-    geom = [factors[0], sim.Nx[0]]
-    for d in range(1, sim.ndim):
-        geom += [factors[d], sim.Nx[d], sim.strides[d - 1]]
-    args = [None] * 6 + [mat["stiff"], sim.dtype(1.0 / sim.dt**2), *geom]
-
-    def gradient_step(g_mass, g_stiff, u0, u1, u2, l1):
-        args[0], args[1] = g_mass, g_stiff
-        args[2], args[3], args[4], args[5] = u0, u1, u2, l1
-        gradient_kernel(grid, block, args)
-
-    return gradient_step
-
-
-def define_frechet(sim: Simulation, kernels: cp.RawModule, sign: float) -> Callable:
-    """Closure accumulating both Frechet densities of one field triplet, times `sign`."""
-    # sign is fixed per pass, so it is folded into the factors rather than recomputed
-    frechet_kernel = kernels.get_function("frechet_kernel")
-    grid, block = grid_block(sim)
-    # [ft, f0, N0, f1, N1, s0, ...], the axis triples as in wave.axis_geometry
-    geom = [sim.dtype(sign / (2.0 * sim.dt) ** 2)]
-    for d in range(sim.ndim):
-        geom.append(sim.dtype(sign / (2.0 * sim.dx[d]) ** 2))
-        geom.append(sim.Nx[d])
-        if d:
-            geom.append(sim.strides[d - 1])
-    args = [None] * 5 + geom
-
-    def frechet_step(acc_mass, acc_stiff, u0, u1, u2):
-        args[0], args[1] = acc_mass, acc_stiff
-        args[2], args[3], args[4] = u0, u1, u2
-        frechet_kernel(grid, block, args)
-
-    return frechet_step
 
 
 # ---------------------------------- adjoint solvers ----------------------------------
@@ -234,16 +201,17 @@ def sensitivity(
 
     mat = sim.build_materials(indicator)
     kernels = compile_kernels(sim)
-    sens_kernels = compile_kernels(sim, KERNEL_PATH)
+    sens_kernels = compile_kernels(sim, sim.sensitivity_path)
 
     fd_step = define_step_method(sim, kernels, mat)
     bc_step = define_boundary(sim, kernels)
     excitation_step = define_excitation(sim, source.position, kernels, mat)
-    gradient_step = define_gradient(sim, sens_kernels, mat)
+    grads = sim.gradient_fields(mat)
+    gradient_step = sim.define_gradient(sens_kernels, mat, grads)
 
     # ------------------------------------ forward pass -----------------------------------
     # stepped straight into the history, so the leading zeros are u^-2 / u^-1
-    V = cp.zeros((sim.N + 2, *sim.Nx_padded), dtype=sim.dtype)
+    V = cp.zeros((sim.N + 2, *sim.field_shape), dtype=sim.dtype)
     # the slot views made once: V[t] is a host slice costing more than its own kernel
     slot = [V[t] for t in range(sim.N + 2)]
 
@@ -262,11 +230,8 @@ def sensitivity(
     adjoint_excitation = define_excitation(sim, sensors, kernels, mat)
 
     # ----------------------------------- backward pass -----------------------------------
-    P = cp.zeros((2, *sim.Nx_padded), dtype=sim.dtype)
+    P = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
     p0, p1 = P[0], P[1]
-    g_mass = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
-    g_stiff = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
-
     for m in range(sim.N):
         n = sim.N - 1 - m
         p0 = fd_step(p0, p1, p0)
@@ -274,11 +239,9 @@ def sensitivity(
         p0 = bc_step(p0)
         p1, p0 = p0, p1  # p1 now holds lambda^n
         # inertia pairs lambda^n with the whole triplet, stiffness with its middle slot
-        gradient_step(g_mass, g_stiff, slot[n], slot[n + 1], slot[n + 2], p1)
+        gradient_step(slot[n], slot[n + 1], slot[n + 2], p1)
 
-    apply_cell_weights(sim, g_mass)
-    apply_cell_weights(sim, g_stiff)
-    return cost, {"mass": g_mass, "stiff": g_stiff}, um, {}
+    return cost, sim.finalize_gradients(grads, sens_kernels), um, {}
 
 
 def reconstruction_sensitivity(
@@ -319,18 +282,19 @@ def reconstruction_sensitivity(
 
     mat = sim.build_materials(indicator)
     kernels = compile_kernels(sim)
-    sens_kernels = compile_kernels(sim, KERNEL_PATH)
+    sens_kernels = compile_kernels(sim, sim.sensitivity_path)
 
     fd_step = define_step_method(sim, kernels, mat)
     bc_step = define_boundary(sim, kernels)
     excitation_step = define_excitation(sim, source.position, kernels, mat)
     get_signal = define_get_signal(sim, sensors, kernels)
-    gradient_step = define_gradient(sim, sens_kernels, mat)
+    grads = sim.gradient_fields(mat)
+    gradient_step = sim.define_gradient(sens_kernels, mat, grads)
     if num_strip:
         record_strip = define_get_signal(sim, strip, kernels)
         replay_strip = define_set_signal(sim, strip, kernels)
 
-    U = cp.zeros((3, *sim.Nx_padded), dtype=sim.dtype)
+    U = cp.zeros((3, *sim.field_shape), dtype=sim.dtype)
     u0, u1, u2 = U[0], U[1], U[2]
     um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
     # two leading zero rows, so row t + 2 is u^t and the initial states need no branch
@@ -353,14 +317,11 @@ def reconstruction_sensitivity(
     adjoint_excitation = define_excitation(sim, sensors, kernels, mat)
 
     # ----------------------------------- backward pass -----------------------------------
-    P = cp.zeros((2, *sim.Nx_padded), dtype=sim.dtype)
+    P = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
     p0, p1 = P[0], P[1]
-    g_mass = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
-    g_stiff = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
-
     # the forward rotation left the last three states live, which is the whole seed
     a, b, c = u2, u0, u1
-    seed = float(cp.linalg.norm(c[valid]))
+    seed = float(cp.linalg.norm(c * valid))
 
     for m in range(sim.N):
         n = sim.N - 1 - m
@@ -369,7 +330,7 @@ def reconstruction_sensitivity(
         p0 = bc_step(p0)
         p1, p0 = p0, p1  # p1 now holds lambda^n
         # inertia pairs lambda^n with the whole triplet, stiffness with its middle slot
-        gradient_step(g_mass, g_stiff, a, b, c, p1)
+        gradient_step(a, b, c, p1)
         if n < 1:
             break
         # read backwards, so the source rides two steps ahead of the state it rebuilds
@@ -380,16 +341,15 @@ def reconstruction_sensitivity(
         c = bc_step(c)
         a, b, c = c, a, b
 
-    apply_cell_weights(sim, g_mass)
-    apply_cell_weights(sim, g_stiff)
+    grads = sim.finalize_gradients(grads, sens_kernels)
     # assigned, not multiplied, so a NaN outside cannot survive as 0 * NaN
     outside = ~valid
-    g_mass[outside] = 0.0
-    g_stiff[outside] = 0.0
+    for field in grads.values():
+        field[outside] = 0.0
     # the march ends on the initial state, which is zero, so what is left is round-off
-    drift = float(cp.linalg.norm(a[valid])) / seed if seed > 0.0 else float("inf")
+    drift = float(cp.linalg.norm(a * valid)) / seed if seed > 0.0 else float("inf")
     info = {"strip": num_strip, "drift": drift}
-    return cost, {"mass": g_mass, "stiff": g_stiff}, um, info
+    return cost, grads, um, info
 
 
 def superposition_sensitivity(
@@ -430,19 +390,18 @@ def superposition_sensitivity(
 
     mat = sim.build_materials(indicator)
     kernels = compile_kernels(sim)
-    sens_kernels = compile_kernels(sim, KERNEL_PATH)
+    sens_kernels = compile_kernels(sim, sim.sensitivity_path)
 
     fd_step = define_step_method(sim, kernels, mat)
     bc_step = define_boundary(sim, kernels)
     excitation_step = define_excitation(sim, source.position, kernels, mat)
     get_signal = define_get_signal(sim, sensors, kernels)
-    subtract_step = define_frechet(sim, sens_kernels, -1.0)
-    add_step = define_frechet(sim, sens_kernels, 1.0)
+    accs = sim.gradient_fields(mat)
+    subtract_step = sim.define_frechet(sens_kernels, accs, -1.0)
+    add_step = sim.define_frechet(sens_kernels, accs, 1.0)
 
-    U = cp.zeros((3, *sim.Nx_padded), dtype=sim.dtype)
+    U = cp.zeros((3, *sim.field_shape), dtype=sim.dtype)
     u0, u1, u2 = U[0], U[1], U[2]
-    acc_mass = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
-    acc_stiff = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
     um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
 
     # ------------------------------------ forward pass -----------------------------------
@@ -452,14 +411,14 @@ def superposition_sensitivity(
         u2 = excitation_step(u2, source.signal, t)
         u2 = bc_step(u2)
         get_signal(u2, um, t)
-        subtract_step(acc_mass, acc_stiff, u0, u1, u2)
+        subtract_step(u0, u1, u2)
         u0, u1, u2 = u1, u2, u0
 
     cost, dphi = objective(um)
 
     # --------------------------------- adjoint excitation --------------------------------
     # the forward diagonal before the backward pass cancels it, for `cancellation`
-    before = float(cp.linalg.norm(acc_stiff))
+    before = _accumulated(accs)
     # concatenated into one launch, sound because excitation_kernel uses atomicAdd
     backward_position = cp.concatenate((sensors, source.position), axis=1)
     backward_signal = cp.ascontiguousarray(
@@ -480,10 +439,10 @@ def superposition_sensitivity(
         u2 = fd_step(u0, u1, u2)
         u2 = backward_excitation(u2, backward_signal, t)
         u2 = bc_step(u2)
-        add_step(acc_mass, acc_stiff, u0, u1, u2)
+        add_step(u0, u1, u2)
         u0, u1, u2 = u1, u2, u0
 
-    after = float(cp.linalg.norm(acc_stiff))
+    after = _accumulated(accs)
     cancellation = before / after if after > 0.0 else float("inf")
     limit = CANCELLATION_LIMIT[sim.precision]
     if cancellation > limit:
@@ -498,12 +457,11 @@ def superposition_sensitivity(
 
     # B(u, lambda) = [B(w, w) - B(u, u)] / 2k, scaled in place to spare a field
     norm = sim.dtype(1.0 / (2.0 * scale))
-    apply_cell_weights(sim, acc_mass)
-    acc_mass *= norm
-    apply_cell_weights(sim, acc_stiff)
-    acc_stiff *= -norm
+    accs = sim.finalize_gradients(accs, sens_kernels)
+    for field in accs.values():
+        field *= norm
     info = {"scale": scale, "cancellation": cancellation}
-    return cost, {"mass": acc_mass, "stiff": acc_stiff}, um, info
+    return cost, accs, um, info
 
 
 def source_sensitivity(
@@ -543,7 +501,7 @@ def source_sensitivity(
     probe = define_get_signal(sim, source.position, kernels)
 
     # ------------------------------------ forward pass -----------------------------------
-    U = cp.zeros((2, *sim.Nx_padded), dtype=sim.dtype)
+    U = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
     u0, u1 = U[0], U[1]
     um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
 
@@ -561,7 +519,7 @@ def source_sensitivity(
     adjoint_excitation = define_excitation(sim, sensors, kernels, mat)
 
     # ----------------------------------- backward pass -----------------------------------
-    P = cp.zeros((2, *sim.Nx_padded), dtype=sim.dtype)
+    P = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
     p0, p1 = P[0], P[1]
     lam = cp.zeros((sim.N, source.position.shape[1]), dtype=sim.dtype)
 

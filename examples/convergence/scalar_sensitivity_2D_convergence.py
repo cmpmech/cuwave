@@ -130,7 +130,7 @@ def gradient_of(
     toc = time.time()
 
     # chain rule from the two material fields back onto the indicator
-    d_mass, d_stiff = sim.parametrization_jacobian()
+    d_mass, d_stiff = sim.parametrization_jacobian(indicator)
     gradient = d_mass * grads["mass"] + d_stiff * grads["stiff"]
     # against the logical Nx: slice(1, -1) would reach into the padding
     interior = tuple(slice(1, n - 1) for n in Nx)

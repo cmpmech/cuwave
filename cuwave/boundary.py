@@ -29,13 +29,14 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, repr=False)
 class BoundaryCondition:
-    """Names a kernel in wave.cu. Frozen, so it can key the grouping below."""
+    """Names a kernel in the equation's .cu, or nothing. Frozen, so it can key the grouping."""
 
-    kernel: str
+    kernel: str | None
+    name: str = ""
 
     def __repr__(self) -> str:
         # so that printing a Simulation shows the condition, not the kernel name
-        return self.kernel.removesuffix("_kernel")
+        return self.name or self.kernel.removesuffix("_kernel")
 
     def define(
         self, sim: Simulation, kernels: cp.RawModule, faces: Sequence[int]
@@ -69,17 +70,22 @@ class BoundaryCondition:
 
 Neumann = BoundaryCondition("homogeneous_neumann_kernel")
 Dirichlet = BoundaryCondition("homogeneous_dirichlet_kernel")
+# an elastic wall is the interior-cell assembly or a zeroed inertia, so neither needs a kernel
+Traction = BoundaryCondition(None, "traction")
+Clamped = BoundaryCondition(None, "clamped")
 
 
 def canonical_boundary(
-    boundary: BoundaryCondition | Sequence | None, ndim: int
+    boundary: BoundaryCondition | Sequence | None,
+    ndim: int,
+    default: BoundaryCondition = Neumann,
 ) -> tuple[tuple[BoundaryCondition, BoundaryCondition], ...]:
     """makes the boundary canonical ((low, high),) * ndim
 
-    Accepts `None` for the reflecting default on every face.
+    Accepts `None` for the equation's `default` on every face.
     """
     if boundary is None:
-        boundary = Neumann
+        boundary = default
     if isinstance(boundary, BoundaryCondition):
         boundary = (boundary,) * ndim
     if len(boundary) != ndim:
@@ -101,7 +107,8 @@ def define_boundary(
     groups = {}
     for d, pair in enumerate(sim.boundary):
         for side, condition in enumerate(pair):
-            groups.setdefault(condition, []).append(2 * d + side)
+            if condition.kernel is not None:
+                groups.setdefault(condition, []).append(2 * d + side)
     steps = [
         condition.define(sim, kernels, faces) for condition, faces in groups.items()
     ]
@@ -224,8 +231,7 @@ def sponge(
     if beta < 0.0:
         raise ValueError(f"beta must be non-negative: {beta}")
     faces = _validate_layer(sim, width, faces)
-    stiff, minv = sim.parametrization(indicator)
-    minv = 1.0 / stiff if minv is None else minv
+    minv = sim.inverse_inertia(indicator)
     taper = _layer_taper(sim, width, faces)
     return cp.ascontiguousarray(
         (2.0 * beta * taper**2 / (sim.dt * minv)).astype(sim.dtype)
