@@ -46,12 +46,12 @@ except Exception:  # cupy missing or no GPU
 
 if HAS_CUDA:
     from cuwave.boundary import Dirichlet, Neumann, pad_for_sponge, sponge
+    from cuwave.scalar import AcousticWave, ScalarWave
     from cuwave.sensitivity import (
         l2_misfit,
         reconstruction_nodes,
         reconstruction_sensitivity,
         sensitivity,
-        sensor_cell_weights,
         source_sensitivity,
         superposition_sensitivity,
     )
@@ -59,13 +59,12 @@ if HAS_CUDA:
     from cuwave.signals import ricker
     from cuwave.wave import (
         apply_cell_weights,
-        AcousticWave,
-        ScalarWave,
         Source,
         compile_kernels,
         define_excitation,
         flatten_indices,
         grid_coords,
+        sensor_cell_weights,
         simulate,
         stable_dt,
     )

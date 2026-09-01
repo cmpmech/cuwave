@@ -9,12 +9,14 @@ Gradients useful in **optimization** scenarios such as inverse problems (full wa
 
 Common **helpers** ease the creation of driver files for applied problem setups
 ## forward simulation
-- [wave](wave.md) with [forward CUDA](cuda_wave.md) kernels
+- [wave](wave.md), the grid and the time loop every equation shares
+- [scalar](scalar.md) with [forward CUDA](cuda_scalar.md) kernels
 - [elastic](elastic.md) with [forward CUDA](cuda_elastic.md) kernels
+- [anisotropic](anisotropic.md) with [forward CUDA](cuda_anisotropic.md) kernels
 - [stencils](stencils.md)
 - [boundary](boundary.md)
 ## sensitivity analysis
-- [sensitivity](sensitivity.md) with [backward CUDA](cuda_wave_sensitivity.md) and [elastic backward CUDA](cuda_elastic_sensitivity.md) kernels
+- [sensitivity](sensitivity.md) with [scalar backward CUDA](cuda_scalar_sensitivity.md), [elastic backward CUDA](cuda_elastic_sensitivity.md) and [anisotropic backward CUDA](cuda_anisotropic_sensitivity.md) kernels
 ## optimization
 - [regularization](regularization.md)
 - [neural networks](nn.md)

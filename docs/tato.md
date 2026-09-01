@@ -3,7 +3,7 @@
 **Transient acoustic topology optimization (tato)** ([Dühring, Jensen & Sigmund 2008](https://www.sciencedirect.com/science/article/pii/S0022460X08002812)) distributes a fixed amount of material inside a design region so that a transient acoustic response is minimized: a scatterer or barrier shaped by the wave it has to stop, rather than by a rule of thumb
 
 An optimization is set up as follows:
-1. define the forward problem with [wave](wave.md) (here `AcousticWave`, whose indicator $\gamma$ interpolates between air and solid)
+1. define the forward problem with [scalar](scalar.md) (here `AcousticWave`, whose indicator $\gamma$ interpolates between air and solid)
 2. mark the design region and the objective region with `box`, the second turned into sensors by `nodes` ([geometry](geometry.md))
 3. map the design variables through a `DensityFilter` and a `Projection` ([regularization](regularization.md))
 4. iterate `response_gradient` and one `Adam` step ([utils](utils.md)), sharpening the projection on a continuation schedule

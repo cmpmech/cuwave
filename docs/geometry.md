@@ -8,6 +8,7 @@ Every helper takes the `coords` that `grid_coords` returns and an optional `out`
 |---|---|---|
 | 2D shape | `ellipse(coords, center, radii, angle=0.0, out=None)` | interior of the ellipse with semi-axes `radii`, rotated by `angle` radians |
 | 2D shape | `circle(coords, center, radius, out=None)` | interior of the circle, the isotropic `ellipse` |
+| point cloud | `circles(coords, centers, radius, out=None)` | union of equal-radius circles, one per row of `centers`, in any dimension |
 | 2D shape | `box(coords, center, sizes, out=None)` | interior of the axis-aligned box with side lengths `sizes`, its boundary included |
 | random field | `random_ellipses(coords, count, radii, bounds, angle=(0, pi), overlap=True, rng=None, attempts=100, out=None)` | `count` ellipses at uniformly random centers, semi-axes and orientations, optionally rejected until none overlap |
 | graded row | `stacked_circles(coords, count, radius, span, center, axis=0, ratio=0.5, order="descending", out=None)` | a row of geometrically shrinking circles, evenly gapped along one axis and tangent to both ends of `span` |
@@ -15,6 +16,8 @@ Every helper takes the `coords` that `grid_coords` returns and an optional `out`
 | nodes | `nodes(mask)` | the `(ndim, count)` grid indices `mask` selects, the layout [sensitivity](sensitivity.md) and `simulate` take |
 
 `nodes` is the one member that consumes a mask rather than building one, and it is what makes a region usable as a sensor array: a target box is marked by coordinate like any other shape and then handed to the solver as the nodes that tile it, with no separate index arithmetic to keep in step
+
+`circles` is the mask a driver freezes rather than fills: taking the transducer coordinates as `centers` marks the neighbourhood of every source and receiver, and zeroing the gradient there holds those nodes at the intact value. The gradient close to a point source is dominated by the singularity of the source itself rather than by the material, so an unconstrained inversion paints a ring of spurious damage around each transducer and spends its iterations on it, which `examples/fwi/fwi_2D_adam_mask.py` shows against the same setup without the mask
 
 Masks are boolean, so the material contrast is the driver's to choose: `cp.where(mask, GAMMA_VOID, 1.0)` for a two-phase indicator, or an arithmetic blend for a smoothed one
 

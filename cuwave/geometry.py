@@ -10,6 +10,7 @@ from collections.abc import Sequence
 import cupy as cp
 import cupy.typing as cpt
 import numpy as np
+import numpy.typing as npt
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -52,6 +53,33 @@ def circle(
 ) -> cpt.NDArray[cp.bool_]:
     """Interior of the circle of radius `radius`"""
     return ellipse(coords, center, (radius, radius), out=out)
+
+
+def circles(
+    coords: Sequence[cpt.NDArray],
+    centers: npt.ArrayLike,
+    radius: float,
+    out: cpt.NDArray[cp.bool_] | None = None,
+) -> cpt.NDArray[cp.bool_]:
+    """Union of equal-radius circles, one per row of `centers`, in any dimension.
+
+    Args:
+        coords: the grid the mask is built on.
+        centers: (num, ndim) physical centers, as `line` returns them.
+        radius: the radius shared by all of them.
+        out: mask to accumulate into, created when omitted.
+
+    Returns:
+        the accumulated mask, true within `radius` of any center.
+    """
+    centers = np.atleast_2d(centers)
+    if centers.shape[1] != len(coords):
+        raise ValueError(f"centers need {len(coords)} coordinates, not {centers.shape}")
+    out = _empty(coords, out)
+    for center in centers:
+        distance = sum((x - c) ** 2 for x, c in zip(coords, center))
+        out |= distance < radius**2
+    return out
 
 
 def box(

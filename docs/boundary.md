@@ -15,7 +15,7 @@ A condition is a declarative marker naming a kernel and nothing more, so a setup
 | normalization | `canonical_boundary(boundary, ndim)` | expands the shorthands (`None`, one condition, one per axis) into the `((low, high),) * ndim` form `Simulation` stores |
 | dispatch | `define_boundary(sim, kernels)` | groups the faces by condition and returns `bc_step(u)`, which runs one launch per **distinct** condition |
 
-Both walls are the discrete method of images and act on the ghost ring only, mirroring the second-interior node onto it, evenly for `Neumann` and oddly for `Dirichlet`, so the interior kernel needs no boundary branch at all. [forward CUDA](cuda_wave.md) carries the two kernels and the thread-to-ghost mapping
+Both walls are the discrete method of images and act on the ghost ring only, mirroring the second-interior node onto it, evenly for `Neumann` and oddly for `Dirichlet`, so the interior kernel needs no boundary branch at all. [forward CUDA](cuda_scalar.md) carries the two kernels and the thread-to-ghost mapping
 
 Grouping by condition rather than by face is what keeps the common case cheap: a uniform boundary is one launch however many faces it covers, and a mixed one costs one launch per distinct condition rather than $2\,\textrm{ndim}$. The faces travel as a bitmask, so no device array has to be allocated or kept alive for the dispatch
 
@@ -27,7 +27,7 @@ Only these two *conditions* are implemented. A true absorbing or radiating condi
 
 $$\beta\left(\mathbf{x}\right)=\beta_\textrm{wall}\,w\left(\mathbf{x}\right)^2,\qquad d=\frac{2m\beta}{\Delta t}$$
 
-with the peak decay per step `beta` $\beta_\textrm{wall}$ reached at the wall node, the taper $w$ rising linearly from 0 at the inner edge of the layer, and the inertia $m$ the parametrization gives. The field is scaled by it, so one `beta` means the same decay whichever formulation is in use. [forward CUDA](cuda_wave.md) carries the $\beta$ the kernel actually reads
+with the peak decay per step `beta` $\beta_\textrm{wall}$ reached at the wall node, the taper $w$ rising linearly from 0 at the inner edge of the layer, and the inertia $m$ the parametrization gives. The field is scaled by it, so one `beta` means the same decay whichever formulation is in use. [forward CUDA](cuda_scalar.md) carries the $\beta$ the kernel actually reads
 
 `beta` has an **optimum** rather than a monotone benefit: too small and the wave crosses the layer and returns off the wall behind it, too large and the damping gradient reflects it on the way in. The optimum sits at $\beta_\textrm{wall}\approx0.05$ and **stays there as the layer thickens**, so thicken the layer and leave `beta` alone. A one-wavelength layer is the exception and wants about twice that, since the same energy has half as many nodes to go into. Thickness is the currency, buying roughly a factor of five per doubling, and `beta` only spends it well or badly
 

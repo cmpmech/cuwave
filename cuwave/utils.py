@@ -90,13 +90,56 @@ def line(
     return np.linspace(start, stop, count)
 
 
+def _corner_weights(
+    sim: Simulation, coords: npt.NDArray, shift: npt.NDArray
+) -> tuple[npt.NDArray, npt.NDArray]:
+    """Cell corners and multilinear weights of `coords` on the grid shifted by `shift`.
+
+    Returns:
+        (nodes, weights) shaped (ndim, num, 2**ndim) and (num, 2**ndim), the nodes
+        array indices on the component's own grid, whose unknowns end half a cell
+        short of a wall along a shifted axis.
+    """
+    index = np.empty_like(coords)
+    for d in range(sim.ndim):
+        nodal = coords[:, d] / sim.dx[d] + 1.0
+        # checked in index units, where the interior runs from node 1 to Nx[d] - 2
+        if nodal.min() < 1.0 - TOL or nodal.max() > sim.Nx[d] - 2.0 + TOL:
+            length = (sim.Nx[d] - 3) * sim.dx[d]  # spanned by the interior nodes
+            raise ValueError(
+                f"axis {d} coordinate outside the domain [0, {length:g}]: "
+                f"[{float(coords[:, d].min()):g}, {float(coords[:, d].max()):g}]"
+            )
+        # a wall coordinate on a shifted axis lands on the unknown half a cell inside
+        high = sim.Nx[d] - 2.0 - (shift[d] > 0.0)
+        index[:, d] = np.clip(nodal - shift[d], 1.0, high)
+    base = np.stack(
+        [
+            np.clip(np.floor(index[:, d]), 1, sim.Nx[d] - 3 - (shift[d] > 0.0)).astype(
+                np.int32
+            )
+            for d in range(sim.ndim)
+        ]
+    )
+    offset = index.T - base  # (ndim, num) position inside that cell, in [0, 1]
+    corners = np.array(list(itertools.product((0, 1), repeat=sim.ndim)))  # (K, ndim)
+    nodes = base[:, :, None] + corners.T[:, None, :]  # (ndim, num, K)
+    weights = np.ones((len(coords), len(corners)))
+    for d in range(sim.ndim):
+        w = offset[d][:, None]
+        weights *= np.where(corners[None, :, d] == 1, w, 1.0 - w)
+    return nodes, weights
+
+
 def distribute(
     sim: Simulation, coords: npt.ArrayLike, direction: npt.ArrayLike | None = None
 ) -> tuple[cpt.NDArray[cp.int32], cpt.NDArray]:
     """Multilinear interpolation of `coords` onto the grid, along `direction`.
 
     A vector unknown drives and reads along a direction, which enters as a factor on the
-    weights, so `traces` and `scatter` stay exact transposes of one another.
+    weights, so `traces` and `scatter` stay exact transposes of one another. A staggered
+    unknown declares `sim.component_offsets`, and each component is then interpolated on
+    its own shifted grid.
 
     Args:
         sim: the simulation whose grid the coordinates land on.
@@ -114,33 +157,13 @@ def distribute(
         raise ValueError(
             f"coordinates need {sim.ndim} components, not {coords.shape[1]}"
         )
-    index = np.empty_like(coords)
-    for d in range(sim.ndim):
-        index[:, d] = coords[:, d] / sim.dx[d] + 1.0
-        # checked in index units, where the interior runs from node 1 to Nx[d] - 2
-        if index[:, d].min() < 1.0 - TOL or index[:, d].max() > sim.Nx[d] - 2.0 + TOL:
-            length = (sim.Nx[d] - 3) * sim.dx[d]  # spanned by the interior nodes
-            raise ValueError(
-                f"axis {d} coordinate outside the domain [0, {length:g}]: "
-                f"[{float(coords[:, d].min()):g}, {float(coords[:, d].max()):g}]"
-            )
-
-    base = np.stack(
-        [
-            np.clip(np.floor(index[:, d]), 1, sim.Nx[d] - 3).astype(np.int32)
-            for d in range(sim.ndim)
-        ]
-    )
-    offset = index.T - base  # (ndim, num) position inside that cell, in [0, 1]
-    corners = np.array(list(itertools.product((0, 1), repeat=sim.ndim)))  # (K, ndim)
-    nodes = base[:, :, None] + corners.T[:, None, :]  # (ndim, num, K)
-    weights = np.ones((len(coords), len(corners)))
-    for d in range(sim.ndim):
-        w = offset[d][:, None]
-        weights *= np.where(corners[None, :, d] == 1, w, 1.0 - w)
+    shifts = sim.component_offsets
+    if shifts is None:
+        shifts = np.zeros((sim.ncomp, sim.ndim))
     if direction is None:
         if sim.ncomp > 1:
             raise ValueError(f"a {sim.ncomp}-component unknown needs a direction")
+        nodes, weights = _corner_weights(sim, coords, shifts[0])
         return (
             cp.asarray(nodes.reshape(sim.ndim, -1), dtype=cp.int32),
             cp.asarray(weights, dtype=sim.dtype),
@@ -152,7 +175,10 @@ def distribute(
         n = np.repeat(n, len(coords), axis=0)
     if len(n) != len(coords):
         raise ValueError(f"{len(n)} directions for {len(coords)} coordinates")
-    weights = (weights[:, :, None] * n[:, None, :]).reshape(len(coords), -1)
+    per = [_corner_weights(sim, coords, shifts[c]) for c in range(sim.ncomp)]
+    weights = np.stack([w for _, w in per], axis=2) * n[:, None, :]
+    weights = weights.reshape(len(coords), -1)
+    nodes = np.stack([nodes for nodes, _ in per], axis=3)  # (ndim, num, K, ncomp)
     if sim.node_rows == sim.ndim:
         # a single component needs no row of its own, so the direction is a scale
         return (
@@ -160,11 +186,10 @@ def distribute(
             cp.asarray(weights, dtype=sim.dtype),
         )
     # the component runs fastest, so one column per (coordinate, corner, component)
-    spatial = np.repeat(nodes[:, :, :, None], sim.ncomp, axis=3)
     component = np.broadcast_to(
-        np.arange(sim.ncomp)[None, None, None, :], (1, *spatial.shape[1:])
+        np.arange(sim.ncomp)[None, None, None, :], (1, *nodes.shape[1:])
     )
-    rows = np.concatenate((component, spatial), axis=0)
+    rows = np.concatenate((component, nodes), axis=0)
     return (
         cp.asarray(rows.reshape(sim.node_rows, -1), dtype=cp.int32),
         cp.asarray(weights, dtype=sim.dtype),

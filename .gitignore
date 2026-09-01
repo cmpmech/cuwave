@@ -8,4 +8,5 @@ examples/analog_nn/minecraft_mobs_audio/
 .zed/
 .obsidian/
 *.pdf
+data/
 

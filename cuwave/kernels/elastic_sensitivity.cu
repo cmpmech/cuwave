@@ -1,7 +1,8 @@
 // Compile-time configuration (set via -D flags from elastic.py):
 //   USE_FLOAT
 //   NDIM = 1 | 2 | 3
-//   RADIUS = space_order / 2
+//   STENCIL_RADIUS
+//   STAG_COEFFS
 
 #ifdef USE_FLOAT
 typedef float real_t;
@@ -9,41 +10,54 @@ typedef float real_t;
 typedef double real_t;
 #endif
 
-#ifndef RADIUS
-#define RADIUS 1 // default order 2
+// ----------------------------- staggered difference helpers
+#ifndef STENCIL_RADIUS
+#define STENCIL_RADIUS 1 // default order 2
 #endif
 
-#define BLK (2 * RADIUS)
-#if NDIM == 1
-#define CELLS BLK
-#elif NDIM == 2
-#define CELLS (BLK * BLK)
+#if STENCIL_RADIUS == 1
+#define SG_W(r, k) ((real_t)1)
 #else
-#define CELLS (BLK * BLK * BLK)
+// cache
+__constant__ real_t SG_C[STENCIL_RADIUS][STENCIL_RADIUS] = STAG_COEFFS;
+#define SG_W(r, k) SG_C[(r) - 1][(k) - 1] // 1-indexed adjustment
 #endif
-#define NLOC (CELLS * NDIM)
-#define CORNERS (1 << NDIM)
 
-// position along axis d of the block entry m, axis 0 running fastest
-__device__ __forceinline__ int block_axis(int m, const int d) {
-#pragma unroll
-  for (int k = 0; k < NDIM; ++k)
-    if (k < d)
-      m /= BLK;
-  return m % BLK;
+#define NPAIRS (NDIM * (NDIM - 1) / 2)
+#define NVOIGT (NDIM + NPAIRS)
+#if NDIM == 3
+#define PAIR_ROW(k, l) (NDIM + 3 - (k) - (l))
+#else
+#define PAIR_ROW(k, l) 2
+#endif
+
+// radius of the node strain along its own axis, zero on the wall itself
+__device__ __forceinline__ int rad_node(const int a, const int N) {
+  return min(STENCIL_RADIUS, min(a - 1, N - 2 - a));
 }
 
-// ----------------------------- cell assembly helpers
+// radius of a half-point derivative, whose taps may sit on the wall
+__device__ __forceinline__ int rad_half(const int a, const int N) {
+  return min(STENCIL_RADIUS, min(a, N - 2 - a));
+}
+
+__device__ __forceinline__ bool clamped_face(const int clamped, const int d,
+                                             const int side) {
+  return (clamped >> (2 * d + side)) & 1;
+}
+
 #if NDIM == 1
-#define AXIS_PARAMS const int N0
+#define AXIS_PARAMS const real_t f0, const int N0
 #define INTERIOR_OR_RETURN                                                     \
   const int a0 = blockIdx.x * blockDim.x + threadIdx.x;                        \
   if (!(a0 > 0 && a0 < N0 - 1))                                                \
     return;                                                                    \
   const int idx = a0
 #define AXIS_GEOM const int A[1] = {a0}, S[1] = {1}, NN[1] = {N0}
+#define AXIS_FACTORS const real_t F[1] = {f0}
 #elif NDIM == 2
-#define AXIS_PARAMS const int N0, const int N1, const int s0
+#define AXIS_PARAMS                                                            \
+  const real_t f0, const int N0, const real_t f1, const int N1, const int s0
 #define INTERIOR_OR_RETURN                                                     \
   const int a1 = blockIdx.x * blockDim.x + threadIdx.x;                        \
   const int a0 = blockIdx.y * blockDim.y + threadIdx.y;                        \
@@ -52,9 +66,11 @@ __device__ __forceinline__ int block_axis(int m, const int d) {
   const int idx = a0 * s0 + a1
 #define AXIS_GEOM                                                              \
   const int A[2] = {a0, a1}, S[2] = {s0, 1}, NN[2] = {N0, N1}
+#define AXIS_FACTORS const real_t F[2] = {f0, f1}
 #elif NDIM == 3
 #define AXIS_PARAMS                                                            \
-  const int N0, const int N1, const int s0, const int N2, const int s1
+  const real_t f0, const int N0, const real_t f1, const int N1, const int s0,  \
+      const real_t f2, const int N2, const int s1
 #define INTERIOR_OR_RETURN                                                     \
   const int a2 = blockIdx.x * blockDim.x + threadIdx.x;                        \
   const int a1 = blockIdx.y * blockDim.y + threadIdx.y;                        \
@@ -65,169 +81,181 @@ __device__ __forceinline__ int block_axis(int m, const int d) {
   const int idx = a0 * s0 + a1 * s1 + a2
 #define AXIS_GEOM                                                              \
   const int A[3] = {a0, a1, a2}, S[3] = {s0, s1, 1}, NN[3] = {N0, N1, N2}
+#define AXIS_FACTORS const real_t F[3] = {f0, f1, f2}
 #endif
 
-// the cell this node is the low corner of, where its density accumulates, plus
-// the radius that cell carries once graded down towards a wall
-__device__ __forceinline__ bool own_cell(const int *A, const int *NN,
-                                         int &radius) {
-  radius = RADIUS;
-  bool inside = true;
+// the node's normal strains, one per axis: a wall grades to a zero row under
+// traction (returned as a set bit) and to the antisymmetric fold when clamped
+__device__ __forceinline__ int
+normal_strains(const real_t *__restrict__ u, const int idx, const int cs,
+               const int *A, const int *S, const int *NN, const real_t *F,
+               const int clamped, real_t *eps) {
+  int zeroed = 0;
 #pragma unroll
   for (int d = 0; d < NDIM; ++d) {
-    inside &= (A[d] >= 1 && A[d] <= NN[d] - 3);
-    radius = min(radius, min(RADIUS, min(A[d], NN[d] - 2 - A[d])));
+    const int r = rad_node(A[d], NN[d]);
+    const real_t *__restrict__ ud = u + d * cs;
+    if (r > 0) {
+      real_t acc = (real_t)0;
+#pragma unroll
+      for (int k = 1; k <= STENCIL_RADIUS; ++k)
+        if (k <= r)
+          acc += SG_W(r, k) * (ud[idx + (k - 1) * S[d]] - ud[idx - k * S[d]]);
+      eps[d] = F[d] * acc;
+    } else if (A[d] == 1 && clamped_face(clamped, d, 0)) {
+      eps[d] = F[d] * 2.f * ud[idx]; // the wall holds u = 0 half a node down
+    } else if (A[d] == NN[d] - 2 && clamped_face(clamped, d, 1)) {
+      eps[d] = -F[d] * 2.f * ud[idx - S[d]];
+    } else {
+      eps[d] = (real_t)0;
+      zeroed |= 1 << d;
+    }
   }
-  return inside;
+  return zeroed;
 }
 
-// block entry l of that cell, and whether it falls inside the graded support
-__device__ __forceinline__ bool own_offset(const int l, const int radius,
-                                           const int *S, int &off) {
-  off = 0;
-  bool carries = true;
+// a traction wall condenses its axis out of the coupling: the plane stress
+// reduction of lam, applied once per zeroed axis
+__device__ __forceinline__ real_t condensed_lame(const real_t lam,
+                                                 const real_t mu,
+                                                 const int zeroed) {
+  real_t lam_eff = lam;
 #pragma unroll
-  for (int d = 0; d < NDIM; ++d) {
-    const int m = block_axis(l, d);
-    carries &= (m >= RADIUS - radius && m <= RADIUS + radius - 1);
-    off += (m - RADIUS + 1) * S[d];
-  }
-  return carries;
+  for (int d = 0; d < NDIM; ++d)
+    if ((zeroed >> d) & 1)
+      lam_eff = 2.f * lam_eff * mu / (lam_eff + 2.f * mu);
+  return lam_eff;
 }
 
-// the 2**NDIM cells a node is a corner of: the material stays cell local,
-// so the design chain rule runs over those, not the wide stencil block
-__device__ __forceinline__ bool corner_cell(const int c, const int *A,
-                                            const int *NN, const int *S,
-                                            int &base) {
-  base = 0;
-  bool inside = true;
+#if NDIM >= 2
+// the engineering shear strain of the (k, l) pair at its own staggered point
+__device__ __forceinline__ real_t
+shear_strain(const real_t *__restrict__ u, const int idx, const int cs,
+             const int k, const int l, const int *A, const int *S,
+             const int *NN, const real_t *F) {
+  const int r1 = rad_half(A[l], NN[l]); // d u_k / d x_l
+  const int r2 = rad_half(A[k], NN[k]); // d u_l / d x_k
+  real_t e = (real_t)0;
+#pragma unroll
+  for (int j = 1; j <= STENCIL_RADIUS; ++j) {
+    if (j <= r1)
+      e += F[l] * SG_W(r1, j) *
+           (u[k * cs + idx + j * S[l]] - u[k * cs + idx - (j - 1) * S[l]]);
+    if (j <= r2)
+      e += F[k] * SG_W(r2, j) *
+           (u[l * cs + idx + j * S[k]] - u[l * cs + idx - (j - 1) * S[k]]);
+  }
+  return e;
+}
+#endif
+
+// the normal bilinear form of two strain sets under the condensed coupling
+__device__ __forceinline__ real_t normal_form(const real_t *ea,
+                                              const real_t *eb,
+                                              const real_t lam,
+                                              const real_t mu,
+                                              const int zeroed) {
+  const real_t lam_eff = condensed_lame(lam, mu, zeroed);
+  real_t tra = (real_t)0, trb = (real_t)0, dot = (real_t)0;
 #pragma unroll
   for (int d = 0; d < NDIM; ++d) {
-    const int bit = (c >> d) & 1;
-    inside &= bit ? (A[d] < NN[d] - 2) : (A[d] > 1);
-    base += (bit - 1) * S[d];
+    tra += ea[d];
+    trb += eb[d];
+    dot += ea[d] * eb[d];
   }
-  return inside;
+  return 2.f * mu * dot + lam_eff * tra * trb;
 }
 
 // -------------------------------------- kernels
 extern "C" {
 
 // ------------------------------------------------------------------------------------
-__global__ void
-gradient_kernel(real_t *__restrict__ g_mass, real_t *__restrict__ g_cell,
-                const real_t *__restrict__ u0, const real_t *__restrict__ u1,
-                const real_t *__restrict__ u2, const real_t *__restrict__ l1,
-                const real_t *__restrict__ stencil, const real_t mass_factor,
-                const int cs, AXIS_PARAMS) {
+__global__ void gradient_kernel(real_t *__restrict__ g_mass,
+                                real_t *__restrict__ g_normal,
+#if NDIM >= 2
+                                real_t *__restrict__ g_shear,
+#endif
+                                const real_t *__restrict__ u0,
+                                const real_t *__restrict__ u1,
+                                const real_t *__restrict__ u2,
+                                const real_t *__restrict__ l1, const real_t lam,
+                                const real_t mu, const real_t mf,
+                                const int clamped, const int cs, AXIS_PARAMS) {
   INTERIOR_OR_RETURN;
   AXIS_GEOM;
+  AXIS_FACTORS;
 
-  // dJ/dmass: no neighbour and no material load
-  real_t acc = (real_t)0;
+  // dJ/dmass on the component points: no neighbour and no material load
 #pragma unroll
-  for (int i = 0; i < NDIM; ++i) {
-    const int n = i * cs + idx;
-    acc += l1[n] * (u2[n] - 2.f * u1[n] + u0[n]);
-  }
-  g_mass[idx] -= mass_factor * acc;
-
-  // dJ/dcell: the cell stencil paired between the forward and adjoint fields
-  int radius;
-  if (!own_cell(A, NN, radius))
-    return;
-  const real_t *__restrict__ table = stencil + (radius - 1) * NLOC * NLOC;
-  real_t bilinear = (real_t)0;
-#pragma unroll
-  for (int l = 0; l < CELLS; ++l) {
-    int lo;
-    if (!own_offset(l, radius, S, lo))
+  for (int c = 0; c < NDIM; ++c) {
+    if (A[c] > NN[c] - 3)
       continue;
-#pragma unroll
-    for (int m = 0; m < CELLS; ++m) {
-      int mo;
-      if (!own_offset(m, radius, S, mo))
-        continue;
-#pragma unroll
-      for (int i = 0; i < NDIM; ++i)
-#pragma unroll
-        for (int j = 0; j < NDIM; ++j)
-          bilinear += l1[i * cs + idx + lo] *
-                      table[(l * NDIM + i) * NLOC + m * NDIM + j] *
-                      u1[j * cs + idx + mo];
-    }
+    const int n = c * cs + idx;
+    g_mass[n] -= mf * l1[n] * (u2[n] - 2.f * u1[n] + u0[n]);
   }
-  g_cell[idx] -= bilinear;
+
+  // dJ/dgamma on the node: forward against adjoint under the normal coupling
+  real_t eu[NDIM], el[NDIM];
+  const int zeroed = normal_strains(u1, idx, cs, A, S, NN, F, clamped, eu);
+  normal_strains(l1, idx, cs, A, S, NN, F, clamped, el);
+  g_normal[idx] -= normal_form(el, eu, lam, mu, zeroed);
+
+#if NDIM >= 2
+#pragma unroll
+  for (int k = 0; k < NDIM - 1; ++k) // and on each of its shear points
+#pragma unroll
+    for (int l = k + 1; l < NDIM; ++l) {
+      if (A[k] > NN[k] - 3 || A[l] > NN[l] - 3)
+        continue;
+      const int v = PAIR_ROW(k, l);
+      g_shear[(v - NDIM) * cs + idx] -=
+          mu * shear_strain(l1, idx, cs, k, l, A, S, NN, F) *
+          shear_strain(u1, idx, cs, k, l, A, S, NN, F);
+    }
+#endif
 }
 
 // ------------------------------------------------------------------------------------
-__global__ void
-frechet_kernel(real_t *__restrict__ acc_mass, real_t *__restrict__ acc_cell,
-               const real_t *__restrict__ u0, const real_t *__restrict__ u1,
-               const real_t *__restrict__ u2,
-               const real_t *__restrict__ stencil, const real_t ft,
-               const real_t fs, const int cs, AXIS_PARAMS) {
+__global__ void frechet_kernel(real_t *__restrict__ acc_mass,
+                               real_t *__restrict__ acc_normal,
+#if NDIM >= 2
+                               real_t *__restrict__ acc_shear,
+#endif
+                               const real_t *__restrict__ u0,
+                               const real_t *__restrict__ u1,
+                               const real_t *__restrict__ u2, const real_t lam,
+                               const real_t mu, const real_t ft,
+                               const real_t fs, const int clamped,
+                               const int cs, AXIS_PARAMS) {
   INTERIOR_OR_RETURN;
   AXIS_GEOM;
+  AXIS_FACTORS;
 
-  real_t acc = (real_t)0;
 #pragma unroll
-  for (int i = 0; i < NDIM; ++i) {
-    const int n = i * cs + idx;
+  for (int c = 0; c < NDIM; ++c) {
+    if (A[c] > NN[c] - 3)
+      continue;
+    const int n = c * cs + idx;
     const real_t dudt = u2[n] - u0[n];
-    acc += dudt * dudt;
+    acc_mass[n] += ft * dudt * dudt;
   }
-  acc_mass[idx] += ft * acc;
 
-  int radius;
-  if (!own_cell(A, NN, radius))
-    return;
-  const real_t *__restrict__ table = stencil + (radius - 1) * NLOC * NLOC;
-  real_t bilinear = (real_t)0;
+  real_t eu[NDIM];
+  const int zeroed = normal_strains(u1, idx, cs, A, S, NN, F, clamped, eu);
+  acc_normal[idx] += fs * normal_form(eu, eu, lam, mu, zeroed);
+
+#if NDIM >= 2
 #pragma unroll
-  for (int l = 0; l < CELLS; ++l) {
-    int lo;
-    if (!own_offset(l, radius, S, lo))
-      continue;
+  for (int k = 0; k < NDIM - 1; ++k)
 #pragma unroll
-    for (int m = 0; m < CELLS; ++m) {
-      int mo;
-      if (!own_offset(m, radius, S, mo))
+    for (int l = k + 1; l < NDIM; ++l) {
+      if (A[k] > NN[k] - 3 || A[l] > NN[l] - 3)
         continue;
-#pragma unroll
-      for (int i = 0; i < NDIM; ++i)
-#pragma unroll
-        for (int j = 0; j < NDIM; ++j)
-          bilinear += u1[i * cs + idx + lo] *
-                      table[(l * NDIM + i) * NLOC + m * NDIM + j] *
-                      u1[j * cs + idx + mo];
+      const int v = PAIR_ROW(k, l);
+      const real_t e = shear_strain(u1, idx, cs, k, l, A, S, NN, F);
+      acc_shear[(v - NDIM) * cs + idx] += fs * mu * e * e;
     }
-  }
-  acc_cell[idx] += fs * bilinear;
-}
-
-// ------------------------------------------------------------------------------------
-__global__ void cell_to_node_kernel(real_t *__restrict__ g_stiff,
-                                    const real_t *__restrict__ g_cell,
-                                    const real_t *__restrict__ cell,
-                                    const real_t *__restrict__ gamma,
-                                    const real_t share, AXIS_PARAMS) {
-  INTERIOR_OR_RETURN;
-  AXIS_GEOM;
-
-  // d(harmonic cell mean)/d(corner) is (cell / corner)^2 over the corner count
-  const real_t gn = gamma[idx];
-  real_t acc = (real_t)0;
-#pragma unroll
-  for (int c = 0; c < CORNERS; ++c) {
-    int base;
-    if (corner_cell(c, A, NN, S, base)) {
-      const real_t ratio = cell[idx + base] / gn;
-      acc += g_cell[idx + base] * ratio * ratio;
-    }
-  }
-  g_stiff[idx] += share * acc;
+#endif
 }
 
 } // extern "C"

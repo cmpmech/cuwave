@@ -2,7 +2,7 @@
 
 **Utils** carries the pieces a driver needs around the solver: putting a source at a physical coordinate, reading receivers back off the grid, and running the misfit and its gradient over a list of shots
 
-Sources and receivers are placed by **coordinate**, not by node index, and multilinearly interpolated onto the surrounding $2^\textrm{ndim}$ corners. So a transducer array sits at the same physical points on every resolution, which is what makes two grids comparable at all
+Sources and receivers are placed by **coordinate**, not by node index, and multilinearly interpolated onto the surrounding $2^\textrm{ndim}$ corners. So a transducer array sits at the same physical points on every resolution, which is what makes two grids comparable at all. A staggered unknown declares `component_offsets` on its [Simulation](wave.md), and each component is then interpolated on its own shifted grid; a coordinate on a wall along a shifted axis lands on the unknown half a cell inside, the staggered convention for a surface force
 
 | member | signature | description |
 |---|---|---|
@@ -10,7 +10,7 @@ Sources and receivers are placed by **coordinate**, not by node index, and multi
 | segmentation | `threshold(field, eta=0.5, low=0.0, high=1.0, dtype=None)` | snaps a grey design to its two materials about `eta`, keeping the dtype of `field` |
 | resampling | `resample(signal, dt, dt_new, N_new=None)` | linear resampling along the leading axis, on either array module, zero past the end of the original span |
 | coordinates | `line(start, stop, count)` | `count` coordinates evenly spaced from `start` to `stop`, endpoints included |
-| interpolation | `distribute(sim, coords)` | the `(nodes, weights)` of the surrounding cell corners, raising for a coordinate outside the domain |
+| interpolation | `distribute(sim, coords, direction=None)` | the `(nodes, weights)` of the surrounding cell corners, per component where `component_offsets` shifts them, raising for a coordinate outside the domain |
 | source | `point_source(sim, coords, signal)` | a `Source` firing `signal` at `coords`, divided by the cell volume so the amplitude does not depend on the spacing |
 | source chain rule | `collect_source(sim, coords, columns)` | the transpose of `point_source`: an $(N,\,\textrm{num}\cdot2^\textrm{ndim})$ node gradient contracted onto the signal of each coordinate |
 | shot list | `shots(sim, coords, signal)` | one single-coordinate `Source` per coordinate, which is the shot list of an inversion |

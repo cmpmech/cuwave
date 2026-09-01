@@ -13,7 +13,7 @@ no arrival time has to be guessed anywhere.
 
 `WallLayerTest` pins the argument `homogeneous_dirichlet_kernel` rests on: that writing
 only the odd-mirrored ghost holds the wall node at zero without the kernel ever writing
-it (docs/cuda_wave.md derives it). It is not held there exactly: the fma contraction of
+it (docs/cuda_scalar.md derives it). It is not held there exactly: the fma contraction of
 the two face fluxes leaves the rounding residual of a product, which then drives a stable
 recursion on the wall layer, so the assertion is against machine epsilon rather than
 against zero.
@@ -48,8 +48,9 @@ if HAS_CUDA:
         pad_for_sponge,
         sponge,
     )
+    from cuwave.scalar import ScalarWave
     from cuwave.signals import ricker
-    from cuwave.wave import ScalarWave, Source, compile_kernels, simulate, stable_dt
+    from cuwave.wave import Source, compile_kernels, simulate, stable_dt
 
 WAVESPEED = 1.0
 DENSITY = 1.0

@@ -1,92 +1,69 @@
 # Elastic
 
-**ElasticWave** solves the isotropic elastic wave equation for the displacement vector, a sibling of [PressureWave](wave.md) on the same grid, the same three-term time march and the same three [sensitivity](sensitivity.md) variants
+**ElasticWave** solves the isotropic elastic wave equation for the displacement vector on a staggered grid, a sibling of [PressureWave](scalar.md) on the same three-term time march and the same [sensitivity](sensitivity.md) variants
 
 $$m\ddot{\mathbf{u}}+d\dot{\mathbf{u}}-\nabla\cdot\boldsymbol{\sigma}=\mathbf{f},\qquad\boldsymbol{\sigma}=\mathbf{C}:\boldsymbol{\varepsilon},\qquad\boldsymbol{\varepsilon}=\frac{1}{2}\left(\nabla\mathbf{u}+\nabla\mathbf{u}^\top\right)$$
 
 with the displacement $\mathbf{u}$ carrying one component per axis, the stiffness tensor $\mathbf{C}$ built from `wavespeed_p` $c_p$, `wavespeed_s` $c_s$ and `density` $\rho_0$, and the damping $d$ the [sponge](boundary.md) sets
 
-## the stencil
+## the staggering
 
-The [pressure](wave.md) equation is discretized axis by axis, each axis a flux divergence with the stiffness on the cell between two nodes. That form carries the elastic **axial** terms unchanged, $\partial_x\left(\left(\lambda+2\mu\right)\partial_xu_x\right)$ and $\partial_y\left(\mu\,\partial_yu_x\right)$, but it cannot carry the **cross** terms $\partial_x\left(\lambda\,\partial_yu_y\right)$ and $\partial_y\left(\mu\,\partial_xu_y\right)$: a per-axis flux varies one index at a time, and those need two. So the gather is over cells rather than axes, and the stencil is 9-point in 2D and 27-point in 3D
+The [pressure](scalar.md) equation is discretized axis by axis, each axis a flux divergence with the stiffness on the cell between two nodes. That form cannot carry the elastic **cross** terms $\partial_x\left(\lambda\,\partial_yu_y\right)$: a per-axis flux varies one index at a time, and those need two. Placing component `c` half a node up its own axis dissolves the problem, in the staggered layout going back to [Virieux 1986](https://doi.org/10.1190/1.1442147) and widened to fourth order by [Levander 1988](https://doi.org/10.1190/1.1442422): every strain then lands on a natural point through a pure per-axis staggered difference
 
-$$f_x=\left(\lambda+2\mu\right)\left[M_y\otimes D^2_x\right]u_x+\mu\left[M_x\otimes D^2_y\right]u_x+\left(\lambda+\mu\right)\left[D_x\otimes D_y\right]u_y$$
+| quantity | lives at | from |
+|---|---|---|
+| $u_x$ | $\left(i+\tfrac{1}{2},\,j,\,k\right)$ | the unknown itself |
+| $\varepsilon_{xx},\,\varepsilon_{yy},\,\varepsilon_{zz}$ and the normal stresses | the node | $\partial_xu_x$ staggered along $x$ lands back on integers |
+| $\varepsilon_{xy}$ and $\sigma_{xy}$ | $\left(i+\tfrac{1}{2},\,j+\tfrac{1}{2},\,k\right)$ | both of its derivatives land there without averaging |
 
-at `space_order` 2, with the second difference $D^2=\left(1,-2,1\right)$, the centred first difference $D=\left(-\tfrac{1}{2},0,\tfrac{1}{2}\right)$ and the transverse average $M=\left(1,4,1\right)/6$. The cross term is the textbook one; the transverse average on the axial terms is the only departure from it, and it is not cosmetic: a plain $\left(1,2,1\right)/4$ leaves the checkerboard $\left(-1\right)^{i+j}$ exactly in the null space, an hourglass mode a material contrast excites and nothing damps
+So the cross terms cost no transverse averaging and no cell gather, and the work per node stays **linear** in the stencil radius, where the cell assembly of [AnisotropicElasticWave](anisotropic.md) pays $\left(2r\right)^{2\,\textrm{ndim}}$. The layout reaches the rest of the code through `component_offsets`, which [distribute](utils.md) reads so a source or receiver coordinate interpolates onto each component's own shifted grid
 
-The coefficients are not written by hand. They are derived cell by cell as
+## the operator
 
-$$\mathbf{L}=-\sum_\textrm{cells}\gamma_c\,\mathbf{B}^\top\mathbf{C}\,\mathbf{B},\qquad\gamma_c=\frac{2^\textrm{ndim}}{\sum_\textrm{nodes}\gamma_i^{-1}}$$
+The coefficients are not written by hand. The operator is assembled as
 
-with $\mathbf{B}$ the discrete symmetric gradient over the cell's $2^\textrm{ndim}$ nodes, $\gamma_c$ the harmonic mean of the design field over them, and the sum running over the cells **inside** the domain only. Deriving them that way rather than writing the stencil out is what buys four properties at once, and every one of them is what a later stage rests on:
+$$\mathbf{L}=-\sum_s w_s\,\gamma_s\,\mathbf{B}_s^\top\mathbf{C}\,\mathbf{B}_s$$
+
+with $\mathbf{B}_s$ the staggered symmetric gradient onto stress point $s$, $w_s$ the cell weight (halved per wall the point sits on), and $\gamma_s$ the design field sampled there: the nodal value for the normal family, the harmonic mean of the four straddled nodes for a shear point (`pair_average`), following the volume averaging of [Moczo et al. 2002](https://doi.org/10.1785/0120010167). The inertia is the arithmetic two-node mean at each component's own point (`point_average`). Deriving the operator this way buys the same four properties the cell assembly had, and every one of them is what a later stage rests on
 
 | property | why it holds | what needs it |
 |---|---|---|
-| exactly symmetric | $\mathbf{B}^\top\mathbf{C}\mathbf{B}$ is symmetric for any $\mathbf{B}$ and symmetric $\mathbf{C}$, so a **varying** material needs no check | the adjoint is the exact transpose |
+| exactly symmetric | both kernels key every tap off the stress point it belongs to, so forward and transpose read the same matrix | the adjoint is the exact transpose, at **every** order |
 | negative semidefinite | $\mathbf{C}$ is positive definite | the leapfrog is stable, with no material to check |
-| material never differentiated | $\mathbf{C}$ enters as a cell multiplier | the gradient needs no derivative of the stencil |
-| traction free without a kernel | restricting the sum to interior cells makes $\boldsymbol{\sigma}\cdot\mathbf{n}=0$ the natural condition | a free surface on faces, edges and corners alike |
+| material never differentiated | $\gamma_s$ enters as a point multiplier | the gradient needs no derivative of the stencil |
+| traction free without a kernel | a wall stress point grades to a zero row and its axis is condensed out | a free surface on faces, edges and corners alike |
 
-Symmetry is the one worth dwelling on, because it is what buys the higher orders. The pressure stencil pairs a **wide** inner gradient against a **single** outer difference, which is why it stops being the exact transpose above order 2 (see [sensitivity](sensitivity.md)). Here both sides of the sandwich widen together, so the transpose stays exact at any width
+Unlike a centred difference, a staggered one does not annihilate the checkerboard $\left(-1\right)^{i+j}$, so the hourglass mode the cell scheme needed full quadrature against never arises
 
 ## higher order
 
-`space_order` is $2r$ for a stencil radius $r$, and any even order is allowed. The cell reaches $2r$ nodes per axis instead of 2, its strain built from Lagrange weights through them, so the nodal stencil grows to $\left(4r-1\right)^\textrm{ndim}$ points. Two things keep it well behaved:
+`space_order` is $2r$ for a stencil radius $r$, and any even order is allowed. Each staggered derivative widens to $2r$ taps with the coefficients of [stencils](stencils.md) `staggered_weights`, graded down towards a wall so no tap leaves the domain, exactly as the scalar flux grades. The cost is a handful of $2r$-tap differences per node, so order 6 runs within a factor of the memory-bound floor of order 2 and the choice of order is no longer a cost question
 
-| ingredient | why |
-|---|---|
-| enough quadrature points, $\max\left(2,\,2r-1\right)$ per axis | the product $\mathbf{B}^\top\mathbf{C}\mathbf{B}$ has to be integrated exactly for the order to show, and never fewer than two, or the checkerboard returns |
-| a graded wall closure | a cell nearer a wall than $r$ drops to the radius its distance allows, so the stencil never reaches a ghost node and the interior-cell sum still gives a free surface |
+Two prices remain, and they are the honest limits of a wide stencil rather than of this scheme:
 
-Grading costs accuracy in a layer a few nodes deep and costs symmetry nothing: the sandwich is symmetric whatever $\mathbf{B}$ each cell carries, so a cell at reduced radius is as exact a transpose as one in the deep interior
+- the leapfrog stays $O\left(\Delta t^2\right)$ in time, so at a fixed Courant number the asymptotic rate is 2 whatever the spatial order; the spatial order pays through **dispersion** in the practical points-per-wavelength regime, which is the classic $(2,4)$ trade of seismology
+- a wide stencil still reaches past the harmonic mean into a void, so a design floor at $\gamma=10^{-3}$ costs stable timestep at order 4 where order 2 is untouched. The collapse is far milder than the cell gather's, but `stable_timestep(sim, indicator)` remains the arbiter: it power-iterates the step kernel itself, so it is exact for any order, material and boundary layout, where `wave.stable_dt` knows only the speed and the spacing. A number far below it is the signal to raise the design floor or drop `space_order`, not to shrink `dt`
 
-The price is arithmetic. A node gathers $\left(2r\right)^\textrm{ndim}$ cells and each carries $\left(2r\right)^\textrm{ndim}$ nodes, so the work per node runs as $\left(2r\right)^{2\,\textrm{ndim}}$
-
-| `space_order` | stencil (2D) | cost per step, 2D |
-|---|---|---|
-| 2 | 9 | 1x |
-| 4 | 49 | 15x |
-| 6 | 121 | 76x |
-
-Against that a higher order resolves a wavelength on fewer points, and a coarser grid buys both fewer nodes and a larger timestep, so the comparison turns on **what sets the spacing**
-
-| what limits the grid | can the grid coarsen? | order 4 against order 2, 2D |
-|---|---|---|
-| dispersion, a smooth medium over a long path | yes, to about a third of the spacing | about $0.35$x, so a win of roughly 3 |
-| geometry, a defect a few nodes across | no | $14.6$x, a pure loss |
-
-The second row is the one an [fwi](fwi.md) driver sits in: the grid is set by the smallest defect and not by the wavelength, so the spacing cannot follow the order and the extra accuracy buys nothing. Folding the quadrature into a stored stress field would trade memory for a factor of a few on the per-step figure, and is the obvious next move if high order turns out to matter
-
-There is a second and sharper price, and it decides where a wide stencil is usable at all. A cell shields a light node from its neighbours through the harmonic mean, but only over the `2**ndim` nodes it owns; a wide stencil reaches past that, so a node at $\gamma=10^{-4}$ feels the full stiffness of solid cells two nodes away and the stable timestep collapses with it
-
-| `space_order` | uniform | $\gamma=10^{-1}$ void | $\gamma=10^{-4}$ void |
-|---|---|---|---|
-| 2 | 1.48 | 1.44 | 1.39 |
-| 4 | 1.48 | 1.30 | **0.19** |
-| 6 | 1.30 | 1.16 | **0.12** |
-
-as a multiple of `wave.stable_dt`. The cliff sits between $10^{-2}$ and $10^{-3}$: above it a wide stencil costs a few percent of timestep and nothing else, and a design floor at $\gamma=0.1$, which is where an ultrasonic inversion bounds the density anyway, pays $1.11$x. Below it the timestep collapses and a higher order stops being affordable. The scheme stays correct at the measured timestep either way, so this is a cost question and not a stability bug
-
-`stable_timestep(sim, indicator)` is what tells the two apart. It power-iterates the step kernel itself, so it is exact for any order, material and boundary layout, where `wave.stable_dt` knows only the speed and the spacing. A number far below it is the signal to drop `space_order`, not to shrink `dt`
+The reconstruction strip of [sensitivity](sensitivity.md) follows `reach` $=2r-1$ rather than $r$: the strain taps compound with the divergence taps, and a strip sized on $r$ alone would let the reverse march read a damped node
 
 ## members
 
 | member | signature | description |
 |---|---|---|
-| constructor | `ElasticWave(Nx, dx, N, dt, threads, density=None, wavespeed_p=None, wavespeed_s=None, plane="strain")` | on top of [Simulation](wave.md), the two speeds and the background density, rejecting a shear speed above the pressure one |
-| stencil radius | `radius` | half `space_order`, the nodes the cell reaches per axis being twice it |
+| constructor | `ElasticWave(Nx, dx, N, dt, threads, density=None, wavespeed_p=None, wavespeed_s=None, plane="strain")` | on top of [Simulation](wave.md), the two speeds and the background density, rejecting a shear speed above the pressure one and any face that is not `Traction` or `Clamped` |
+| staggering | `component_offsets` | component `c` half a node up axis `c`, what [distribute](utils.md) shifts by |
+| stencil radius | `radius` | half `space_order`, each derivative reaching twice it |
+| strip radius | `reach` | $2r-1$, the nodes one step reads past a point |
 | timestep | `stable_timestep(sim, indicator, iterations=60, safety=0.95)` | the largest stable step, measured on the step kernel rather than estimated |
-| materials | `build_materials(indicator)` | the lumped inverse inertia, the harmonic cell field, the element table and `damping` |
-| inertia | `inverse_inertia(indicator)` | $1/\left(\gamma\rho_0V W\right)$, the lumped mass the interior-cell assembly implies |
+| materials | `build_materials(indicator)` | the point inverse inertia per component, the design field on the node and shear stress points, and `damping` |
+| step | `define_step(kernels, mat)` | the two-launch closure: the stress kernel, then the update |
+| inertia | `inverse_inertia(indicator)` | nodal $1/\left(\gamma\rho_0W\right)$, what a [sponge](boundary.md) scales its damping by |
 | coefficients | `parametrization_jacobian(indicator)` | $\left(1,\,1\right)$, since $\gamma$ scales inertia and stiffness alike |
-| per-axis factors | `step_factors()` | $\Delta t^2$, the grid spacing already sitting in the element |
-| source scaling | `source_factor()` | $1$, since $\rho_0$ is already folded into the lumped inertia |
-| stencil | `stencil()` | the table at $\gamma=1$, one graded radius per slice, zero padded and flattened |
-| adjoint scaling | `adjoint_weights(sensors)` | ones, since the lumped inertia already carries the cell weights $W$ |
+| per-axis factors | `step_factors()` | $\Delta t^2/\Delta x_d$, the strain carrying the other $1/\Delta x$ |
+| source scaling | `source_factor()` | $1$; the excitation weights divide by the volume the kernel inertia leaves out |
+| averages | `point_average(field, c)`, `pair_average(field, axes)` | the arithmetic two-node inertia mean and the harmonic four-node shear mean |
+| weights | `component_weights(c)`, `pair_weights(axes)` | the cell weights $W$ of a point family, halved on the walls of its unstaggered axes |
 | stiffness matrix | `voigt(ndim, lame, shear, plane="strain")` | the isotropic Voigt matrix, `plane` selecting strain or stress in 2D |
-| stencil | `cell_stencil(ndim, dx, C, radius=1)` | one cell's contribution to the nodal stencil, ordered (node, component) |
-| block order | `block_indices(ndim, radius)` | the cell's node block in the kernel's order, axis 0 running fastest |
-| weights | `lagrange_weights(radius, t)` | value and derivative weights at `t` inside the cell |
 
 ## parametrization
 
@@ -102,16 +79,18 @@ with the Lamé parameters recovered as `lame` $\lambda=\rho_0\left(c_p^2-2c_s^2\
 
 | condition | meaning | cost |
 |---|---|---|
-| `Traction` | $\boldsymbol{\sigma}\cdot\mathbf{n}=0$, the default and a genuine free surface | no kernel and no launch |
-| `Clamped` | $\mathbf{u}=0$, the wall nodes held by a zeroed inverse inertia | no kernel and no launch |
+| `Traction` | $\boldsymbol{\sigma}\cdot\mathbf{n}=0$, the default: the wall stress point condenses its axis out of the coupling | no kernel and no launch |
+| `Clamped` | $\mathbf{u}=0$, the tangential wall unknowns held by a zeroed inverse inertia, the normal strain folded antisymmetrically about the wall | no kernel and no launch |
 | `sponge` | the same damping field the pressure equation takes, shared by every component | as [boundary](boundary.md) |
+
+A traction wall condenses each graded-out axis by the plane stress reduction $\lambda\to2\lambda\mu/\left(\lambda+2\mu\right)$, so the surface-tangential stiffness is the statically condensed one rather than merely the interior one with a row deleted. The wall-normal component carries no unknown on the wall itself, so a source or receiver coordinate placed **on** a traction surface lands on the unknown half a cell inside, which is the staggered convention for a surface force
 
 A sponge behind an elastic wall has to swallow the shear and surface waves as well as the pressure one, and the shear wavelength is $c_p/c_s$ shorter at the same frequency, so a layer sized on the pressure wavelength leaks. Size it on $c_s$ and expect what is left to show in the tangential component
 
 ## limits
 
-Where the pressure equation trades exactness for width above order 2, this one trades cost for it instead and keeps the exact transpose at every order
+In 1D on a uniform material the staggered scheme is the [scalar](scalar.md) stencil on the half-shifted grid, unknown for unknown, which is the one configuration where the whole vector pipeline is checked against an already-trusted one. On a varying material the two sample $\gamma$ on offset grids and agree only to discretization order
 
-In 1D there is no coupling, so `ElasticWave` reduces to the [scalar](wave.md) equation with $c=\sqrt{\left(\lambda+2\mu\right)/\rho}$ and reproduces `ScalarWave` node for node. That is worth keeping in reach: it is the one configuration where the whole vector pipeline can be checked against an already-trusted scalar one
+The staggering is also what this scheme cannot escape: a general anisotropic $\mathbf{C}$ couples strains that live on different points, so anisotropy belongs to the collocated [AnisotropicElasticWave](anisotropic.md), which trades the linear-in-radius cost for it
 
 The kernels are documented in [forward CUDA](cuda_elastic.md) and [backward CUDA](cuda_elastic_sensitivity.md)

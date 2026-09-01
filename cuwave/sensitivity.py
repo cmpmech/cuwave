@@ -30,7 +30,6 @@ from .wave import (
     define_step_method,
     flatten_indices,
     grid_rows,
-    sensor_cell_weights,
 )
 
 ADJOINT_DELAY = 1  # lines the adjoint up with the reconstructed forward triplet
@@ -114,7 +113,7 @@ def reconstruction_nodes(
         every lossless interior node, which is where the rebuilt triplet is exact.
     """
     # the reverse step of a node reaches this far, so a strip that thin feeds it
-    radius = sim.space_order // 2
+    radius = sim.reach
     interior = cp.zeros(sim.Nx_padded, dtype=cp.bool_)
     interior[tuple(slice(1, n - 1) for n in sim.Nx)] = True
     if sim.damping is None:
@@ -531,6 +530,6 @@ def source_sensitivity(
         p1, p0 = p0, p1  # p1 now holds lambda^n
         probe(p1, lam, n)  # row n rather than row m, so the record runs forward in time
 
-    # the transpose of adjoint_signal: over W and source_factor, and not reversed
-    gradient = lam * sensor_cell_weights(sim, source.position) * sim.source_factor()
+    # the transpose of adjoint_signal: over the same weights, and not reversed
+    gradient = lam * sim.adjoint_weights(source.position)
     return cost, gradient, um, {}

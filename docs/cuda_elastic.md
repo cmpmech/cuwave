@@ -1,76 +1,111 @@
 # CUDA elastic
 
-The forward kernels of the [elastic](elastic.md) equation, gathering the cell assembly at each node
+The forward kernels of the staggered [elastic](elastic.md) equation: one pass forming the stresses on their staggered points, one pass gathering their divergence into the update
 
 ## compilation logic
 
 | flag | set from | effect |
 |---|---|---|
 | `USE_FLOAT` | `precision` | `real_t` is `float` rather than `double` |
-| `NDIM` | `len(Nx)` | selects the interior guard, the geometry macro and the loop bounds |
+| `NDIM` | `len(Nx)` | selects the interior guard, the geometry macros and the loop bounds |
 | `USE_DAMPING` | `damping is not None` | adds the damped update and its two extra arguments |
-| `RADIUS` | `space_order // 2` | nodes the cell reaches per axis, `BLK` being twice it, and the number of graded slices in the stencil table |
+| `STENCIL_RADIUS` | `space_order // 2` | taps per staggered difference, prepended by [stencils](stencils.md) |
+| `STAG_COEFFS` | `staggered_weights` | the graded coefficient table, prepended alongside |
 
-`BLK` is $2\,\textrm{RADIUS}$, `CELLS` is $\textrm{BLK}^\textrm{ndim}$, the cells a node borders and equally the nodes a cell reaches, and `NLOC` is `CELLS * NDIM`, the side of one slice of the stencil table. All are compile-time, so every loop over them unrolls fully
-
-Unlike [cuda_wave](cuda_wave.md) the graded table is indexed by the **cell's** radius rather than the node's, since the gather is over cells rather than along an axis, and `STENCIL_RADIUS` never enters. The table arrives as the `stencil` argument, one slice per radius $1\ldots\textrm{RADIUS}$, each slice a cell's contribution to the nodal stencil with everything outside its own support left at zero
+`NPAIRS` is $\textrm{ndim}\left(\textrm{ndim}-1\right)/2$ and `NVOIGT` is `NDIM + NPAIRS`, the stress components held back to back in the `sigma` scratch. `SG_W(r, k)` reads coefficient $k$ of the radius-$r$ row from `__constant__` memory, collapsing to 1 at `STENCIL_RADIUS` 1. `PAIR_ROW(k, l)` maps an axis pair onto its Voigt row, `NDIM + 3 - k - l` in 3D and 2 in 2D
 
 ## macros
 
 ### INTERIOR_OR_RETURN
-Declares `a0`, `a1`, `a2` and `idx` and returns on the ghost ring and the padding tail, exactly as in [cuda_wave](cuda_wave.md)
+Declares `a0`, `a1`, `a2` and `idx` and returns on the ghost ring and the padding tail, exactly as in [cuda_scalar](cuda_scalar.md). The guard is the union over the point families; each family checks its own staggered axes against `NN[d] - 3` inside
 
-### AXIS_GEOM
-Declares three compile-time arrays the cell loop indexes rather than unrolling by hand: `A` the per-axis grid index, `S` the per-axis stride over the padded shape (last is 1), `NN` the per-axis logical extent
+### AXIS_GEOM, AXIS_FACTORS
+Declare the compile-time arrays the family loops index: `A` the per-axis grid index, `S` the per-axis stride (last is 1), `NN` the per-axis logical extent, `F` the per-axis factor `f0..f2`
 
 ## device functions
 
-### cell_inside
+### rad_node, rad_half
 **aim**
-decide whether cell `c` lies inside the domain, and where its low corner sits
+the graded radius of a staggered difference, keyed off the **stress point** so the forward and the transpose read the same matrix entry
 **input args**
-`c`: cell code, bit $d$ set on the plus side of axis $d$; `A`: grid index per axis; `NN`: logical extent per axis; `S`: stride per axis
-**output args**
-`base`: offset from `idx` to the cell's low corner
+`a`: the point's index along the derivative axis; `N`: logical extent
 **how?**
-- the cell exists when both of its corners do, on every axis, which for the node gathering it is
-$$\textrm{bit}_d(c)=1:\quad a_d<N_d-2,\qquad\textrm{bit}_d(c)=0:\quad a_d>1$$
-- restricting the assembly to the cells that pass is what makes $\boldsymbol{\sigma}\cdot\mathbf{n}=0$ the natural boundary condition, so no ghost value of $\mathbf{u}$ is ever read and the ring the [boundary](boundary.md) kernels would fill is not needed
+- a node strain reads unknowns at $a-r\ldots a+r-1$, valid over $1\ldots N-3$, so
+$$r_\textrm{node}\left(a\right)=\min\left(R,\,a-1,\,N-2-a\right)$$
+which is zero on the wall itself; a half-point derivative reads nodes at $a+1-r\ldots a+r$, valid over $1\ldots N-2$, so
+$$r_\textrm{half}\left(a\right)=\min\left(R,\,a,\,N-2-a\right)$$
 
-### corner_offset
+### clamped_face
+Reads bit $2d+\textrm{side}$ of the `clamped` mask, the faces `Simulation.boundary` marks `Clamped`
+
+### normal_strains
 **aim**
-offset of local corner `l` of cell `c`, relative to the node gathering that cell
+the node's normal strains, one per axis, and which axes graded to a zero row
 **input args**
-`c`: cell code; `l`: corner code, in the same bit convention; `S`: stride per axis
+`u`: a displacement field, `NDIM` components of `cs` entries back to back; `idx`, `A`, `S`, `NN`, `F`: geometry, `F` holding $1/\Delta x_d$
+**output args**
+`eps`: $\varepsilon_{dd}$ per axis; the return value: the bitmask of zeroed axes
 **how?**
-$$\textrm{offset}=\sum_d\left(\textrm{bit}_d(c)-1+\textrm{bit}_d(l)\right)s_d$$
+- in the interior, the graded staggered difference of the component along its own axis
+$$\varepsilon_{dd}\big|_a=\frac{1}{\Delta x_d}\sum_{k\le r}c_k^{(r)}\left(u_d^{a+k-1}-u_d^{a-k}\right)$$
+- on a clamped wall the strain folds antisymmetrically about the held wall value, $\varepsilon=\pm2u_d/\Delta x_d$ from the single unknown half a node inside
+- on a traction wall the row is zero and the axis is reported for condensation
+
+### condensed_lame
+**aim**
+condense each zeroed axis out of the normal coupling
+**input args**
+`lam`, `mu`: the Lamé scalars; `zeroed`: the bitmask from `normal_strains`
+**how?**
+- setting $\sigma_{dd}=0$ and eliminating $\varepsilon_{dd}$ is the plane stress reduction, applied once per zeroed axis
+$$\lambda\leftarrow\frac{2\lambda\mu}{\lambda+2\mu}$$
+so a surface-tangential stiffness is the statically condensed one, and an edge or corner condenses twice or three times
+
+### shear_strain
+**aim**
+the engineering shear strain of the $\left(k,l\right)$ pair at its own staggered point
+**input args**
+`u`, `idx`, `cs`, `k`, `l`, `A`, `S`, `NN`, `F`: as above
+**how?**
+- both derivatives land on the point without averaging, each at its own graded radius
+$$2\,\varepsilon_{kl}=\frac{1}{\Delta x_l}\sum_{j\le r_1}c_j\left(u_k^{a+j}-u_k^{a+1-j}\right)+\frac{1}{\Delta x_k}\sum_{j\le r_2}c_j\left(u_l^{a+j}-u_l^{a+1-j}\right)$$
 
 ## kernels
 
+### stress_kernel
+**parallelization**
+one thread per grid point, writing every stress family whose point it carries
+**input args**
+`u1`: the field at $t-1$; `gnode`: $W\gamma$ on the nodes; `gshear`: `NPAIRS` fields of $w_s\gamma_s$, the harmonic shear means, `NDIM >= 2` only; `lam`, `mu`: $\lambda$ (plane-reduced on the host) and $\mu$; `clamped`: the face bitmask; `cs`: component stride; `f0..f2`: $1/\Delta x_d$; `N0..N2`, `s0, s1`: geometry
+**output args**
+`sigma`: `NVOIGT` fields, the normal stresses first and the pairs in Voigt order, assigned rather than accumulated; points no family writes stay at the zero the scratch was allocated with
+**how?**
+- the normal family couples through the (possibly condensed) $\lambda$, a zeroed axis writing an explicit zero
+$$\sigma_{dd}=W\gamma\left(2\mu\,\varepsilon_{dd}+\lambda_\textrm{eff}\,\textrm{tr}\,\boldsymbol{\varepsilon}\right)$$
+- each shear point is one multiply on its own strain
+$$\sigma_{kl}=w_s\gamma_s\,\mu\left(2\,\varepsilon_{kl}\right)$$
+
 ### fd_kernel
 **parallelization**
-one thread per node of the padded grid, retired to the interior by the guard
+one thread per grid point, updating every component whose unknown it carries
 **input args**
-`u0`, `u1`: the fields at $t-2$ and $t-1$, each `NDIM` components of `cs` entries laid out back to back; `minv`: lumped $1/\left(\gamma\rho_0VW\right)$, nodal and scalar; `cell`: the harmonic cell mean $\gamma_c$, stored at the cell's low corner; `stencil`: `RADIUS` slices of `NLOC` by `NLOC`, the cell's contribution at $\gamma=1$, row-major, indexed by the cell's graded radius; `damping`: nodal $d$, with `USE_DAMPING` only; `dt`: $\Delta t$, with `USE_DAMPING` only; `cs`: component stride, the padded node count; `f0`: $\Delta t^2$, the only axis factor the kernel reads; `N0, N1, N2`: logical extents, ghost nodes in and padding out; `s0, s1`: strides of axes 0 and 1
+`u0`, `u1`: the fields at $t-2$ and $t-1$; `sigma`: the stresses `stress_kernel` just wrote; `minv`: `NDIM` fields of $1/\left(\rho_0W\bar{\gamma}\right)$, one per component at its own points, the volume deliberately left out since the force below leaves it out too; `damping`: nodal $d$, with `USE_DAMPING` only; `dt`: $\Delta t$, with `USE_DAMPING` only; `clamped`, `cs`: as above; `f0..f2`: $\Delta t^2/\Delta x_d$
 **output args**
 `u2`: the field at $t$, same layout as `u1`
 **internal args**
-`force`: the internal force per component, accumulated over the node's cells; `gc`: $\gamma_c$ of the cell being gathered; `self`: the node's own corner of that cell, `CELLS - 1 - c`; `mi`: inverse inertia at the node
+`force`: the divergence per component; `ap, am`: the stress node of the plus and minus tap; `rp, rm`: that point's own graded radius, which decides whether the tap exists
 **how?**
-- the force gathers the node's row of the stencil from every cell it borders
-$$f_i=-\sum_{c\ni i}\gamma_c\sum_{l,j}\hat{K}_{\left(\textrm{self},i\right)\left(l,j\right)}u_j^{l}$$
-- the march is the same three-term recursion the pressure equation uses, applied component by component since the lumped mass is diagonal and shared
-$$u_i^{t}=-u_i^{t-2}+2u_i^{t-1}+\Delta t^2\,m^{-1}f_i$$
-- with `USE_DAMPING` the update divides through by $1+\beta$ as in [cuda_wave](cuda_wave.md), one damping field serving every component
-$$\beta=\frac{d\,\Delta t}{2m}$$
-
-Note that `f1` and `f2` are accepted and never read: the tail `wave.axis_geometry` packs is per-axis, while the elastic factors live in `element` instead
+- the divergence is the exact transpose of the strain differences: every tap carries the coefficient of the stress point it reads, evaluated by the same `rad_node` / `rad_half`, with the clamped fold doubling the wall tap
+$$f_c=\frac{1}{\Delta x_c}\sum_k c_k^{\left(r\left(a\right)\right)}\left(\sigma_{cc}^{i+k}-\sigma_{cc}^{i-k+1}\right)+\sum_{l\ne c}\frac{1}{\Delta x_l}\sum_j c_j^{\left(r\left(a\right)\right)}\left(\sigma_{cl}^{i+j-1}-\sigma_{cl}^{i-j}\right)$$
+- the march is the three-term recursion of [cuda_scalar](cuda_scalar.md), component by component, `USE_DAMPING` dividing by $1+\beta$ with one damping field serving every component
 
 ### excitation_kernel
-Byte-identical to [cuda_wave](cuda_wave.md). A vector source is `NDIM` entries of `lin_index`, one per component, at `d * cs + idx`, so the `atomicAdd` covers a source and a sensor landing on the same node and component
+Byte-identical to [cuda_scalar](cuda_scalar.md). A vector source is `NDIM` entries of `lin_index`, one per component, at `d * cs + idx`, so the `atomicAdd` covers a source and a sensor landing on the same point and component
 
 ### get_signal_kernel
-Byte-identical to [cuda_wave](cuda_wave.md), the component folded into `lin_index` the same way
+Byte-identical to [cuda_scalar](cuda_scalar.md), the component folded into `lin_index` the same way
 
 ### set_signal_kernel
-Byte-identical to [cuda_wave](cuda_wave.md), assignment rather than `atomicAdd`, so it restores a recorded state
+Byte-identical to [cuda_scalar](cuda_scalar.md), assignment rather than `atomicAdd`, so it restores a recorded state
+
+The `sigma` scratch is allocated once by `define_step` and reused every step: the two launches replace the single fused one because each stress value is read by up to $2r$ updates, so forming it once trades one round of global traffic against recomputing every strain per reader

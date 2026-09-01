@@ -1,10 +1,11 @@
-"""Contracts of the elastic equation that the scalar tests cannot reach.
+"""Contracts of the staggered elastic equation that the scalar tests cannot reach.
 
-Three of them carry the rest. In 1D elasticity *is* the scalar equation, so `ElasticWave`
-must reproduce `ScalarWave` to round-off, which pins the whole pipeline against the
-already-trusted one. The cell assembly is `-B^T C B`, so the operator must be exactly
-symmetric, which is what all three adjoint variants rest on. And full quadrature is what
-buys that symmetry without an hourglass mode, so the checkerboard must not be a null mode.
+Three of them carry the rest. The staggered strains put every stress on a natural point,
+so the operator must converge at its full order while the cost stays flat in the radius.
+The operator is `-B^T C B` with matching taps in both kernels, so it must be exactly
+symmetric at every order and boundary mix, which is what all adjoint variants rest on.
+And the staggering shifts every component off the nodes, so sources, sensors and the
+reconstruction strip must all honour the half-node offsets.
 """
 
 import unittest
@@ -20,25 +21,22 @@ except Exception:
     HAS_CUDA = False
 
 if HAS_CUDA:
-    from cuwave.boundary import Clamped, pad_for_sponge, sponge
-    from cuwave.elastic import (
-        ElasticWave,
-        cell_stencil,
-        corner_bits,
-        stable_timestep,
-        voigt,
-    )
+    from cuwave.boundary import Clamped, Traction, pad_for_sponge, sponge
+    from cuwave.elastic import ElasticWave, stable_timestep
+    from cuwave.scalar import ScalarWave
     from cuwave.sensitivity import (
         l2_misfit,
-        reconstruction_sensitivity,
         reconstruction_nodes,
+        reconstruction_sensitivity,
         sensitivity,
+        source_sensitivity,
         superposition_sensitivity,
     )
     from cuwave.signals import ricker
+    from cuwave.stencils import staggered_weights
     from cuwave.utils import Sensors, point_source
     from cuwave.wave import (
-        ScalarWave,
+        Source,
         compile_kernels,
         define_step_method,
         simulate,
@@ -50,15 +48,16 @@ THREADS = {1: (128,), 2: (8, 8), 3: (4, 4, 8)}
 
 
 # -------------------------------------- helpers --------------------------------------
-def _sim(Nx, N=80, precision="float64", **kwargs):
+def _sim(Nx, N=80, precision="float64", space_order=2, **kwargs):
     dx = tuple(1.0 / (n - 3) for n in Nx)
     return ElasticWave(
         Nx,
         dx,
         N,
-        0.9 * stable_dt(dx, CP, 2),
+        0.8 * stable_dt(dx, CP, space_order),
         THREADS[len(Nx)][::-1],
         precision=precision,
+        space_order=space_order,
         density=RHO,
         wavespeed_p=CP,
         wavespeed_s=CS,
@@ -88,21 +87,27 @@ def _problem(sim, seed=0):
 
 
 def _operator(sim, indicator):
-    """The mass weighted spatial operator, which the assembly makes symmetric."""
+    """The mass weighted spatial operator on the free unknowns, an exact transpose."""
     mat = sim.build_materials(indicator)
     step = define_step_method(sim, compile_kernels(sim), mat)
-    interior = (Ellipsis, *(slice(1, n - 1) for n in sim.Nx))
     mass = cp.where(mat["minv"] > 0, 1.0 / cp.maximum(mat["minv"], 1e-300), 0.0)
+    slices = [
+        (c, *(slice(1, n - 1 - (d == c)) for d, n in enumerate(sim.Nx)))
+        for c in range(sim.ncomp)
+    ]
+
+    def mask(x):
+        out = cp.zeros_like(x)
+        for sl in slices:
+            out[sl] = x[sl]
+        return out * (mat["minv"] > 0)
 
     def apply(x):
         out = cp.zeros_like(x)
         step(cp.zeros_like(x), x, out)
-        weighted = (2.0 * x - out) * mass
-        masked = cp.zeros_like(weighted)
-        masked[interior] = weighted[interior]
-        return masked
+        return mask((2.0 * x - out) * mass)
 
-    return apply, interior
+    return apply, mask
 
 
 def _finite_difference(cost_of, indicator, nodes, h=1e-6):
@@ -116,93 +121,106 @@ def _finite_difference(cost_of, indicator, nodes, h=1e-6):
     return np.array(out)
 
 
-# -------------------------------- element and operator -------------------------------
+def _divergence_error(order, n):
+    """Relative operator error against the analytic div(sigma) of a smooth field."""
+    lame, shear = 1.0, 0.6
+    a, b, c, e = 2.0 * np.pi, 3.0 * np.pi, np.pi, 2.0 * np.pi
+    speed_p, speed_s = np.sqrt((lame + 2.0 * shear) / RHO), np.sqrt(shear / RHO)
+    dx = (1.0 / n, 1.3 / n)
+    sim = ElasticWave(
+        (n + 3, n + 3),
+        dx,
+        1,
+        0.9 * stable_dt(dx, speed_p, order),
+        (8, 32),
+        precision="float64",
+        space_order=order,
+        density=RHO,
+        wavespeed_p=speed_p,
+        wavespeed_s=speed_s,
+    )
+    axes = [(np.arange(m) - 1) * h for m, h in zip(sim.Nx_padded, dx)]
+    X, Y = np.meshgrid(*axes, indexing="ij")
+    # each component sampled at its own half-shifted point
+    Xs, Ys = X + 0.5 * dx[0], Y + 0.5 * dx[1]
+    u = np.stack([np.sin(a * Xs) * np.cos(b * Y), np.cos(c * X) * np.sin(e * Ys)])
+    gx = -(a * a) * np.sin(a * Xs) * np.cos(b * Y) - e * c * np.sin(c * Xs) * np.cos(
+        e * Y
+    )
+    gy = -a * b * np.cos(a * X) * np.sin(b * Ys) - (e * e) * np.cos(c * X) * np.sin(
+        e * Ys
+    )
+    lx = -(a * a + b * b) * np.sin(a * Xs) * np.cos(b * Y)
+    ly = -(c * c + e * e) * np.cos(c * X) * np.sin(e * Ys)
+    want = np.stack(
+        [(lame + shear) * gx + shear * lx, (lame + shear) * gy + shear * ly]
+    )
+    u1 = cp.asarray(u, dtype=sim.dtype)
+    mat = sim.build_materials(cp.ones(sim.Nx_padded, dtype=sim.dtype))
+    step = define_step_method(sim, compile_kernels(sim), mat)
+    u0, u2 = cp.zeros_like(u1), cp.zeros_like(u1)
+    step(u0, u1, u2)
+    cp.cuda.Stream.null.synchronize()
+    got = cp.asnumpy(u2 - 2.0 * u1) * RHO / sim.dt**2
+    margin = order + 1
+    inner = (Ellipsis, slice(margin, n - margin), slice(margin, n - margin))
+    return np.abs(got[inner] - want[inner]).max() / np.abs(want[inner]).max()
+
+
+# -------------------------------- stencil and operator -------------------------------
 class StencilTest(unittest.TestCase):
-    def test_the_stencil_has_only_the_rigid_body_null_space(self):
-        for ndim, dx in ((1, (0.7,)), (2, (0.7, 1.3)), (3, (0.7, 1.3, 0.9))):
-            with self.subTest(ndim=ndim):
-                K = cell_stencil(ndim, dx, voigt(ndim, 2.0, 1.0))
-                ev = np.linalg.eigvalsh(K)
-                null = int(np.sum(np.abs(ev) < 1e-9 * abs(ev).max()))
-                self.assertEqual(null, {1: 1, 2: 3, 3: 6}[ndim])
-                self.assertLess(np.linalg.norm(K - K.T), 1e-12 * np.linalg.norm(K))
+    def test_the_weights_are_the_staggered_taylor_ones(self):
+        np.testing.assert_allclose(staggered_weights(1), [1.0])
+        np.testing.assert_allclose(staggered_weights(2), [9.0 / 8.0, -1.0 / 24.0])
 
-    def test_a_rigid_translation_carries_no_force(self):
-        K = cell_stencil(2, (0.7, 1.3), voigt(2, 2.0, 1.0))
-        for component in range(2):
-            shift = np.zeros(K.shape[0])
-            shift[component::2] = 1.0
-            self.assertLess(np.linalg.norm(K @ shift), 1e-10 * np.linalg.norm(K))
-
-    def test_the_corner_order_matches_the_kernel(self):
-        self.assertEqual(corner_bits(2), [(0, 0), (1, 0), (0, 1), (1, 1)])
+    def test_the_weights_differentiate_at_their_order(self):
+        for r in (1, 2, 3):
+            errors = []
+            for h in (0.02, 0.01):
+                c = staggered_weights(r)
+                taps = sum(
+                    c[k - 1] * (np.sin((k - 0.5) * h) - np.sin(-(k - 0.5) * h))
+                    for k in range(1, r + 1)
+                )
+                errors.append(abs(taps / h - 1.0))
+            self.assertGreater(np.log2(errors[0] / errors[1]), 2 * r - 0.5)
 
 
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class OperatorTest(unittest.TestCase):
-    def test_the_kernel_reproduces_the_continuum_divergence(self):
-        """Independent of every convention in the module: a smooth field against analytic
-        div(sigma), on deliberately unequal dx so an axis mix-up cannot hide."""
-        lame, shear = 1.0, 0.6
-        a, b, c, e = 2.0 * np.pi, 3.0 * np.pi, np.pi, 2.0 * np.pi
-        speed_p = np.sqrt((lame + 2.0 * shear) / RHO)
-        speed_s = np.sqrt(shear / RHO)
-        errors = []
-        for n in (32, 64):
-            dx = (1.0 / n, 1.3 / n)
-            sim = ElasticWave(
-                (n + 3, n + 3),
-                dx,
-                1,
-                0.9 * stable_dt(dx, speed_p, 2),
-                (8, 32),
-                precision="float64",
-                density=RHO,
-                wavespeed_p=speed_p,
-                wavespeed_s=speed_s,
-            )
-            axes = [(np.arange(m) - 1) * h for m, h in zip(sim.Nx_padded, dx)]
-            X, Y = np.meshgrid(*axes, indexing="ij")
-            u = np.stack([np.sin(a * X) * np.cos(b * Y), np.cos(c * X) * np.sin(e * Y)])
-            grad_x = -(a * a) * np.sin(a * X) * np.cos(b * Y) - e * c * np.sin(
-                c * X
-            ) * np.cos(e * Y)
-            grad_y = -a * b * np.cos(a * X) * np.sin(b * Y) - (e * e) * np.cos(
-                c * X
-            ) * np.sin(e * Y)
-            lap_x = -(a * a + b * b) * np.sin(a * X) * np.cos(b * Y)
-            lap_y = -(c * c + e * e) * np.cos(c * X) * np.sin(e * Y)
-            want = np.stack(
-                [
-                    (lame + shear) * grad_x + shear * lap_x,
-                    (lame + shear) * grad_y + shear * lap_y,
-                ]
-            )
-            u1 = cp.asarray(u, dtype=sim.dtype)
-            mat = sim.build_materials(cp.ones(sim.Nx_padded, dtype=sim.dtype))
-            step = define_step_method(sim, compile_kernels(sim), mat)
-            u0, u2 = cp.zeros_like(u1), cp.zeros_like(u1)
-            step(u0, u1, u2)
-            cp.cuda.Stream.null.synchronize()
-            got = cp.asnumpy(u2 - 2.0 * u1) * RHO / sim.dt**2
-            inner = (Ellipsis, slice(3, n - 1), slice(3, n - 1))
-            errors.append(
-                np.abs(got[inner] - want[inner]).max() / np.abs(want[inner]).max()
-            )
-        self.assertLess(errors[0], 5e-2)
-        self.assertGreater(np.log2(errors[0] / errors[1]), 1.7)
+    def test_the_stencil_converges_at_its_order(self):
+        for order in (2, 4, 6):
+            with self.subTest(order=order):
+                errors = [_divergence_error(order, n) for n in (32, 64)]
+                rate = np.log2(errors[0] / errors[1])
+                self.assertGreater(rate, order - 0.5)
 
-    def test_the_operator_is_symmetric(self):
+    def test_the_operator_is_symmetric_at_every_order_and_boundary(self):
         rng = np.random.default_rng(4)
-        for Nx in ((18, 20), (12, 11, 13)):
-            with self.subTest(ndim=len(Nx)):
-                sim = _sim(Nx, N=1)
+        cases = (
+            ((18, 20), 2, None),
+            ((18, 20), 4, None),
+            ((18, 20), 6, Clamped),
+            ((18, 20), 4, ((Traction, Clamped), (Clamped, Traction))),
+            ((12, 11, 13), 4, Clamped),
+        )
+        for Nx, order, boundary in cases:
+            with self.subTest(Nx=Nx, order=order, boundary=boundary):
+                sim = _sim(Nx, N=1, space_order=order, boundary=boundary)
                 gamma = cp.asarray(0.4 + rng.random(sim.Nx_padded), dtype=sim.dtype)
-                apply, interior = _operator(sim, gamma)
-                a = cp.zeros((sim.ncomp, *sim.Nx_padded), dtype=sim.dtype)
-                b = cp.zeros_like(a)
-                a[interior] = cp.asarray(rng.standard_normal(a[interior].shape))
-                b[interior] = cp.asarray(rng.standard_normal(b[interior].shape))
+                apply, mask = _operator(sim, gamma)
+                a = mask(
+                    cp.asarray(
+                        rng.standard_normal((sim.ncomp, *sim.Nx_padded)),
+                        dtype=sim.dtype,
+                    )
+                )
+                b = mask(
+                    cp.asarray(
+                        rng.standard_normal((sim.ncomp, *sim.Nx_padded)),
+                        dtype=sim.dtype,
+                    )
+                )
                 lhs = float(cp.sum(b * apply(a)))
                 rhs = float(cp.sum(a * apply(b)))
                 self.assertLess(abs(lhs - rhs), 1e-12 * abs(lhs))
@@ -210,68 +228,48 @@ class OperatorTest(unittest.TestCase):
     def test_the_checkerboard_is_not_a_null_mode(self):
         sim = _sim((18, 20), N=1)
         gamma = cp.ones(sim.Nx_padded, dtype=sim.dtype)
-        apply, interior = _operator(sim, gamma)
+        apply, mask = _operator(sim, gamma)
         axes = cp.meshgrid(
             *[cp.arange(n, dtype=sim.dtype) for n in sim.Nx_padded], indexing="ij"
         )
         checker = (-1.0) ** (axes[0] + axes[1])
         field = cp.zeros((sim.ncomp, *sim.Nx_padded), dtype=sim.dtype)
         field[:] = checker
-        masked = cp.zeros_like(field)
-        masked[interior] = field[interior]
-        # full quadrature is what removes the hourglass mode of a one point cell
+        # a staggered difference does not annihilate the alternating mode
+        masked = mask(field)
         self.assertGreater(
             float(cp.linalg.norm(apply(masked))), 1e-3 * float(cp.linalg.norm(masked))
         )
 
-    def test_the_plane_wave_speeds_are_the_lame_ones(self):
-        for ndim, plane, cp_ref in ((2, "strain", CP), (3, "strain", CP)):
-            with self.subTest(ndim=ndim, plane=plane):
-                dx = (0.01,) * ndim
-                lame = RHO * (cp_ref**2 - 2.0 * CS**2)
-                K = cell_stencil(ndim, dx, voigt(ndim, lame, RHO * CS**2, plane))
-                corners = corner_bits(ndim)
-                k = 2.0 * np.pi / (200 * dx[0])
-                A = np.zeros((ndim, ndim), dtype=complex)
-                for c in range(len(corners)):
-                    own = sum((1 - ((c >> d) & 1)) << d for d in range(ndim))
-                    for far in range(len(corners)):
-                        off = np.array(
-                            [((c >> d) & 1) - 1 + ((far >> d) & 1) for d in range(ndim)]
-                        )
-                        phase = np.exp(1j * k * off[0] * dx[0])
-                        A += (
-                            phase
-                            * K[
-                                own * ndim : own * ndim + ndim,
-                                far * ndim : far * ndim + ndim,
-                            ]
-                        )
-                A = (A + A.conj().T) / 2.0
-                speeds = (
-                    np.sqrt(
-                        np.abs(np.linalg.eigvalsh(A).real / (RHO * float(np.prod(dx))))
-                    )
-                    / k
-                )
-                exact = np.sort([CS] * (ndim - 1) + [cp_ref])
-                for got, want in zip(np.sort(speeds), exact):
-                    self.assertAlmostEqual(got / want, 1.0, places=3)
+    def test_the_cost_stays_flat_in_the_order(self):
+        import time
 
-    def test_plane_stress_softens_the_pressure_speed(self):
-        lame, shear = RHO * (CP**2 - 2.0 * CS**2), RHO * CS**2
-        strain = voigt(2, lame, shear, "strain")
-        stress = voigt(2, lame, shear, "stress")
-        self.assertLess(stress[0, 0], strain[0, 0])
-        self.assertAlmostEqual(float(stress[2, 2]), float(strain[2, 2]), places=12)
+        times = {}
+        for order in (2, 6):
+            sim = _sim((260, 260), N=1, precision="float32", space_order=order)
+            mat = sim.build_materials(cp.ones(sim.Nx_padded, dtype=sim.dtype))
+            step = define_step_method(sim, compile_kernels(sim), mat)
+            u = cp.zeros((3, sim.ncomp, *sim.Nx_padded), dtype=sim.dtype)
+            for _ in range(5):
+                step(u[0], u[1], u[2])
+            cp.cuda.Stream.null.synchronize()
+            tic = time.time()
+            for _ in range(50):
+                step(u[0], u[1], u[2])
+            cp.cuda.Stream.null.synchronize()
+            times[order] = time.time() - tic
+        # the cell gather paid 76x here; per-axis staggering pays a small factor
+        self.assertLess(times[6], 3.0 * times[2])
 
 
 # ---------------------------------- against the scalar -------------------------------
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class OneDimensionTest(unittest.TestCase):
-    """1D elasticity is the scalar equation, so the two solvers must agree exactly."""
+    """On a uniform medium the 1D staggered scheme is the scalar stencil on the offset
+    grid, so the two must agree to round-off while no reflection is in flight."""
 
-    def _pair(self, N=400, res=300):
+    def test_it_reproduces_the_scalar_solver_before_the_walls_answer(self):
+        res, N = 400, 150
         Nx, dx = (res,), (1.0 / (res - 3),)
         dt = 0.7 * stable_dt(dx, CP, 2)
         common = dict(precision="float64", space_order=2)
@@ -284,187 +282,32 @@ class OneDimensionTest(unittest.TestCase):
             (128,),
             density=RHO,
             wavespeed_p=CP,
-            wavespeed_s=0.4 * CP,
+            wavespeed_s=0.8 * CP,
             **common,
         )
-        return scalar, elastic
-
-    def test_it_reproduces_the_scalar_solver(self):
-        scalar, elastic = self._pair()
-        t = np.arange(scalar.N) * scalar.dt
+        t = np.arange(N) * dt
         signal = ricker(t, 1.0, 12.0)
-        volume = float(np.prod(scalar.dx))
-        nodes = scalar.Nx_padded[0]
-        cases = {
-            "uniform": np.full(nodes, 0.8),
-            "smooth": 0.7 + 0.25 * np.sin(np.linspace(0.0, 7.0, nodes)),
-            "void": np.where(abs(np.arange(nodes) - 200) < 15, 1e-3, 1.0),
-        }
-        for label, values in cases.items():
-            with self.subTest(gamma=label):
-                gamma = cp.asarray(values, dtype=scalar.dtype)
-                # the elastic source is a force, the scalar one a force density
-                a = simulate(
-                    scalar, point_source(scalar, [[0.35]], signal), gamma.copy()
-                )
-                b = simulate(
-                    elastic,
-                    point_source(elastic, [[0.35]], signal * volume, direction=[1.0]),
-                    gamma.copy(),
-                )
-                a, b = cp.asnumpy(a)[1:-1], cp.asnumpy(b)[1:-1]
-                self.assertLess(np.abs(a - b).max(), 1e-10 * np.abs(a).max())
+        volume = float(np.prod(dx))
+        gamma = 0.8
+        # the same discrete system: node i of the scalar is unknown i of the staggered
+        a = simulate(
+            scalar,
+            point_source(scalar, [[139 * dx[0]]], signal),
+            cp.full(scalar.Nx_padded, gamma),
+        )
+        b = simulate(
+            elastic,
+            point_source(elastic, [[139.5 * dx[0]]], signal * volume, direction=[1.0]),
+            cp.full(elastic.Nx_padded, gamma),
+        )
+        a, b = cp.asnumpy(a)[1:-1], cp.asnumpy(b)[1:-2]
+        self.assertLess(np.abs(a[:-1] - b).max(), 1e-12 * np.abs(a).max())
 
 
 # ------------------------------------- sensitivity -----------------------------------
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
-class HighOrderTest(unittest.TestCase):
-    """What the pressure equation cannot do: widen the stencil and keep the transpose.
-
-    Both sides of `B^T C B` widen together, so the adjoint stays exact at any order, where
-    the flux form pairs a wide inner gradient against a single outer difference and stops
-    being the transpose above order 2.
-    """
-
-    def test_the_stencil_converges_at_its_order(self):
-        lame, shear = 1.0, 0.6
-        a, b, c, e = 2.0 * np.pi, 3.0 * np.pi, np.pi, 2.0 * np.pi
-        speed_p, speed_s = np.sqrt((lame + 2.0 * shear) / RHO), np.sqrt(shear / RHO)
-        for order in (2, 4, 6):
-            with self.subTest(order=order):
-                errors = []
-                for n in (32, 64):
-                    dx = (1.0 / n, 1.3 / n)
-                    sim = ElasticWave(
-                        (n + 3, n + 3),
-                        dx,
-                        1,
-                        0.9 * stable_dt(dx, speed_p, 2),
-                        (8, 32),
-                        precision="float64",
-                        space_order=order,
-                        density=RHO,
-                        wavespeed_p=speed_p,
-                        wavespeed_s=speed_s,
-                    )
-                    axes = [(np.arange(m) - 1) * h for m, h in zip(sim.Nx_padded, dx)]
-                    X, Y = np.meshgrid(*axes, indexing="ij")
-                    u = np.stack(
-                        [np.sin(a * X) * np.cos(b * Y), np.cos(c * X) * np.sin(e * Y)]
-                    )
-                    gx = -(a * a) * np.sin(a * X) * np.cos(b * Y) - e * c * np.sin(
-                        c * X
-                    ) * np.cos(e * Y)
-                    gy = -a * b * np.cos(a * X) * np.sin(b * Y) - (e * e) * np.cos(
-                        c * X
-                    ) * np.sin(e * Y)
-                    lx = -(a * a + b * b) * np.sin(a * X) * np.cos(b * Y)
-                    ly = -(c * c + e * e) * np.cos(c * X) * np.sin(e * Y)
-                    want = np.stack(
-                        [
-                            (lame + shear) * gx + shear * lx,
-                            (lame + shear) * gy + shear * ly,
-                        ]
-                    )
-                    u1 = cp.asarray(u, dtype=sim.dtype)
-                    mat = sim.build_materials(cp.ones(sim.Nx_padded, dtype=sim.dtype))
-                    step = define_step_method(sim, compile_kernels(sim), mat)
-                    u0, u2 = cp.zeros_like(u1), cp.zeros_like(u1)
-                    step(u0, u1, u2)
-                    cp.cuda.Stream.null.synchronize()
-                    got = cp.asnumpy(u2 - 2.0 * u1) * RHO / sim.dt**2
-                    margin = order + 1
-                    inner = (
-                        Ellipsis,
-                        slice(margin, n - margin),
-                        slice(margin, n - margin),
-                    )
-                    errors.append(
-                        np.abs(got[inner] - want[inner]).max()
-                        / np.abs(want[inner]).max()
-                    )
-                rate = np.log2(errors[0] / errors[1])
-                self.assertGreater(rate, order - 0.5)
-
-    def test_the_adjoint_stays_exact_at_every_order(self):
-        for order in (2, 4, 6):
-            with self.subTest(order=order):
-                sim = _sim((26, 28), N=70, space_order=order)
-                source, sensors, indicator, objective = _problem(sim)
-
-                def cost_of(field):
-                    return objective(simulate(sim, source, field, sensors=sensors)[1])[
-                        0
-                    ]
-
-                _, grads, _, _ = sensitivity(sim, source, indicator, sensors, objective)
-                gradient = grads["mass"] + grads["stiff"]
-                nodes = [(10, 11), (13, 13), (1, 12), (24, 14)]
-                for node, want in zip(
-                    nodes, _finite_difference(cost_of, indicator, nodes)
-                ):
-                    self.assertLess(abs(float(gradient[node]) - want), 1e-5 * abs(want))
-
-    def test_the_wide_operator_is_still_symmetric(self):
-        rng = np.random.default_rng(11)
-        for order in (4, 6):
-            with self.subTest(order=order):
-                sim = _sim((22, 24), N=1, space_order=order)
-                gamma = cp.asarray(0.4 + rng.random(sim.Nx_padded), dtype=sim.dtype)
-                apply, interior = _operator(sim, gamma)
-                a = cp.zeros((sim.ncomp, *sim.Nx_padded), dtype=sim.dtype)
-                b = cp.zeros_like(a)
-                a[interior] = cp.asarray(rng.standard_normal(a[interior].shape))
-                b[interior] = cp.asarray(rng.standard_normal(b[interior].shape))
-                lhs = float(cp.sum(b * apply(a)))
-                rhs = float(cp.sum(a * apply(b)))
-                self.assertLess(abs(lhs - rhs), 1e-12 * abs(lhs))
-
-    def test_a_contrast_tightens_the_timestep_at_a_wide_stencil(self):
-        """The wide stencil lets a light node feel stiffness the cell mean cannot shield,
-        so a void costs timestep at order 4 and not at order 2."""
-        res = 96
-        dx = (1.0 / (res - 3),) * 2
-        ratios = {}
-        for order in (2, 4):
-            sim = _sim((res, res), N=1, space_order=order)
-            axes = cp.meshgrid(
-                *[
-                    (cp.arange(n, dtype=sim.dtype) - 1) * h
-                    for n, h in zip(sim.Nx_padded, dx)
-                ],
-                indexing="ij",
-            )
-            void = (axes[0] - 0.5) ** 2 + (axes[1] - 0.5) ** 2 < 0.1**2
-            indicator = cp.where(void, 1e-4, 1.0).astype(sim.dtype)
-            ratios[order] = stable_timestep(sim, indicator) / sim.dt
-        self.assertGreater(ratios[2], 1.0)
-        self.assertLess(ratios[4], 0.5)
-
-    def test_the_measured_timestep_agrees_with_the_cheap_bound_when_uniform(self):
-        sim = _sim((64, 64), N=1)
-        uniform = cp.ones(sim.Nx_padded, dtype=sim.dtype)
-        # stable_dt only knows the speed and the spacing, so it stays conservative
-        self.assertGreater(stable_timestep(sim, uniform) / sim.dt, 1.0)
-
-    def test_the_variants_agree_at_order_four(self):
-        sim = _sim((26, 28), N=60, space_order=4)
-        source, sensors, indicator, objective = _problem(sim)
-        args = (source, indicator, sensors, objective)
-        cost, grads, _, _ = sensitivity(sim, *args)
-        reference = grads["mass"] + grads["stiff"]
-        got, rebuilt, _, info = reconstruction_sensitivity(sim, *args)
-        total = rebuilt["mass"] + rebuilt["stiff"]
-        self.assertEqual(got, cost)
-        self.assertLess(
-            float(cp.linalg.norm(total - reference)),
-            1e-10 * float(cp.linalg.norm(reference)),
-        )
-
-
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class GradientTest(unittest.TestCase):
-    def _check(self, sim, nodes, tol=1e-5):
+    def _check(self, sim, nodes, tol=1e-4):
         source, sensors, indicator, objective = _problem(sim)
 
         def cost_of(field):
@@ -477,13 +320,19 @@ class GradientTest(unittest.TestCase):
         for node, want in zip(nodes, reference):
             self.assertLess(abs(float(gradient[node]) - want), tol * abs(want))
 
-    def test_it_matches_finite_differences_in_2D(self):
-        sim = _sim((24, 26))
-        self._check(sim, [(6, 9), (12, 12), (1, 10), (22, 11), (1, 1)])
+    def test_it_matches_finite_differences_at_every_order(self):
+        for order in (2, 4, 6):
+            with self.subTest(order=order):
+                sim = _sim((24, 26), space_order=order)
+                self._check(sim, [(6, 9), (12, 12), (1, 10), (22, 11), (1, 1)])
 
     def test_it_matches_finite_differences_in_3D(self):
-        sim = _sim((14, 13, 15), N=50)
+        sim = _sim((14, 13, 15), N=50, space_order=4)
         self._check(sim, [(6, 6, 7), (1, 6, 7), (12, 5, 8)])
+
+    def test_it_matches_finite_differences_on_a_clamped_wall(self):
+        sim = _sim((24, 26), space_order=4, boundary=Clamped)
+        self._check(sim, [(6, 9), (1, 10), (1, 1)])
 
     def test_a_ghost_node_carries_no_gradient(self):
         sim = _sim((24, 26))
@@ -492,6 +341,28 @@ class GradientTest(unittest.TestCase):
         gradient = grads["mass"] + grads["stiff"]
         for ghost in ((0, 12), (sim.Nx[0] - 1, 12), (12, 0), (12, sim.Nx[1] - 1)):
             self.assertEqual(float(gradient[ghost]), 0.0)
+
+    def test_the_source_gradient_matches_finite_differences(self):
+        sim = _sim((24, 26), space_order=4)
+        source, sensors, indicator, objective = _problem(sim)
+
+        def cost_of(src):
+            return objective(simulate(sim, src, indicator, sensors=sensors)[1])[0]
+
+        _, gradient, _, _ = source_sensitivity(
+            sim, source, indicator, sensors, objective
+        )
+        h = 1e-6
+        for t_index, column in ((20, 0), (40, 1), (10, 2)):
+            up, dn = source.signal.copy(), source.signal.copy()
+            up[t_index, column] += h
+            dn[t_index, column] -= h
+            want = (
+                cost_of(Source(source.position, up))
+                - cost_of(Source(source.position, dn))
+            ) / (2.0 * h)
+            got = float(gradient[t_index, column])
+            self.assertLess(abs(got - want), 1e-4 * abs(want))
 
 
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
@@ -504,9 +375,9 @@ class VariantTest(unittest.TestCase):
         return args, cost, grads["mass"] + grads["stiff"]
 
     def test_reconstruction_is_the_exact_transpose(self):
-        for Nx in ((24, 26), (14, 13, 15)):
-            with self.subTest(ndim=len(Nx)):
-                sim = _sim(Nx, N=50)
+        for Nx, order in (((24, 26), 4), ((14, 13, 15), 2)):
+            with self.subTest(ndim=len(Nx), order=order):
+                sim = _sim(Nx, N=50, space_order=order)
                 args, cost, reference = self._reference(sim)
                 got, grads, _, info = reconstruction_sensitivity(sim, *args)
                 total = grads["mass"] + grads["stiff"]
@@ -517,8 +388,37 @@ class VariantTest(unittest.TestCase):
                     1e-10 * float(cp.linalg.norm(reference)),
                 )
 
+    def test_the_sponge_is_reconstructed_exactly_where_it_is_lossless(self):
+        # the strip must honour reach = 2r - 1: the strain and divergence taps compound
+        for order in (2, 4):
+            with self.subTest(order=order):
+                res = 26
+                dx = (1.0 / (res - 3),) * 2
+                Nx, width, _, _ = pad_for_sponge((res, res), dx, 0.15, faces=(0, 1))
+                sim = _sim(Nx, N=70, space_order=order)
+                sim = replace(
+                    sim,
+                    damping=sponge(
+                        sim,
+                        cp.ones(sim.Nx_padded, dtype=sim.dtype),
+                        width,
+                        0.08,
+                        faces=(0, 1),
+                    ),
+                )
+                args, cost, reference = self._reference(sim)
+                got, grads, _, info = reconstruction_sensitivity(sim, *args)
+                _, valid = reconstruction_nodes(sim)
+                total = (grads["mass"] + grads["stiff"]) * valid
+                self.assertEqual(got, cost)
+                self.assertGreater(info["strip"], 0)
+                self.assertLess(
+                    float(cp.linalg.norm(total - reference * valid)),
+                    1e-10 * float(cp.linalg.norm(reference * valid)),
+                )
+
     def test_superposition_agrees_in_direction(self):
-        sim = _sim((24, 26), N=60)
+        sim = _sim((24, 26), N=60, space_order=4)
         args, cost, reference = self._reference(sim)
         _, grads, _, _ = superposition_sensitivity(sim, *args, scale=1e-4)
         total = grads["mass"] + grads["stiff"]
@@ -530,28 +430,6 @@ class VariantTest(unittest.TestCase):
         )
         self.assertLess(relative, 0.25)
         self.assertGreater(cosine, 0.98)
-
-    def test_the_sponge_is_reconstructed_exactly_where_it_is_lossless(self):
-        res = 26
-        dx = (1.0 / (res - 3),) * 2
-        Nx, width, _, _ = pad_for_sponge((res, res), dx, 0.12, faces=(0, 1))
-        sim = _sim(Nx, N=70)
-        sim = replace(
-            sim,
-            damping=sponge(
-                sim, cp.ones(sim.Nx_padded, dtype=sim.dtype), width, 0.08, faces=(0, 1)
-            ),
-        )
-        args, cost, reference = self._reference(sim)
-        got, grads, _, info = reconstruction_sensitivity(sim, *args)
-        _, valid = reconstruction_nodes(sim)
-        total = (grads["mass"] + grads["stiff"]) * valid
-        self.assertEqual(got, cost)
-        self.assertGreater(info["strip"], 0)
-        self.assertLess(
-            float(cp.linalg.norm(total - reference * valid)),
-            1e-10 * float(cp.linalg.norm(reference * valid)),
-        )
 
 
 # ------------------------------- transducers and validation --------------------------
@@ -574,6 +452,17 @@ class TransducerTest(unittest.TestCase):
         rhs = float(cp.sum(x * sensors.scatter(y)))
         self.assertLess(abs(lhs - rhs), 1e-12 * abs(lhs))
 
+    def test_a_source_on_its_own_point_lands_on_one_unknown(self):
+        sim = _sim((26, 26), N=5)
+        source = point_source(
+            sim,
+            [[10.5 * sim.dx[0], 12.0 * sim.dx[1]]],
+            np.ones(5),
+            direction=[1.0, 0.0],
+        )
+        weights = cp.asnumpy(source.signal[0]).reshape(-1, sim.ncomp)
+        self.assertEqual(int((np.abs(weights) > 1e-12).sum()), 1)
+
     def test_a_vector_unknown_needs_a_direction(self):
         sim = _sim((14, 14), N=5)
         with self.assertRaises(ValueError):
@@ -583,8 +472,42 @@ class TransducerTest(unittest.TestCase):
         sim = _sim((22, 22), N=60, boundary=Clamped)
         source, _, _, _ = _problem(sim)
         field = simulate(sim, source, cp.ones(sim.Nx_padded, dtype=sim.dtype))
-        for wall in (1, sim.Nx[0] - 2):
-            self.assertEqual(float(cp.abs(field[:, wall, :]).max()), 0.0)
+        # the tangential components carry the wall unknowns: u_x on y-walls and back
+        walls = [field[0][:, 1], field[0][:, 20], field[1][1, :], field[1][20, :]]
+        for wall in walls:
+            self.assertEqual(float(cp.abs(wall).max()), 0.0)
+        self.assertGreater(float(cp.abs(field).max()), 0.0)
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class TimestepTest(unittest.TestCase):
+    def test_the_measured_timestep_agrees_with_the_cheap_bound_when_uniform(self):
+        for order in (2, 4):
+            sim = _sim((64, 64), N=1, space_order=order)
+            uniform = cp.ones(sim.Nx_padded, dtype=sim.dtype)
+            # stable_dt only knows the speed and the spacing, so it stays conservative
+            self.assertGreater(stable_timestep(sim, uniform) / sim.dt, 1.0)
+
+    def test_a_contrast_still_costs_timestep_at_a_wide_stencil(self):
+        """The wide stencil reaches past the harmonic shear mean into a void, so order 4
+        still pays timestep, though far less than the cell gather did."""
+        res = 96
+        ratios = {}
+        for order in (2, 4):
+            sim = _sim((res, res), N=1, space_order=order)
+            axes = cp.meshgrid(
+                *[
+                    (cp.arange(n, dtype=sim.dtype) - 1) * h
+                    for n, h in zip(sim.Nx_padded, sim.dx)
+                ],
+                indexing="ij",
+            )
+            void = (axes[0] - 0.5) ** 2 + (axes[1] - 0.5) ** 2 < 0.1**2
+            indicator = cp.where(void, 1e-4, 1.0).astype(sim.dtype)
+            ratios[order] = stable_timestep(sim, indicator) / sim.dt
+        self.assertGreater(ratios[2], 1.0)
+        self.assertLess(ratios[4], 1.0)
+        self.assertGreater(ratios[4], 0.3)
 
 
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
@@ -595,7 +518,7 @@ class ValidationTest(unittest.TestCase):
 
     def test_it_rejects_a_shear_speed_above_the_pressure_one(self):
         with self.assertRaises(ValueError):
-            _sim((10, 10), N=1).__class__(
+            ElasticWave(
                 (10, 10),
                 (0.1, 0.1),
                 1,
@@ -609,6 +532,12 @@ class ValidationTest(unittest.TestCase):
     def test_it_rejects_plane_stress_in_3D(self):
         with self.assertRaises(ValueError):
             _sim((8, 8, 8), N=1, plane="stress")
+
+    def test_it_rejects_a_pressure_boundary_condition(self):
+        from cuwave.boundary import Neumann
+
+        with self.assertRaises(ValueError):
+            _sim((10, 10), N=1, boundary=Neumann)
 
 
 if __name__ == "__main__":

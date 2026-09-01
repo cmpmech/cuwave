@@ -1,74 +1,52 @@
 # CUDA elastic sensitivity
 
-The backward kernels of the [elastic](elastic.md) equation. Compilation, the interior guard, the geometry macro and `RADIUS` are those of [cuda_elastic](cuda_elastic.md); `USE_DAMPING` does not appear, since the damped recursion transposes itself
+The backward kernels of the staggered [elastic](elastic.md) equation. Compilation, the geometry macros, the graded radii and the strain helpers are those of [cuda_elastic](cuda_elastic.md); `USE_DAMPING` does not appear, since the damped recursion transposes itself
 
-## the two densities
+## the densities
 
-The residual is the elastic form of the one [cuda_wave_sensitivity](cuda_wave_sensitivity.md) derives, so the gradient splits the same way: a nodal part carrying the inertia and a cell part carrying the stiffness
+The residual is the elastic form of the one [cuda_scalar_sensitivity](cuda_scalar_sensitivity.md) derives, so the gradient splits the same way: an inertia part on each component's points and a stiffness part on each stress-point family
 
-$$\frac{dJ}{dm}\bigg|_i=-\frac{\rho_0V}{\Delta t^2}\sum_t\boldsymbol{\lambda}_i^t\cdot\left(\mathbf{u}_i^t-2\mathbf{u}_i^{t-1}+\mathbf{u}_i^{t-2}\right),\qquad\frac{dJ}{d\gamma_c}=-\sum_t\boldsymbol{\lambda}_c^t\cdot\hat{\mathbf{K}}\,\mathbf{u}_c^t$$
+$$\frac{dJ}{dm}\bigg|_s=-\frac{1}{\Delta t^2}\sum_t\lambda_s^t\left(u_s^t-2u_s^{t-1}+u_s^{t-2}\right),\qquad\frac{dJ}{d\gamma_s}=-w_s\sum_t\boldsymbol{\varepsilon}\left(\boldsymbol{\lambda}^t\right):\mathbf{C}:\boldsymbol{\varepsilon}\left(\mathbf{u}^t\right)\bigg|_s$$
 
-with $V$ the cell volume, $\hat{\mathbf{K}}$ the cell stencil at $\gamma=1$ and $\boldsymbol{\lambda}_c$, $\mathbf{u}_c$ the two fields gathered over the corners of cell $c$. Because the assembly is exactly symmetric, the second one is a derivative of the discretization with no averaging left to differentiate
+with $s$ a component point for the inertia and a stress point for the stiffness. Because both kernels tap the same matrix, the second one is a derivative of the discretization with no averaging left to differentiate; the kernels accumulate the raw densities and `finalize_gradients` chains them onto the nodes on the host, through the arithmetic mean of the inertia ($1/2$ per neighbour node), the identity of the node family, and the harmonic mean of a shear point
+
+$$\frac{\partial\gamma_s}{\partial\gamma_i}=\frac{1}{4}\left(\frac{\gamma_s}{\gamma_i}\right)^2$$
 
 ## device functions
 
-### own_cell
-**aim**
-decide whether this node is the low corner of a cell inside the domain, which is where that cell's density accumulates
-**input args**
-`A`: grid index per axis; `NN`: logical extent per axis
-**how?**
-- one cell per node rather than the node's whole neighbourhood, so the cell density is accumulated once and not $2^\textrm{ndim}$ times
-$$1\le a_d\le N_d-3\quad\textrm{on every axis}$$
+`rad_node`, `rad_half`, `clamped_face`, `normal_strains`, `condensed_lame` and `shear_strain` as in [cuda_elastic](cuda_elastic.md), evaluated here on the forward and the adjoint field alike, plus
 
-### cell_inside
-As in [cuda_elastic](cuda_elastic.md), used by the scatter rather than the assembly
-
-### low_corner_offset
+### normal_form
 **aim**
-offset of corner `l` of the cell this node is the low corner of
+the normal bilinear form of two strain sets under the condensed coupling
 **input args**
-`l`: corner code; `S`: stride per axis
+`ea`, `eb`: two strain sets from `normal_strains`; `lam`, `mu`: the Lamé scalars; `zeroed`: the bitmask both sets share
 **how?**
-$$\textrm{offset}=\sum_d\textrm{bit}_d(l)\,s_d$$
+$$2\mu\sum_d\varepsilon^a_{dd}\varepsilon^b_{dd}+\lambda_\textrm{eff}\,\textrm{tr}\,\boldsymbol{\varepsilon}^a\,\textrm{tr}\,\boldsymbol{\varepsilon}^b$$
 
 ## kernels
 
 ### gradient_kernel
 **parallelization**
-one thread per node, accumulating the nodal density everywhere and the cell density where the node owns a cell
+one thread per grid point, accumulating the inertia density on its component points and the stiffness density on its stress points
 **input args**
-`u0`, `u1`, `u2`: the forward triplet, the stiffness pairing with the middle slot; `l1`: the adjoint field $\boldsymbol{\lambda}^t$; `stencil`: $\hat{\mathbf{K}}$, row-major; `mass_factor`: $\rho_0V/\Delta t^2$, the cell weights $W$ left to the epilogue; `cs`: component stride; `N0, N1, N2`, `s0, s1`: geometry, no factors
+`u0`, `u1`, `u2`: the forward triplet, the stiffness pairing with the middle slot; `l1`: the adjoint field $\boldsymbol{\lambda}^t$; `lam`, `mu`: the Lamé scalars; `mf`: $1/\Delta t^2$, the $\rho_0W/2$ of the inertia chain rule left to the epilogue; `clamped`, `cs`: as forward; `f0..f2`: $1/\Delta x_d$
 **output args**
-`g_mass`: nodal inertia density, accumulated with `-=`; `g_cell`: cell stiffness density at the cell's low corner, accumulated with `-=`
+`g_mass`: `NDIM` fields of inertia density, accumulated with `-=`; `g_normal`: the node-family density; `g_shear`: `NPAIRS` fields, `NDIM >= 2` only
 **how?**
-- the inertia density needs no neighbour and no material load, summing over components at the node
-- the stiffness density is the cell stencil contracted between the two fields over the cell's nodes, which is the second equation above
+- the inertia density needs no neighbour and no material load, one entry per component point
+- the stiffness densities contract the adjoint strains against the forward ones: `normal_form` on the node, $\mu$ times the two shear strains on each pair point, neither carrying $\gamma$ or $w_s$, which the epilogue holds
 
 ### frechet_kernel
 **parallelization**
 as `gradient_kernel`
 **input args**
-`u0`, `u1`, `u2`: one field triplet, which for [superposition](sensitivity.md) is the combined $\mathbf{u}+k\boldsymbol{\lambda}$; `stencil`: $\hat{\mathbf{K}}$; `ft`: $\pm\rho_0V/\left(2\Delta t\right)^2$, the pass sign folded in; `fs`: $\mp1$, the pass sign and the density's own sign folded in; `cs`: component stride
+`u0`, `u1`, `u2`: one field triplet, which for [superposition](sensitivity.md) is the combined $\mathbf{u}+k\boldsymbol{\lambda}$; `lam`, `mu`: as above; `ft`: $\pm1/\left(2\Delta t\right)^2$, the pass sign folded in; `fs`: $\mp1$, the pass sign and the density's own sign folded in
 **output args**
-`acc_mass`, `acc_cell`: the two quadratic diagonals, accumulated with `+=`
+`acc_mass`, `acc_normal`, `acc_shear`: the quadratic diagonals, accumulated with `+=`
 **how?**
 - both are the diagonal of the bilinear forms the gradient pairs, so their difference over the two passes gives the cross term
-$$B_m\left(\mathbf{u},\mathbf{u}\right)=\rho_0V\sum_t\left|\dot{\mathbf{u}}\right|^2,\qquad B_k\left(\mathbf{u},\mathbf{u}\right)=-\sum_t\mathbf{u}_c\cdot\hat{\mathbf{K}}\,\mathbf{u}_c$$
+$$B_m\left(u,u\right)=\sum_t\left(u^{t}-u^{t-2}\right)^2,\qquad B_k\left(\mathbf{u},\mathbf{u}\right)=-\sum_t\boldsymbol{\varepsilon}:\mathbf{C}:\boldsymbol{\varepsilon}$$
 - the sign each density needs is folded into `ft` and `fs`, so the epilogue scales both alike and no field is named there
 
-### cell_to_node_kernel
-**parallelization**
-one thread per node, run once after the time loop rather than per step
-**aim**
-carry the cell density onto the design field through the chain rule of the harmonic cell mean
-**input args**
-`g_cell`: the accumulated cell density; `cell`: $\gamma_c$; `gamma`: the nodal design field; `share`: $1/2^\textrm{ndim}$; `N0, N1, N2`, `s0, s1`: geometry
-**output args**
-`g_stiff`: nodal stiffness gradient, accumulated with `+=`
-**how?**
-- the harmonic mean makes the share a design-dependent one, not a constant
-$$\frac{\partial\gamma_c}{\partial\gamma_i}=\frac{1}{2^\textrm{ndim}}\left(\frac{\gamma_c}{\gamma_i}\right)^2$$
-- running it once at the end rather than every step is what keeps the cell density a cell quantity for the whole march, and it is why `g_cell` is allocated alongside the two the caller sees
-
-The cell weights $W$ apply to the inertia density only. The stiffness density lives on cells, every one of which is interior by construction, so the wall ring it would halve does not arise
+There is no `cell_to_node_kernel` here: the chain rule onto the nodes is a handful of shifted adds run once after the time loop, so `finalize_gradients` does it with array slices on the host rather than a kernel of its own

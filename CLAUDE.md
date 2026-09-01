@@ -57,19 +57,36 @@ kernel conventions). Do not infer the style from a single file instead of readin
 - Sources and sensors live on **interior** nodes; `sensitivity` raises if they don't
   (`require_interior`), because a ghost node carries no equation and corrupts the gradient.
 
-### Forward solve (`wave.py` + `kernels/wave.cu`)
+### Forward solve (`wave.py` framework + one module per equation)
+
+`wave.py` is the framework only: the grid contract, `compile_kernels`, the `define_*`
+closure factories and `simulate`. Every equation family is a `Simulation` subclass in its
+own module, paired with its own `kernels/<name>.cu` and `kernels/<name>_sensitivity.cu`,
+and names them through `kernel_path` / `sensitivity_path` / `default_boundary`. A new
+equation is a new module, never an addition to `wave.py`.
 
 Dataclass hierarchy, each level adding one thing:
 
 `Simulation` (grid, dt, precision, `space_order`, `boundary`, `compile_flags`)
-→ `PressureWave` (nodal `stiff`/`minv` fields, optional damping)
+→ `scalar.PressureWave` (nodal `stiff`/`minv` fields, optional damping)
 → `ScalarWave` (constant `wavespeed`/`density`, indicator gamma scales both mass and
 stiffness — hence `derive_inertia = True`, `minv` never formed) and `AcousticWave`
 (two-phase TATO interpolation between `rho1/kappa1` and `rho2/kappa2`).
 
 A subclass supplies four hooks the solver and adjoint both call: `parametrization`,
 `parametrization_jacobian`, `step_factors`, `source_factor`. Adding a new wave equation
-means adding a subclass with those four, not touching `simulate`.
+means adding a subclass with those four, not touching `simulate`. A scheme that needs
+several launches per step overrides `Simulation.define_step` instead (the staggered
+elastic's stress+update pair does), still without touching `simulate`.
+
+The vector siblings: `elastic.ElasticWave` is staggered (component `c` half a node up
+axis `c`, declared via `component_offsets`, which `utils.distribute` honours), carries any
+even `space_order` at per-axis cost, and is the exact transpose at every order.
+`anisotropic.AnisotropicElasticWave` is the collocated cell assembly: order 2 only (the
+gather costs `(2r)**(2*ndim)`), but it takes an arbitrary symmetric Voigt `C`, which the
+staggered layout cannot. Both are lossless-reversible with kernel-less Traction/Clamped
+boundaries. The staggered scheme's one-step read reach is `2r-1` nodes (`Simulation.reach`),
+which sizes the reconstruction strip.
 
 **Compile-time configuration is the central idea.** `compile_kernels` builds one
 `cp.RawModule` per `(ndim, precision, damping, space_order)` combination: `NDIM`,
@@ -88,7 +105,7 @@ loops.
 `Simulation.boundary` can carry a per-face layout long before compilation; `define_boundary`
 groups faces by condition into a bitmask so the default stays one launch.
 
-### Adjoint sensitivities (`sensitivity.py` + `kernels/wave_sensitivity.cu`)
+### Adjoint sensitivities (`sensitivity.py` + `kernels/<equation>_sensitivity.cu`)
 
 Two variants, identical signature and return, differing only in how the forward field is
 made available to the backward pass:
@@ -143,8 +160,8 @@ full one; copy their shape.
 An Obsidian wiki (one page per module, indexed by `docs/Home.md`) carrying the *what and
 why* — governing equations, symbol-to-identifier bindings, design trade-offs. Adding a module
 page and its `Home.md` line is one edit. The `.cu` files have no docstrings by design, so
-`docs/cuda_wave.md` and `docs/cuda_wave_sensitivity.md` are the only pages that document
-arguments. `docs/integrators.md` and `docs/uncertainty.md` are TODO stubs for unimplemented
+the `docs/cuda_*.md` pages are the only ones that document arguments.
+`docs/integrators.md` and `docs/uncertainty.md` are TODO stubs for unimplemented
 features.
 
 ## Traps

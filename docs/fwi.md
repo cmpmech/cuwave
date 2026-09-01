@@ -3,7 +3,7 @@
 **Full waveform inversion (fwi)** recovers a material field from recorded waveforms by minimizing the misfit between measured and simulated traces, using the full recorded signal rather than picked arrival times
 
 An inversion is set up as follows:
-1. define the forward problem with [wave](wave.md) (here `ScalarWave`, whose indicator $\gamma$ scales the density)
+1. define the forward problem with [scalar](scalar.md) (here `ScalarWave`, whose indicator $\gamma$ scales the density)
 2. place transducers with `line` and turn them into a shot list with `shots` and a receiver array with `Sensors` ([utils](utils.md))
 3. produce or load the measurement, `measure` against the true field for a synthetic study
 4. pick an [optimization](optimization.md) scheme and, if the problem needs it, a [regularization](regularization.md)
