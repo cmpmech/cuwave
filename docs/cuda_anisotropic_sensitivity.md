@@ -2,6 +2,8 @@
 
 The backward kernels of the [anisotropic](anisotropic.md) equation. Compilation, the interior guard and the geometry macro are those of [cuda_anisotropic](cuda_anisotropic.md); `USE_DAMPING` does not appear, since the damped recursion transposes itself
 
+The prelude of [cuda_anisotropic](cuda_anisotropic.md) is prepended here too, so `real_t`, the coefficient accessors and the graded radii are not repeated
+
 ## the two densities
 
 The residual is the elastic form of the one [cuda_scalar_sensitivity](cuda_scalar_sensitivity.md) derives, so the gradient splits the same way: a nodal part carrying the inertia and a cell part carrying the stiffness

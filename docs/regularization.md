@@ -20,13 +20,15 @@ with the neighborhood $N_e=\{i:\lVert\mathbf{r}_i-\mathbf{r}_e\rVert\le r_\textr
 
 | member | signature | description |
 |---|---|---|
-| constructor | `DensityFilter(rmin, shape, dtype=None)` | precomputes the conic kernel $w$ and the weight sums $\sum_i w_{ei}$ on a grid of `shape` |
+| constructor | `DensityFilter(rmin, shape, dtype=None)` | precomputes the conic kernel $w$ and the weight sums $\sum_i w_{ei}$ on a grid of `shape`, whose length fixes the dimension of the kernel |
 | filter | `__call__(x)` | returns the filtered design $\hat{x}$ |
 | derivative | `grad(x, dy=1.0)` | returns $\partial\hat{x}/\partial x$ contracted with `dy`, independent of `x` |
 | alternative | `sensitivity(rho, dc)` | classic OC sensitivity filter [Sigmund 2001](https://doi.org/10.1007/s001580050176) smoothing the gradient `dc` instead of the design `rho` |
 | update | `set(**params)` | only `kernel` and `Hs` are stored, so a different `rmin` or `shape` needs a new instance |
 
 The weight sums are evaluated with zero padding, so cells at the boundary are normalized by their truncated neighborhood only
+
+The kernel is built over as many axes as `shape` has, so the same filter serves a 2D and a 3D design region. The support grows as $\left(2r_\textrm{min}\right)^\textrm{ndim}$, so a radius that is cheap on a plane is not automatically cheap on a volume
 
 ### Projection
 `Projection` sharpens the filtered design towards $0/1$ with a smoothed Heaviside about the threshold `eta`, following [Wang, Lazarov & Sigmund 2011](https://doi.org/10.1007/s00158-010-0602-y) and, for the original projection idea, [Guest, Prévost & Belytschko 2004](https://doi.org/10.1002/nme.1064)

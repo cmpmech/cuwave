@@ -96,6 +96,23 @@ def box(
     return _accumulate(inside, out)
 
 
+def rectangle(
+    coords: Sequence[cpt.NDArray],
+    center: Sequence[float],
+    sizes: Sequence[float],
+    angle: float = 0.0,
+    out: cpt.NDArray[cp.bool_] | None = None,
+) -> cpt.NDArray[cp.bool_]:
+    """Interior of the rectangle with side lengths `sizes`, rotated by `angle` radians"""
+    dx = coords[0] - center[0]
+    dy = coords[1] - center[1]
+    if angle:
+        cos, sin = math.cos(angle), math.sin(angle)
+        dx, dy = cos * dx + sin * dy, cos * dy - sin * dx
+    inside = (cp.abs(dx) <= 0.5 * sizes[0]) & (cp.abs(dy) <= 0.5 * sizes[1])
+    return _accumulate(inside, out)
+
+
 def random_ellipses(
     coords: Sequence[cpt.NDArray],
     count: int,

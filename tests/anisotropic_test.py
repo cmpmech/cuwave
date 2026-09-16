@@ -22,7 +22,7 @@ except Exception:
 if HAS_CUDA:
     from cuwave.anisotropic import AnisotropicElasticWave, cell_stencil, corner_bits
     from cuwave.boundary import Clamped
-    from cuwave.elastic import stable_timestep, voigt
+    from cuwave.elastic import voigt
     from cuwave.scalar import ScalarWave
     from cuwave.sensitivity import (
         l2_misfit,
@@ -32,7 +32,13 @@ if HAS_CUDA:
     )
     from cuwave.signals import ricker
     from cuwave.utils import Sensors, point_source
-    from cuwave.wave import compile_kernels, define_step_method, simulate, stable_dt
+    from cuwave.wave import (
+        compile_kernels,
+        define_step_method,
+        simulate,
+        stable_dt,
+        stable_timestep,
+    )
 
 CP, CS, RHO = 2.0, 1.0, 1.3
 THREADS = {1: (128,), 2: (8, 8), 3: (4, 4, 8)}

@@ -73,6 +73,24 @@ Dirichlet = BoundaryCondition("homogeneous_dirichlet_kernel")
 # an elastic wall is the interior-cell assembly or a zeroed inertia, so neither needs a kernel
 Traction = BoundaryCondition(None, "traction")
 Clamped = BoundaryCondition(None, "clamped")
+# the same two walls read electromagnetically, the tangential field held or left natural
+Conductor = BoundaryCondition(None, "conductor")
+Magnetic = BoundaryCondition(None, "magnetic")
+
+
+def faces_with(sim: Simulation, condition: BoundaryCondition) -> list[int]:
+    """The `2 * axis + side` codes of the faces `sim.boundary` marks with `condition`."""
+    return [
+        2 * d + side
+        for d, pair in enumerate(sim.boundary)
+        for side, marker in enumerate(pair)
+        if marker is condition
+    ]
+
+
+def face_mask(sim: Simulation, condition: BoundaryCondition) -> np.int32:
+    """The faces carrying `condition`, as the bitmask the kernels take."""
+    return np.int32(sum(1 << f for f in faces_with(sim, condition)))
 
 
 def canonical_boundary(

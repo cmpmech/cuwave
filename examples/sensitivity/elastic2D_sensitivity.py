@@ -5,7 +5,7 @@ import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
-from cuwave.elastic import ElasticWave, stable_timestep
+from cuwave.elastic import ElasticWave
 from cuwave.sensitivity import (
     l2_misfit,
     sensitivity,
@@ -13,7 +13,7 @@ from cuwave.sensitivity import (
 )
 from cuwave.signals import ricker
 from cuwave.utils import Sensors, point_source
-from cuwave.wave import grid_coords, simulate, stable_dt
+from cuwave.wave import grid_coords, simulate, stable_dt, stable_timestep
 
 # -------------------------------------- settings -------------------------------------
 # discretization

@@ -9,6 +9,8 @@ so $\lambda$ needs no kernel of its own: `sensitivity.py` steps it with `fd_kern
 $$\frac{dJ}{dm}\bigg|_i=-\frac{1}{\Delta t^2}\sum_t\lambda_i^t\left(u_i^t-2u_i^{t-1}+u_i^{t-2}\right)$$
 $$\frac{dJ}{dk}\bigg|_i=\sum_t\frac{\partial}{\partial k_i}\left[\lambda^t\cdot\nabla\cdot(k\nabla u^{t-1})\right]$$
 Both are exact derivatives of the **discretization**, not of the PDE. And both differentiate the residual rather than the update, which is why neither carries the $\Delta t^2$ that the forward step folds into $f_d$: the mass term gets it back as `inv_dt2`, and the stiffness term runs on $F_d=f_d/\Delta t^2$, i.e. $2c_0^2/h_d^2$ (`ScalarWave`) or $2/h_d^2$ (`AcousticWave`)
+The prelude of [cuda_scalar](cuda_scalar.md) is prepended here too, so `real_t`, the coefficient accessors and the graded radii are not repeated
+
 ## gradient helpers
 
 ### INTERIOR_OR_RETURN, AXIS_RADII, AXIS_OFFSETS

@@ -1,30 +1,6 @@
-// Compile-time configuration (set via -D flags from sensitivity.py):
-//   USE_FLOAT
+// Prepended by wave.compile_kernels: stencils.preamble, then common.cuh.
+// Compile-time configuration this file responds to:
 //   NDIM = 1 | 2 | 3
-//   STENCIL_RADIUS
-//   OP_COEFFS
-
-#ifdef USE_FLOAT
-typedef float real_t;
-#else
-typedef double real_t;
-#endif
-
-// ----------------------------- finite difference helpers
-#ifndef STENCIL_RADIUS
-#define STENCIL_RADIUS 1 // default order 2
-#endif
-
-#if STENCIL_RADIUS == 1
-#define OP_W(r, k) ((real_t)1)
-#define CLOSURE(a, N) 1
-#else
-// cache
-__constant__ real_t OP_C[STENCIL_RADIUS][STENCIL_RADIUS] = OP_COEFFS;
-#define OP_W(r, k) OP_C[(r) - 1][(k) - 1] // 1-indexed adjustment
-// grade radius down towards wall so the stencil never reaches past ghost nodes
-#define CLOSURE(a, N) min(STENCIL_RADIUS, min(a, (N) - 1 - (a)))
-#endif
 
 // ------------------------------- interior guard macros
 #if NDIM == 1

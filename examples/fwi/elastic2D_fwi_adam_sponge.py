@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from cuwave.boundary import pad_for_sponge, sponge
-from cuwave.elastic import ElasticWave, stable_timestep
+from cuwave.elastic import ElasticWave
 from cuwave.evals import f1_score, l2_error, pr_auc
 from cuwave.geometry import stacked_circles
 from cuwave.optimization import Adam
@@ -23,7 +23,7 @@ from cuwave.utils import (
     shots,
     threshold,
 )
-from cuwave.wave import grid_coords, stable_dt
+from cuwave.wave import grid_coords, stable_dt, stable_timestep
 
 # -------------------------------------- settings -------------------------------------
 # discretization

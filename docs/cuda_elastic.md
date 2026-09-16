@@ -100,12 +100,12 @@ $$f_c=\frac{1}{\Delta x_c}\sum_k c_k^{\left(r\left(a\right)\right)}\left(\sigma_
 - the march is the three-term recursion of [cuda_scalar](cuda_scalar.md), component by component, `USE_DAMPING` dividing by $1+\beta$ with one damping field serving every component
 
 ### excitation_kernel
-Byte-identical to [cuda_scalar](cuda_scalar.md). A vector source is `NDIM` entries of `lin_index`, one per component, at `d * cs + idx`, so the `atomicAdd` covers a source and a sensor landing on the same point and component
+From the shared prelude, so this file does not carry it; see [cuda_scalar](cuda_scalar.md). A vector source is `NDIM` entries of `lin_index`, one per component, at `d * cs + idx`, so the `atomicAdd` covers a source and a sensor landing on the same point and component
 
 ### get_signal_kernel
-Byte-identical to [cuda_scalar](cuda_scalar.md), the component folded into `lin_index` the same way
+From the shared prelude, the component folded into `lin_index` the same way
 
 ### set_signal_kernel
-Byte-identical to [cuda_scalar](cuda_scalar.md), assignment rather than `atomicAdd`, so it restores a recorded state
+From the shared prelude, assignment rather than `atomicAdd`, so it restores a recorded state
 
 The `sigma` scratch is allocated once by `define_step` and reused every step: the two launches replace the single fused one because each stress value is read by up to $2r$ updates, so forming it once trades one round of global traffic against recomputing every strain per reader

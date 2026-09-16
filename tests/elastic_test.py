@@ -22,7 +22,7 @@ except Exception:
 
 if HAS_CUDA:
     from cuwave.boundary import Clamped, Traction, pad_for_sponge, sponge
-    from cuwave.elastic import ElasticWave, stable_timestep
+    from cuwave.elastic import ElasticWave
     from cuwave.scalar import ScalarWave
     from cuwave.sensitivity import (
         l2_misfit,
@@ -41,6 +41,7 @@ if HAS_CUDA:
         define_step_method,
         simulate,
         stable_dt,
+        stable_timestep,
     )
 
 CP, CS, RHO = 2.0, 1.0, 1.3

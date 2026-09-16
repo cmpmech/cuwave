@@ -70,11 +70,12 @@ class Regularization(abc.ABC):
 
 # ------------------------------ design-map modification ------------------------------
 class DensityFilter(Regularization):
-    """Conic density filter on a structured 2D grid, with an OC sensitivity variant.
+    """Conic density filter on a structured grid of any dimension, with an OC variant.
 
     Args:
         rmin: filter radius in nodes, which sets the conic kernel's support.
-        shape: the design field's shape, which the normalization `Hs` is built for.
+        shape: the design field's shape, which fixes the dimension of the kernel and
+            the normalization `Hs` it is built for.
         dtype: kernel dtype, matched to the design field to keep the convolution
             in one precision.
     """
@@ -83,12 +84,9 @@ class DensityFilter(Regularization):
         self, rmin: float, shape: tuple[int, ...], dtype: npt.DTypeLike | None = None
     ) -> None:
         ceil_r = int(math.ceil(rmin))
-        ki, kj = cp.meshgrid(
-            cp.arange(-ceil_r, ceil_r + 1),
-            cp.arange(-ceil_r, ceil_r + 1),
-            indexing="ij",
-        )
-        self.kernel = cp.maximum(0.0, rmin - cp.sqrt(ki**2 + kj**2))
+        taps = cp.arange(-ceil_r, ceil_r + 1)
+        offsets = cp.meshgrid(*(taps,) * len(shape), indexing="ij")
+        self.kernel = cp.maximum(0.0, rmin - cp.sqrt(sum(k**2 for k in offsets)))
         if dtype is not None:
             self.kernel = self.kernel.astype(dtype)
         self.Hs = ndi.convolve(

@@ -2,6 +2,8 @@
 
 The backward kernels of the staggered [elastic](elastic.md) equation. Compilation, the geometry macros, the graded radii and the strain helpers are those of [cuda_elastic](cuda_elastic.md); `USE_DAMPING` does not appear, since the damped recursion transposes itself
 
+The prelude of [cuda_elastic](cuda_elastic.md) is prepended here too, so `real_t`, the coefficient accessors and the graded radii are not repeated
+
 ## the densities
 
 The residual is the elastic form of the one [cuda_scalar_sensitivity](cuda_scalar_sensitivity.md) derives, so the gradient splits the same way: an inertia part on each component's points and a stiffness part on each stress-point family

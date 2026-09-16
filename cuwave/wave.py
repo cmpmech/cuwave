@@ -8,6 +8,7 @@ configuration, and `simulate` loops over the closures they return.
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,12 +21,79 @@ import numpy.typing as npt
 from .boundary import canonical_boundary, define_boundary
 from .stencils import preamble, weights
 
+# Voigt row order per dimension, as (k, l) strain pairs; the shear rows are PAIRS[d][d:]
+PAIRS = {
+    1: ((0, 0),),
+    2: ((0, 0), (1, 1), (0, 1)),
+    3: ((0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1)),
+}
+
 
 # ------------------------------------- utilities -------------------------------------
 def stable_dt(dx: tuple[float, ...], wavespeed: float, space_order: int = 2) -> float:
     """CFL-stable timestep for an explicit scheme with grid spacing `dx`."""
     lam = float(np.abs(weights(space_order // 2)).sum())
     return 2.0 / (wavespeed * float(np.sqrt(lam * sum(1.0 / d**2 for d in dx))))
+
+
+def stable_timestep(
+    sim: Simulation,
+    indicator: cpt.NDArray,
+    iterations: int = 60,
+    safety: float = 0.95,
+) -> float:
+    """Largest stable timestep for `sim` under `indicator`, measured not estimated.
+
+    The leapfrog is stable while the spectral radius of `dt**2 minv L` stays under 4, and
+    `L` is symmetric with `minv` diagonal, so a power iteration on the step kernel itself
+    converges to that radius. Exact for any order, any material and any boundary layout,
+    where `stable_dt` only knows the wave speed and the spacing.
+
+    Args:
+        sim: the simulation to measure, whose own `dt` sets the scale of the answer.
+        indicator: the design field, which is what a high contrast enters through.
+        iterations: power iterations, 60 being ample for three digits.
+        safety: fraction of the bound to return.
+
+    Returns:
+        the timestep to build `sim` with. A wide stencil over a strong contrast can put
+        this far below `stable_dt`, which is the signal to drop `space_order` rather
+        than to shrink `dt`.
+    """
+    mat = sim.build_materials(indicator)
+    step = define_step_method(sim, compile_kernels(sim), mat)
+    shifts = sim.component_offsets
+    if shifts is None:
+        shifts = np.zeros((sim.ncomp, sim.ndim))
+    slices = [
+        (c, *(slice(1, n - 1 - (shifts[c][d] > 0)) for d, n in enumerate(sim.Nx)))
+        for c in range(sim.ncomp)
+    ]
+    field = cp.asarray(
+        np.random.default_rng(0).standard_normal((sim.ncomp, *sim.Nx_padded)),
+        dtype=sim.dtype,
+    )
+    zero = cp.zeros_like(field)
+    out = cp.zeros_like(field)
+
+    def masked(values):
+        kept = cp.zeros_like(values)
+        for sl in slices:
+            kept[sl] = values[sl]
+        return kept
+
+    field = masked(field)
+    value = 0.0
+    for _ in range(iterations):
+        field /= cp.linalg.norm(field)
+        out[...] = 0.0
+        step(zero, field, out)
+        applied = masked(2.0 * field - out)
+        value = float(cp.sum(field * applied))
+        field = applied
+    if value <= 0.0:
+        raise ValueError(f"the operator came back non-positive: {value}")
+    return safety * sim.dt * float(np.sqrt(4.0 / value))
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -109,6 +177,94 @@ def flatten_indices(
     if sim.ncomp > 1:
         lin += position[0] * cp.int32(sim.comp_stride)
     return lin
+
+
+# --------------------------------- staggered lattice ---------------------------------
+def component_weights(sim: Simulation, c: int) -> cpt.NDArray:
+    """Cell weights of component `c`: halved on the walls of the unstaggered axes."""
+    w = cp.ones(sim.Nx_padded, dtype=sim.dtype)
+    for d in range(sim.ndim):
+        if d == c:
+            continue
+        for index in (1, sim.Nx[d] - 2):
+            wall = [slice(None)] * sim.ndim
+            wall[d] = index
+            w[tuple(wall)] *= 0.5
+    return w
+
+
+def pair_weights(sim: Simulation, axes: tuple[int, int]) -> cpt.NDArray:
+    """Cell weights of a pair point: halved on the walls of the remaining axes."""
+    w = cp.ones(sim.Nx_padded, dtype=sim.dtype)
+    for d in range(sim.ndim):
+        if d in axes:
+            continue
+        for index in (1, sim.Nx[d] - 2):
+            wall = [slice(None)] * sim.ndim
+            wall[d] = index
+            w[tuple(wall)] *= 0.5
+    return w
+
+
+def point_average(sim: Simulation, field: cpt.NDArray, c: int) -> cpt.NDArray:
+    """Arithmetic mean of `field` over the two nodes component `c` sits between."""
+    out = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
+    lo = tuple(slice(0, n - 1) if d == c else slice(0, n) for d, n in enumerate(sim.Nx))
+    hi = tuple(slice(1, n) if d == c else slice(0, n) for d, n in enumerate(sim.Nx))
+    out[lo] = 0.5 * (field[lo] + field[hi])
+    return out
+
+
+def point_average_adjoint(sim: Simulation, density: cpt.NDArray, c: int) -> cpt.NDArray:
+    """Transpose of `point_average`: half of `density` back onto each node it spans."""
+    out = 0.5 * density
+    to = [slice(None)] * sim.ndim
+    fro = [slice(None)] * sim.ndim
+    to[c], fro[c] = slice(1, None), slice(0, -1)
+    out[tuple(to)] += 0.5 * density[tuple(fro)]
+    return out
+
+
+def pair_average(
+    sim: Simulation, field: cpt.NDArray, axes: tuple[int, int]
+) -> cpt.NDArray:
+    """Harmonic mean of `field` over the four nodes a pair point straddles.
+
+    Harmonic for the reason the cell scheme uses it: it keeps the coefficient single
+    valued across a material jump.
+    """
+    out = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
+    safe = cp.maximum(field, cp.finfo(sim.dtype).tiny)
+    inner = tuple(
+        slice(0, n - 1) if d in axes else slice(0, n) for d, n in enumerate(sim.Nx)
+    )
+    for bits in itertools.product((0, 1), repeat=2):
+        shifted = tuple(
+            slice(bits[axes.index(d)], n - 1 + bits[axes.index(d)])
+            if d in axes
+            else slice(0, n)
+            for d, n in enumerate(sim.Nx)
+        )
+        out[inner] += 1.0 / safe[shifted]
+    out[inner] = 4.0 / out[inner]
+    return out
+
+
+def pair_average_adjoint(
+    sim: Simulation, density: cpt.NDArray, field: cpt.NDArray, axes: tuple[int, int]
+) -> cpt.NDArray:
+    """Transpose of `pair_average`: d(harmonic mean)/d(node) is `(mean / node)**2 / 4`."""
+    safe = cp.maximum(field, cp.finfo(sim.dtype).tiny)
+    mean = pair_average(sim, field, axes)
+    scattered = density * mean * mean * 0.25
+    out = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
+    for bits in itertools.product((0, 1), repeat=2):
+        to = [slice(None)] * sim.ndim
+        fro = [slice(None)] * sim.ndim
+        for d, b in zip(axes, bits):
+            to[d], fro[d] = slice(b, None), slice(0, -b if b else None)
+        out[tuple(to)] += scattered[tuple(fro)] / safe[tuple(to)] ** 2
+    return out
 
 
 # -------------------------------- discretization setup -------------------------------
@@ -198,6 +354,9 @@ class Simulation:
 
 
 # ----------------------------------- kernel helpers ----------------------------------
+COMMON_PATH = Path(__file__).parent / "kernels" / "common.cuh"
+
+
 def compile_kernels(sim: Simulation, path: Path | None = None) -> cp.RawModule:
     """Compile `path` for `sim`, defaulting to its own source, stencil table injected."""
     path = sim.kernel_path if path is None else path
@@ -205,7 +364,7 @@ def compile_kernels(sim: Simulation, path: Path | None = None) -> cp.RawModule:
     if sim.precision == "float32":
         options.append("-DUSE_FLOAT")
     # injected as source, so the module cache keys on the order without a -D flag
-    code = preamble(sim.space_order) + Path(path).read_text()
+    code = preamble(sim.space_order) + COMMON_PATH.read_text() + Path(path).read_text()
     return cp.RawModule(code=code, options=tuple(options))
 
 

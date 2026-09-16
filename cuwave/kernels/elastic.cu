@@ -1,51 +1,7 @@
-// Compile-time configuration (set via -D flags from elastic.py):
-//   USE_FLOAT
+// Prepended by wave.compile_kernels: stencils.preamble, then common.cuh.
+// Compile-time configuration this file responds to:
 //   NDIM = 1 | 2 | 3
 //   USE_DAMPING
-//   STENCIL_RADIUS
-//   STAG_COEFFS
-
-#ifdef USE_FLOAT
-typedef float real_t;
-#else
-typedef double real_t;
-#endif
-
-// ----------------------------- staggered difference helpers
-#ifndef STENCIL_RADIUS
-#define STENCIL_RADIUS 1 // default order 2
-#endif
-
-#if STENCIL_RADIUS == 1
-#define SG_W(r, k) ((real_t)1)
-#else
-// cache
-__constant__ real_t SG_C[STENCIL_RADIUS][STENCIL_RADIUS] = STAG_COEFFS;
-#define SG_W(r, k) SG_C[(r) - 1][(k) - 1] // 1-indexed adjustment
-#endif
-
-#define NPAIRS (NDIM * (NDIM - 1) / 2)
-#define NVOIGT (NDIM + NPAIRS)
-#if NDIM == 3
-#define PAIR_ROW(k, l) (NDIM + 3 - (k) - (l))
-#else
-#define PAIR_ROW(k, l) 2
-#endif
-
-// radius of the node strain along its own axis, zero on the wall itself
-__device__ __forceinline__ int rad_node(const int a, const int N) {
-  return min(STENCIL_RADIUS, min(a - 1, N - 2 - a));
-}
-
-// radius of a half-point derivative, whose taps may sit on the wall
-__device__ __forceinline__ int rad_half(const int a, const int N) {
-  return min(STENCIL_RADIUS, min(a, N - 2 - a));
-}
-
-__device__ __forceinline__ bool clamped_face(const int clamped, const int d,
-                                             const int side) {
-  return (clamped >> (2 * d + side)) & 1;
-}
 
 #if NDIM == 1
 #define AXIS_PARAMS const real_t f0, const int N0
@@ -265,38 +221,5 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
   }
 }
 
-// ------------------------------------------------------------------------------------
-__global__ void
-excitation_kernel(real_t *__restrict__ u, const real_t *__restrict__ source,
-                  const int offset, const int *__restrict__ lin_index,
-                  const int num_sources, const real_t *__restrict__ weight) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < num_sources) {
-    atomicAdd(&u[lin_index[idx]], weight[idx] * source[offset + idx]);
-  }
-}
-
-// ------------------------------------------------------------------------------------
-__global__ void get_signal_kernel(const real_t *__restrict__ u,
-                                  real_t *__restrict__ um, const int offset,
-                                  const int *__restrict__ lin_index,
-                                  const int num_sensors) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < num_sensors) {
-    um[offset + idx] = u[lin_index[idx]];
-  }
-}
-
-// ------------------------------------------------------------------------------------
-__global__ void set_signal_kernel(real_t *__restrict__ u,
-                                  const real_t *__restrict__ um,
-                                  const int offset,
-                                  const int *__restrict__ lin_index,
-                                  const int num_sensors) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < num_sensors) {
-    u[lin_index[idx]] = um[offset + idx];
-  }
-}
 
 } // extern "C"

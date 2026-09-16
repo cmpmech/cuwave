@@ -88,12 +88,31 @@ staggered layout cannot. Both are lossless-reversible with kernel-less Traction/
 boundaries. The staggered scheme's one-step read reach is `2r-1` nodes (`Simulation.reach`),
 which sizes the reconstruction strip.
 
+`maxwell.MaxwellWave` is the Yee lattice as `-C^T nu C`, which is the staggered elastic
+layout with the normal-stress block deleted, so it shares that whole geometry layer:
+`component_weights`, `pair_weights`, `point_average`, `pair_average` and their adjoints are
+free functions in `wave.py`, not methods, precisely because two equations need them. It is
+2D/3D only and its kernel-less walls are `Conductor`/`Magnetic`. Its class switch
+`magnetic` (the `derive_inertia` idiom) adds `-DUSE_MAGNETIC` and the pair-point curl
+density; unset, both adjoint kernels carry no stencil at all, since a uniform `mu` leaves
+the stiffness with no design dependence.
+
+**2D Maxwell needs none of that.** Out of plane one component survives and the curl-curl
+collapses to a flux divergence, so `maxwell.ElectricWave` (E_z, permittivity as inertia)
+and `maxwell.MagneticWave` (H_z, inverse permittivity as stiffness) are `PressureWave` on
+the existing `scalar.cu`. Both `examples/tpto/` drivers use them. Trap: `MagneticWave` puts
+the design in the **stiffness**, which is where the wide-order transpose stops being exact,
+so it must run at `space_order = 2`; `ElectricWave` is exact at any order.
+
 **Compile-time configuration is the central idea.** `compile_kernels` builds one
 `cp.RawModule` per `(ndim, precision, damping, space_order)` combination: `NDIM`,
-`USE_FLOAT` and `USE_DAMPING` go in as `-D` flags, while the stencil table from
-`stencils.preamble(space_order)` is *prepended as source* so CuPy's module cache keys on the
-order without needing a flag. Any new flag is added to both the `.cu` header block and
-`Simulation.compile_flags`.
+`USE_FLOAT`, `USE_DAMPING` and `USE_MAGNETIC` go in as `-D` flags, while two source blocks
+are *prepended* so CuPy's module cache keys on them without a flag: the stencil table from
+`stencils.preamble(space_order)`, then `kernels/common.cuh`. That prelude holds what every
+`.cu` repeated (the `real_t` typedef, the `OP_W`/`SG_W` accessors, `rad_node`/`rad_half`,
+`PAIR_ROW`, and the three transfer kernels); the `AXIS_*` macro blocks stay per file, since
+the anisotropic adjoint's signature genuinely differs. Any new flag is added to both the
+`.cu` header block and `Simulation.compile_flags`.
 
 **Closure factories.** `define_step_method`, `define_boundary`, `define_excitation`,
 `define_get_signal`, `define_gradient`, `define_frechet` each build the launch config and a
@@ -141,8 +160,15 @@ gradient with respect to the design indicator is the caller's chain rule via
 - `utils.py` — the application glue: `distribute`/`point_source`/`shots`/`Sensors`
   (multilinear interpolation onto the grid and its transpose), `interior_slice`/`threshold`,
   the fwi pair `misfit`/`misfit_gradient` and the tato pair `response`/`response_gradient`,
-  both routing the chain rule through the private `_reparametrize`.
+  both routing the chain rule through the private `_reparametrize`. Objectives live here
+  too: `energy` (a time integral, tato) and `intensity` (a running DFT at chosen
+  frequencies, tpto). An objective sees the whole `(N, num_sensors)` record, which is why a
+  frequency-domain figure of merit needs no new machinery at all, and why one broadband run
+  scores every design wavelength.
 - `evals.py`, `geometry.py`, `signals.py` — scoring, region masks, source wavelets.
+  For Maxwell use `ricker`, not `sineburst`: the curl-curl null space is driven by the
+  divergence of the source, and only a wavelet with zero mean *and* zero first moment
+  leaves no static blob behind.
 - `postprocessing.py` — the matplotlib helpers the field figures share: `field_axes`
   builds a borderless axes the size of the grid, `show` draws a field and/or a design
   over it, `markers` sizes a dot in grid nodes so it matches across figures.
@@ -152,8 +178,10 @@ gradient with respect to the design indicator is the caller's chain rule via
 Flat top-to-bottom scripts, not functions: an ALL-CAPS settings block, then setup →
 measurement → optimization → evaluation → postprocessing, separated by 87-character banners.
 `matplotlib` reaches a driver through `cuwave.postprocessing`.
-`examples/forward/scalar_nD.py` is the minimal driver and `examples/fwi/fwi_2D_adam.py` the
-full one; copy their shape.
+`examples/forward/scalarND.py` is the minimal driver and `examples/fwi/scalar2D_fwi_adam.py`
+the full one; copy their shape. `examples/tpto/` holds the two photonic inverse-design
+drivers (a metalens and a wavelength demultiplexer), which are `examples/tato/`'s shape with
+`intensity` in place of `energy` and a sponge plus `reconstruction_sensitivity`.
 
 ### Docs (`docs/`)
 

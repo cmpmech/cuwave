@@ -22,9 +22,9 @@ import cupy.typing as cpt
 import numpy as np
 import numpy.typing as npt
 
-from .boundary import Clamped, Traction
-from .elastic import PAIRS, voigt
-from .wave import Simulation, apply_cell_weights, grid_block
+from .boundary import Clamped, Traction, faces_with
+from .elastic import voigt
+from .wave import PAIRS, Simulation, apply_cell_weights, grid_block
 
 KERNEL_PATH = Path(__file__).parent / "kernels" / "anisotropic.cu"
 SENSITIVITY_PATH = Path(__file__).parent / "kernels" / "anisotropic_sensitivity.cu"
@@ -192,15 +192,6 @@ class AnisotropicElasticWave(Simulation):
         """Nodal cell weights W, halved once per wall the node sits on."""
         return apply_cell_weights(self, cp.ones(self.Nx_padded, dtype=self.dtype))
 
-    def clamped_faces(self) -> list[int]:
-        """The `2 * axis + side` codes carrying `Clamped`, whose wall nodes are held at zero."""
-        return [
-            2 * d + side
-            for d, pair in enumerate(self.boundary)
-            for side, condition in enumerate(pair)
-            if condition is Clamped
-        ]
-
     def inverse_inertia(self, indicator: cpt.NDArray) -> cpt.NDArray:
         """Lumped `1 / (gamma rho0 V W)`, the mass the interior-cell assembly implies."""
         volume = float(np.prod(self.dx))
@@ -210,7 +201,7 @@ class AnisotropicElasticWave(Simulation):
     def build_materials(self, indicator: cpt.NDArray) -> dict:
         """Lumped inverse inertia, the cell design field, and the stencil table."""
         minv = self.inverse_inertia(indicator)
-        for face in self.clamped_faces():
+        for face in faces_with(self, Clamped):
             wall = [slice(None)] * self.ndim
             wall[face // 2] = 1 if face % 2 == 0 else self.Nx[face // 2] - 2
             minv[tuple(wall)] = 0.0

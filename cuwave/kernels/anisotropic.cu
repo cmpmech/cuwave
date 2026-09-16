@@ -1,13 +1,7 @@
-// Compile-time configuration (set via -D flags from anisotropic.py):
-//   USE_FLOAT
+// Prepended by wave.compile_kernels: stencils.preamble, then common.cuh.
+// Compile-time configuration this file responds to:
 //   NDIM = 1 | 2 | 3
 //   USE_DAMPING
-
-#ifdef USE_FLOAT
-typedef float real_t;
-#else
-typedef double real_t;
-#endif
 
 #ifndef RADIUS
 #define RADIUS 1 // default order 2
@@ -176,38 +170,5 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
 #endif
 }
 
-// ------------------------------------------------------------------------------------
-__global__ void
-excitation_kernel(real_t *__restrict__ u, const real_t *__restrict__ source,
-                  const int offset, const int *__restrict__ lin_index,
-                  const int num_sources, const real_t *__restrict__ weight) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < num_sources) {
-    atomicAdd(&u[lin_index[idx]], weight[idx] * source[offset + idx]);
-  }
-}
-
-// ------------------------------------------------------------------------------------
-__global__ void get_signal_kernel(const real_t *__restrict__ u,
-                                  real_t *__restrict__ um, const int offset,
-                                  const int *__restrict__ lin_index,
-                                  const int num_sensors) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < num_sensors) {
-    um[offset + idx] = u[lin_index[idx]];
-  }
-}
-
-// ------------------------------------------------------------------------------------
-__global__ void set_signal_kernel(real_t *__restrict__ u,
-                                  const real_t *__restrict__ um,
-                                  const int offset,
-                                  const int *__restrict__ lin_index,
-                                  const int num_sensors) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < num_sensors) {
-    u[lin_index[idx]] = um[offset + idx];
-  }
-}
 
 } // extern "C"

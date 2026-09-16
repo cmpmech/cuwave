@@ -66,10 +66,10 @@ $$\beta=\frac{d\,\Delta t}{2m}$$
 Note that `f1` and `f2` are accepted and never read: the tail `wave.axis_geometry` packs is per-axis, while the elastic factors live in the stencil table instead
 
 ### excitation_kernel
-Byte-identical to [cuda_scalar](cuda_scalar.md). A vector source is `NDIM` entries of `lin_index`, one per component, at `d * cs + idx`, so the `atomicAdd` covers a source and a sensor landing on the same node and component
+From the shared prelude, so this file does not carry it; see [cuda_scalar](cuda_scalar.md). A vector source is `NDIM` entries of `lin_index`, one per component, at `d * cs + idx`, so the `atomicAdd` covers a source and a sensor landing on the same node and component
 
 ### get_signal_kernel
-Byte-identical to [cuda_scalar](cuda_scalar.md), the component folded into `lin_index` the same way
+From the shared prelude, the component folded into `lin_index` the same way
 
 ### set_signal_kernel
-Byte-identical to [cuda_scalar](cuda_scalar.md), assignment rather than `atomicAdd`, so it restores a recorded state
+From the shared prelude, assignment rather than `atomicAdd`, so it restores a recorded state

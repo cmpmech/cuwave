@@ -10,6 +10,10 @@ A condition is a declarative marker naming a kernel and nothing more, so a setup
 | launch | `BoundaryCondition.define(sim, kernels, faces)` | returns `step(u)`, applying this condition to every face of `faces` in one launch |
 | reflecting | `Neumann` | zero flux, $\partial u/\partial n=0$, the default on every face |
 | absorbing pressure | `Dirichlet` | zero field, $u=0$, the pressure-release or free-surface wall |
+| elastic walls | `Traction`, `Clamped` | the free surface and the held one, both kernel-less: [elastic](elastic.md) reads them off the assembly and the inertia |
+| electromagnetic walls | `Conductor`, `Magnetic` | the same two walls read electromagnetically, the tangential field held or left natural, `Conductor` the [maxwell](maxwell.md) default |
+| selection | `faces_with(sim, condition)` | the face codes `sim.boundary` marks with `condition` |
+| bitmask | `face_mask(sim, condition)` | the same faces packed as the `int32` the kernels take |
 | layout | `pad_for_sponge(Nx, dx, thickness, faces=None)` | grows a region of interest by a layer of physical `thickness` behind the named faces, returning the extent to build the simulation on, the layer width in nodes, and where the region of interest ends up |
 | dissipating absorber | `sponge(sim, indicator, width, beta, faces=None)` | a damping field ramping to `beta` over the `width` nodes behind the named faces and zero elsewhere, for a driver to set as `Simulation.damping` |
 | normalization | `canonical_boundary(boundary, ndim)` | expands the shorthands (`None`, one condition, one per axis) into the `((low, high),) * ndim` form `Simulation` stores |
@@ -19,7 +23,9 @@ Both walls are the discrete method of images and act on the ghost ring only, mir
 
 Grouping by condition rather than by face is what keeps the common case cheap: a uniform boundary is one launch however many faces it covers, and a mixed one costs one launch per distinct condition rather than $2\,\textrm{ndim}$. The faces travel as a bitmask, so no device array has to be allocated or kept alive for the dispatch
 
-Only these two *conditions* are implemented. A true absorbing or radiating condition would need state on the boundary layer rather than a ghost mirror, so it does not fit the marker-plus-kernel shape and is left out rather than approximated: `sponge` opens the domain in the material instead, dissipating the outgoing wave behind a face that stays reflecting, which is why it is a field builder and not a `BoundaryCondition`
+A kernel-less marker names a wall the discretization already produces: `Traction` and `Magnetic` are the natural condition of the interior assembly, and `Clamped` and `Conductor` are a zeroed inertia on the wall unknowns. They cost no launch, which is why `define_boundary` skips a condition whose `kernel` is `None`, and they are separate objects from their mechanical twins so that a simulation prints the vocabulary of its own physics
+
+Only two ghost-mirroring *conditions* are implemented. A true absorbing or radiating condition would need state on the boundary layer rather than a ghost mirror, so it does not fit the marker-plus-kernel shape and is left out rather than approximated: `sponge` opens the domain in the material instead, dissipating the outgoing wave behind a face that stays reflecting, which is why it is a field builder and not a `BoundaryCondition`
 
 ## sponge
 
@@ -30,6 +36,8 @@ $$\beta\left(\mathbf{x}\right)=\beta_\textrm{wall}\,w\left(\mathbf{x}\right)^2,\
 with the peak decay per step `beta` $\beta_\textrm{wall}$ reached at the wall node, the taper $w$ rising linearly from 0 at the inner edge of the layer, and the inertia $m$ the parametrization gives. The field is scaled by it, so one `beta` means the same decay whichever formulation is in use. [forward CUDA](cuda_scalar.md) carries the $\beta$ the kernel actually reads
 
 `beta` has an **optimum** rather than a monotone benefit: too small and the wave crosses the layer and returns off the wall behind it, too large and the damping gradient reflects it on the way in. The optimum sits at $\beta_\textrm{wall}\approx0.05$ and **stays there as the layer thickens**, so thicken the layer and leave `beta` alone. A one-wavelength layer is the exception and wants about twice that, since the same energy has half as many nodes to go into. Thickness is the currency, buying roughly a factor of five per doubling, and `beta` only spends it well or badly
+
+`beta` is a decay **per step**, so the conductivity it produces scales as $1/\Delta t$ and the optimum moves with the resolution: halving $\Delta x$ halves it. A driver that may be refined should set it from the timestep, `beta` $=\alpha\Delta t$ with $\alpha$ the decay per wavelength travelled, which is what the [tpto](tpto.md) drivers do
 
 What a sponge leaves is a small reflection per pass rather than a clean cut, so what becomes of that leakage decides whether it matters. **A face left reflecting traps it**: the leaked wave returns to graze the sponge again and again, and the residual grows with the length of the record instead of settling. Lining every face is worth far more than tuning the one face that is lined, so open them all where the setup allows it, and where it does not, read a long record with the accumulation in mind
 

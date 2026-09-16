@@ -21,10 +21,11 @@ Sources and receivers are placed by **coordinate**, not by node index, and multi
 | cost | `misfit(sim, sources, indicator, sensors, observed, objective=l2_misfit)` | the summed cost alone, forward passes only |
 | cost and gradient | `misfit_gradient(sim, sources, indicator, sensors, observed, objective=l2_misfit, adjoint=sensitivity)` | the same cost with its derivative, already reparametrized from $(m,k)$ onto the indicator |
 | objective | `energy(sim)` | factory for $J=\tfrac{1}{2}\Delta t\prod_d\Delta x_d\sum p^2$, the acoustic energy reaching the sensor nodes |
+| objective | `intensity(sim, frequencies, weights=None)` | factory for $J=\sum_{fc}w_{fc}\lvert\hat{u}_{fc}\rvert^2$, the spectral intensity at the sensor nodes, `weights` pairing each frequency with the port it is scored on |
 | cost | `response(sim, source, indicator, sensors, objective)` | one forward pass, returning the cost together with the field at the last step |
 | cost and gradient | `response_gradient(sim, source, indicator, sensors, objective, adjoint=sensitivity)` | the same cost with its derivative, reparametrized onto the indicator as above |
 
-The two applications get the same pair twice: `misfit` / `misfit_gradient` sums over a shot list against measured data for [fwi](fwi.md), `response` / `response_gradient` scores one shot against a design objective for [tato](tato.md). Both route the chain rule from $(m,k)$ onto the indicator through the same private `_reparametrize`, so a new `Simulation` subclass changes neither
+The three applications get the same pair twice: `misfit` / `misfit_gradient` sums over a shot list against measured data for [fwi](fwi.md), `response` / `response_gradient` scores one shot against a design objective for [tato](tato.md) and [tpto](tpto.md). Both route the chain rule from $(m,k)$ onto the indicator through the same private `_reparametrize`, so a new `Simulation` subclass changes neither
 
 `response` returns the field alongside the cost because the thresholded design is re-simulated precisely to be looked at: the number and the picture come from the same solve, and cannot drift apart
 
@@ -35,3 +36,7 @@ Both gradients take the adjoint variant itself as an argument, so a sponged run 
 `stack` trades resolution for cost. A stacked shot is one simulation and one record instead of `len(sources)`, but the gradient it produces is the superposition of the individual ones and cannot be separated again; encode the shots by scaling their signals (random signs, phase shifts) before stacking if the crosstalk matters
 
 Receiver interpolation is the transpose of source distribution, deliberately: `scatter` is exactly `traces` run backwards, so an objective defined on receivers differentiates correctly without the driver forming anything on the grid
+
+`intensity` is the spectral sibling of `energy`, and it is what a time-domain solver needs in order to answer a frequency-domain question. An objective already receives the whole $(N,\,\textrm{num sensors})$ record rather than one step of it, so a discrete Fourier transform is an ordinary objective and needs nothing from the adjoint: the transform is linear, so its derivative is the same pair of tables read backwards. The tables are built in double and stored in the simulation's own precision, since the phase reaches $10^5$ radians over a long run
+
+Several frequencies cost one run, not one run each, which is the whole reason [tpto](tpto.md) is transient: `weights` is $(\textrm{num frequencies},\,\textrm{num sensors})$, so a demultiplexer scoring two wavelengths on two ports is one broadband simulation and a two-row matrix. The run has to be long enough for the transform to resolve them, the bin spacing being $1/\left(N\Delta t\right)$

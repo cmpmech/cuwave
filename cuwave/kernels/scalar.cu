@@ -1,31 +1,7 @@
-// Compile-time configuration (set via -D flags from wave.py):
-//   USE_FLOAT
+// Prepended by wave.compile_kernels: stencils.preamble, then common.cuh.
+// Compile-time configuration this file responds to:
 //   NDIM = 1 | 2 | 3
 //   USE_DAMPING
-//   STENCIL_RADIUS
-//   OP_COEFFS
-
-#ifdef USE_FLOAT
-typedef float real_t;
-#else
-typedef double real_t;
-#endif
-
-// ----------------------------- finite difference helpers
-#ifndef STENCIL_RADIUS
-#define STENCIL_RADIUS 1 // default order 2
-#endif
-
-#if STENCIL_RADIUS == 1
-#define OP_W(r, k) ((real_t)1)
-#define CLOSURE(a, N) 1
-#else
-// cache
-__constant__ real_t OP_C[STENCIL_RADIUS][STENCIL_RADIUS] = OP_COEFFS;
-#define OP_W(r, k) OP_C[(r) - 1][(k) - 1] // 1-indexed adjustment
-// grade radius down towards wall so the stencil never reaches past ghost nodes
-#define CLOSURE(a, N) min(STENCIL_RADIUS, min(a, (N) - 1 - (a)))
-#endif
 
 // spatial finite difference stencil for Laplacian
 __device__ __forceinline__ real_t flux_divergence_axis(
@@ -184,38 +160,5 @@ __global__ void homogeneous_dirichlet_kernel(real_t *__restrict__ u,
   u[ghost] = -u[ghost + 2 * normal];
 }
 
-// ------------------------------------------------------------------------------------
-__global__ void
-excitation_kernel(real_t *__restrict__ u, const real_t *__restrict__ source,
-                  const int offset, const int *__restrict__ lin_index,
-                  const int num_sources, const real_t *__restrict__ weight) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < num_sources) {
-    atomicAdd(&u[lin_index[idx]], weight[idx] * source[offset + idx]);
-  }
-}
-
-// ------------------------------------------------------------------------------------
-__global__ void get_signal_kernel(const real_t *__restrict__ u,
-                                  real_t *__restrict__ um, const int offset,
-                                  const int *__restrict__ lin_index,
-                                  const int num_sensors) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < num_sensors) {
-    um[offset + idx] = u[lin_index[idx]];
-  }
-}
-
-// ------------------------------------------------------------------------------------
-__global__ void set_signal_kernel(real_t *__restrict__ u,
-                                  const real_t *__restrict__ um,
-                                  const int offset,
-                                  const int *__restrict__ lin_index,
-                                  const int num_sensors) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < num_sensors) {
-    u[lin_index[idx]] = um[offset + idx];
-  }
-}
 
 } // extern "C"

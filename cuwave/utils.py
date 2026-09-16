@@ -432,3 +432,40 @@ def response_gradient(
     """
     cost, grads, _, _ = adjoint(sim, source, indicator, sensors, objective)
     return cost, _reparametrize(sim, indicator, grads)
+
+
+# ---------------------------------------- tpto ---------------------------------------
+def intensity(
+    sim: Simulation,
+    frequencies: npt.ArrayLike,
+    weights: cpt.NDArray | npt.ArrayLike | None = None,
+) -> Callable:
+    """Objective factory: J = sum |u_hat(f)|**2, the spectral intensity at the sensors.
+
+    Args:
+        sim: the simulation the record comes from, whose `dt` and `N` fix the transform.
+        frequencies: one frequency, or several scored by the same run.
+        weights: (num_frequencies, num_sensors), or anything broadcasting to it, so one
+            record scores several ports each at its own frequency. Defaults to 1.
+
+    Returns:
+        the objective `sensitivity` takes. The transform is linear in the record, so its
+        adjoint is the same pair of tables read backwards.
+    """
+    # the phase reaches 1e5 radians over a long run, so it is built in double
+    f = np.atleast_1d(np.asarray(frequencies, dtype=np.float64))
+    t = np.arange(sim.N, dtype=np.float64) * sim.dt
+    phase = 2.0 * np.pi * t[:, None] * f[None, :]
+    cos = cp.asarray(np.cos(phase), dtype=sim.dtype)
+    sin = cp.asarray(np.sin(phase), dtype=sim.dtype)
+    scale = sim.dtype(sim.dt)
+    w = 1.0 if weights is None else cp.asarray(weights, dtype=sim.dtype)
+
+    # real tables rather than one complex one: half the work, and no conjugate to drop
+    def objective(traces):
+        re = scale * (cos.T @ traces)
+        im = -scale * (sin.T @ traces)
+        cost = float(cp.sum(w * (re * re + im * im)))
+        return cost, 2.0 * scale * (cos @ (w * re) - sin @ (w * im))
+
+    return objective

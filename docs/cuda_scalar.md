@@ -11,7 +11,9 @@
 | `STENCIL_RADIUS`, `OP_COEFFS` | `stencils.preamble(space_order)`                                      | the radius $R$ and the cell-coefficient table                 |
 | `--use_fast_math`             | always                                                                |                                                               |
 
-The stencil table is **prepended to the source text** rather than passed as a `-D`, because `RawModule` caches on the code string: a different `space_order` is then a different module automatically, without the order having to appear in the options
+Two source blocks are **prepended to the text** rather than passed as `-D` flags: the stencil table, then `kernels/common.cuh`. `RawModule` caches on the code string, so a different `space_order` is a different module automatically, without the order having to appear in the options, and the prelude needs no include path
+
+The prelude is where the `real_t` typedef, the `OP_W` and `CLOSURE` accessors and the three transfer kernels below actually live, so every `.cu` in the repo carries only its own operator. [wave](wave.md) lists what it holds and what it deliberately does not
 
 `stencils.preamble(4)` for instance emits
 ```c

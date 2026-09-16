@@ -30,6 +30,7 @@ From those it derives everything the kernels are launched and compiled with: so 
 | step | `define_step(kernels, mat)` | the step closure, one `fd_kernel` launch here; a scheme needing several launches per step overrides it, which is how the staggered [elastic](elastic.md) exists without touching `simulate` |
 | staggering | `component_offsets` | `(ncomp, ndim)` grid offsets of each component, `None` for a nodal unknown; what [distribute](utils.md) shifts by |
 | strip radius | `reach` | nodes one step reads past a point, `space_order // 2` here; what sizes the [reconstruction](sensitivity.md) strip |
+| measured timestep | `stable_timestep(sim, indicator, iterations=60, safety=0.95)` | the largest stable step, power-iterated on the step kernel rather than estimated from the speed and the spacing as `stable_dt` is |
 
 A specialization adds the physics: it turns one design field `indicator` $\gamma$ into the nodal coefficient fields the kernels read, and supplies the constants that fold $\Delta t$, $\Delta x$ and the material scaling into the update
 
@@ -51,6 +52,8 @@ Each equation family lives in its own module and fills the hooks above, so addin
 | `PressureWave` with `ScalarWave` and `AcousticWave` | [scalar](scalar.md) | one per node | the cheapest operator, any even `space_order`, and the two-phase interpolation the [tato](tato.md) driver optimizes over |
 | `ElasticWave` | [elastic](elastic.md) | `ndim` per node, staggered | the vector equation at a cost linear in the stencil radius, and the exact transpose at every order |
 | `AnisotropicElasticWave` | [anisotropic](anisotropic.md) | `ndim` per node, collocated | an arbitrary symmetric Voigt $\mathbf{C}$, at order 2 only |
+| `MaxwellWave` with `DielectricWave` | [maxwell](maxwell.md) | `ndim` per node, staggered | the curl-curl equation on the Yee lattice, which is the elastic layout with the normal-stress block deleted |
+| `PolarizedWave` with `ElectricWave` and `MagneticWave` | [maxwell](maxwell.md) | one per node | the 2D out-of-plane reductions, which are `PressureWave` with its two coefficient fields exchanged |
 
 ## define_\[kernel]
 Every kernel launch in the time loop is prepared by a `define_[kernel]` factory: it is called **once** during setup and returns a closure that launches one compiled kernel
@@ -102,3 +105,36 @@ Only the reverse march of the [sensitivity](sensitivity.md) analysis needs it, t
 see [boundary](boundary.md)
 ### define_gradient
 see [sensitivity](sensitivity.md)
+
+## the staggered lattice
+
+A staggered equation puts its unknowns off the nodes, and the geometry that follows is a
+function of `component_offsets` and `PAIRS` alone rather than of the physics, so it lives
+here and both [elastic](elastic.md) and [maxwell](maxwell.md) call it
+
+| member | signature | description |
+|---|---|---|
+| voigt order | `PAIRS` | the $\left(k,l\right)$ pairs per dimension, the shear or curl rows being `PAIRS[ndim][ndim:]` |
+| weights | `component_weights(sim, c)`, `pair_weights(sim, axes)` | the cell weights $W$ of a point family, halved on the walls of the axes it is not staggered on |
+| averages | `point_average(sim, field, c)`, `pair_average(sim, field, axes)` | the arithmetic two-node mean at a component point and the harmonic four-node mean at a pair point |
+| average adjoints | `point_average_adjoint(sim, density, c)`, `pair_average_adjoint(sim, density, field, axes)` | their transposes, which is how a point density is chained back onto the nodal design field |
+
+They are free functions taking `sim` rather than a shared base class: what the two
+equations hold in common is the lattice, and their material models, `build_materials` and
+`define_step` are precisely what they do not share
+
+## the CUDA prelude
+
+`compile_kernels` prepends two source blocks to every `.cu` before handing it to
+`RawModule`: the coefficient tables from [stencils](stencils.md) `preamble`, then
+`kernels/common.cuh`. The prelude carries what every equation repeats, so a `.cu` holds
+only its own operator: the `real_t` typedef, the `OP_W` / `CLOSURE` and `SG_W` accessors
+with their `__constant__ tables`, `NPAIRS` / `PAIR_ROW`, `rad_node` / `rad_half`,
+`clamped_face`, and the byte-identical `excitation_kernel`, `get_signal_kernel` and
+`set_signal_kernel`
+
+Injecting it as source rather than as an include keeps the module cache correct without an
+include path, exactly as the stencil table already did. What stays per equation is the
+`AXIS_*` and `INTERIOR_OR_RETURN` macro block, which is **not** common: the anisotropic
+adjoint takes no per-axis factors where the others do, so one shared definition would
+change its kernel signatures rather than deduplicate them

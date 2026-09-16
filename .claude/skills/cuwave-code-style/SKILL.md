@@ -451,9 +451,16 @@ this block and to `Simulation.compile_flags` together.
   case.
 - **A whole `(N, num)` record plus an `offset`, never a per-row view**: slicing a row per step
   costs more host time than the kernel costs on the device.
-- **A preamble shared by two `.cu` files is duplicated byte-identically** rather than factored
-  out: each file is compiled as its own `RawModule` from a source string, with no include
-  path, so keep the copies diffable.
+- **What every `.cu` shares lives in `kernels/common.cuh`**, which `compile_kernels`
+  prepends as source next to the stencil table: the `real_t` typedef, the `OP_W` / `SG_W`
+  accessors and their `__constant__` tables, `NPAIRS` / `PAIR_ROW`, `rad_node` / `rad_half`,
+  `clamped_face`, and the three transfer kernels. A `.cu` opens with the flags **it** still
+  responds to, not the prelude's, and holds only its own operator.
+- **What only some files share stays duplicated byte-identically**: the `AXIS_*` and
+  `INTERIOR_OR_RETURN` blocks differ between equations (the anisotropic adjoint takes no
+  per-axis factors), and a strain or curl helper is repeated in the sensitivity file rather
+  than hoisted. Each file is still its own `RawModule` from a source string, so keep those
+  copies diffable rather than growing the prelude to cover them.
 
 ### Naming inside a kernel
 

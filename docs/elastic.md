@@ -42,7 +42,7 @@ Unlike a centred difference, a staggered one does not annihilate the checkerboar
 Two prices remain, and they are the honest limits of a wide stencil rather than of this scheme:
 
 - the leapfrog stays $O\left(\Delta t^2\right)$ in time, so at a fixed Courant number the asymptotic rate is 2 whatever the spatial order; the spatial order pays through **dispersion** in the practical points-per-wavelength regime, which is the classic $(2,4)$ trade of seismology
-- a wide stencil still reaches past the harmonic mean into a void, so a design floor at $\gamma=10^{-3}$ costs stable timestep at order 4 where order 2 is untouched. The collapse is far milder than the cell gather's, but `stable_timestep(sim, indicator)` remains the arbiter: it power-iterates the step kernel itself, so it is exact for any order, material and boundary layout, where `wave.stable_dt` knows only the speed and the spacing. A number far below it is the signal to raise the design floor or drop `space_order`, not to shrink `dt`
+- a wide stencil still reaches past the harmonic mean into a void, so a design floor at $\gamma=10^{-3}$ costs stable timestep at order 4 where order 2 is untouched. The collapse is far milder than the cell gather's, but `stable_timestep(sim, indicator)` remains the arbiter: it power-iterates the step kernel itself, so it is exact for any order, material and boundary layout, where `stable_dt` knows only the speed and the spacing. A number far below it is the signal to raise the design floor or drop `space_order`, not to shrink `dt`
 
 The reconstruction strip of [sensitivity](sensitivity.md) follows `reach` $=2r-1$ rather than $r$: the strain taps compound with the divergence taps, and a strip sized on $r$ alone would let the reverse march read a damped node
 
@@ -54,15 +54,14 @@ The reconstruction strip of [sensitivity](sensitivity.md) follows `reach` $=2r-1
 | staggering | `component_offsets` | component `c` half a node up axis `c`, what [distribute](utils.md) shifts by |
 | stencil radius | `radius` | half `space_order`, each derivative reaching twice it |
 | strip radius | `reach` | $2r-1$, the nodes one step reads past a point |
-| timestep | `stable_timestep(sim, indicator, iterations=60, safety=0.95)` | the largest stable step, measured on the step kernel rather than estimated |
 | materials | `build_materials(indicator)` | the point inverse inertia per component, the design field on the node and shear stress points, and `damping` |
 | step | `define_step(kernels, mat)` | the two-launch closure: the stress kernel, then the update |
 | inertia | `inverse_inertia(indicator)` | nodal $1/\left(\gamma\rho_0W\right)$, what a [sponge](boundary.md) scales its damping by |
 | coefficients | `parametrization_jacobian(indicator)` | $\left(1,\,1\right)$, since $\gamma$ scales inertia and stiffness alike |
 | per-axis factors | `step_factors()` | $\Delta t^2/\Delta x_d$, the strain carrying the other $1/\Delta x$ |
 | source scaling | `source_factor()` | $1$; the excitation weights divide by the volume the kernel inertia leaves out |
-| averages | `point_average(field, c)`, `pair_average(field, axes)` | the arithmetic two-node inertia mean and the harmonic four-node shear mean |
-| weights | `component_weights(c)`, `pair_weights(axes)` | the cell weights $W$ of a point family, halved on the walls of its unstaggered axes |
+| lattice geometry | `component_weights`, `pair_weights`, `point_average`, `pair_average` | the point families' cell weights and material means, shared with [maxwell](maxwell.md) and therefore living in [wave](wave.md) |
+| timestep | `stable_timestep(sim, indicator, ...)` | the largest stable step, measured on the step kernel; also in [wave](wave.md), since it names no elastic concept |
 | stiffness matrix | `voigt(ndim, lame, shear, plane="strain")` | the isotropic Voigt matrix, `plane` selecting strain or stress in 2D |
 
 ## parametrization
