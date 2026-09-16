@@ -37,7 +37,7 @@ Possible applications include
 </table>
 
 ## Documentation
-- see the [documentation](docs/Home.md) for how the code works
+- see the [documentation](docs/Home.md) for how the code works (generated with Claude)
 - see [examples](https://github.com/Leon-Herrmann/cuwave/tree/main/examples) for how to apply the code
 ## Install
 

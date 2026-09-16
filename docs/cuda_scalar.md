@@ -96,7 +96,7 @@ flat 1D launch, 256 threads per block, one thread per source
 **aim**
 add the scaled signal sample of time step `t_index` into the field
 **input args**
-`u`: array of $u$, accumulated into; `source`: the whole $(N,\textrm{num\_sources})$ record; `offset`: `t_index * num_sources`, the row start; `lin_index`: flat indices of the source nodes; `num_sources`; `weight`: per-source $\Delta t^2/m$ times `source_factor`
+`u`: array of $u$, accumulated into; `source`: the whole $(N,\,\textrm{num sources})$ record; `offset`: `t_index * num_sources`, the row start; `lin_index`: flat indices of the source nodes; `num_sources`; `weight`: per-source $\Delta t^2/m$ times `source_factor`
 **how?**
 - `weight` is precomputed once at setup by `excitation_weights`, so this kernel needs neither a material field nor any knowledge of the formulation
 - `lin_index` comes from `wave.flatten_indices`, which collapses the $(\textrm{ndim},\textrm{num})$ grid indices into flat indices of the padded array once, outside the time loop
@@ -107,7 +107,7 @@ add the scaled signal sample of time step `t_index` into the field
 **parallelization**
 flat 1D launch, 256 threads per block, one thread per sensor
 **aim**
-write row `t_index` of the $(N,\textrm{num\_sensors})$ record `um` from the current field
+write row `t_index` of the $(N,\,\textrm{num sensors})$ record `um` from the current field
 **input args**
 `u`: array of $u$; `um`: the record, written to; `offset`: `t_index * num_sensors`, the row start; `lin_index`: flat indices of the sensor nodes; `num_sensors`
 **how?**
