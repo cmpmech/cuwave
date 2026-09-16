@@ -1,6 +1,7 @@
 # CuWave
 
 **Forward simulation** of the following wave equations:
+
 $$\textrm{pressure:}\qquad m\ddot{u}+d\dot{u}-\nabla\cdot(k\nabla u)=f$$
 $$\textrm{elastic:}\qquad m\ddot{\mathbf{u}}+d\dot{\mathbf{u}}-\nabla\cdot\boldsymbol{\sigma}=\mathbf{f},\qquad\boldsymbol{\sigma}=\lambda\,\textrm{tr}\left(\boldsymbol{\varepsilon}\right)\mathbf{I}+2\mu\boldsymbol{\varepsilon},\qquad\boldsymbol{\varepsilon}=\frac{1}{2}\left(\nabla\mathbf{u}+\nabla\mathbf{u}^\top\right)$$
 $$\textrm{electromagnetic:}\qquad\varepsilon\ddot{\mathbf{E}}+\sigma\dot{\mathbf{E}}+\nabla\times\left(\frac{1}{\mu}\nabla\times\mathbf{E}\right)=-\dot{\mathbf{J}}$$
