@@ -28,9 +28,9 @@ from cuwave.wave import grid_coords, stable_dt, stable_timestep
 PRECISION = "float32"
 RESOLUTION = (256, 256)
 SPACE_ORDER = 4
-SPACE_ORDER_OBS = 6  # the measurement is simulated more accurately than it is inverted
+SPACE_ORDER_OBS = 6  # measurement is simulated more accurately than it is inverted
 SAFETY = 0.9
-SAFETY_OBS = 0.45  # the measurement is stepped finer as well as wider
+SAFETY_OBS = 0.45  # measurement is stepped finer as well as wider
 GAMMA_MIN = 1e-3
 
 # physics
@@ -38,7 +38,7 @@ T = 2.5  # traversals per length (y) at the pressure wave speed
 WAVESPEED_P, WAVESPEED_S, DENSITY = 1.0, 0.5, 1.0  # material
 PLANE = "strain"
 AMPLITUDE, FREQUENCY, CYCLES = 1.0, 10.0, 2  # source
-# transducer, a normal force read by receivers measuring the same component
+# transducer
 NUM_SOURCES, NUM_SENSORS = 4, 32
 ARRAY_SPAN = (0.1, 0.9)  # absolute values
 NORMAL = (0.0, 1.0)
@@ -48,7 +48,7 @@ LENGTHS = (1.0, 1.0)
 NUM_VOIDS = 4
 VOID_MAX_RADIUS = 0.05
 VOID_GROWTH_RATE = 0.5
-GAMMA_VOID = 1e-2  # a wide stencil goes unstable an order below this
+GAMMA_VOID = 1e-2
 VOID_YRANGE, VOID_X = (0.1, 0.5), 0.5
 
 # optimization
@@ -66,7 +66,6 @@ N = math.ceil(T / (SAFETY * stable_dt(dx, WAVESPEED_P, SPACE_ORDER))) + 1
 N_obs = math.ceil(T / (SAFETY_OBS * stable_dt(dx, WAVESPEED_P, SPACE_ORDER))) + 1
 dt, dt_obs = T / (N - 1), T / (N_obs - 1)
 
-# about 12 points per shear wavelength is reasonable
 smallest_radius = VOID_MAX_RADIUS * VOID_GROWTH_RATE ** (NUM_VOIDS - 1)
 print(
     f"{WAVESPEED_S / (FREQUENCY * max(dx)):.0f} points per shear wavelength, "
@@ -114,8 +113,6 @@ voids = stacked_circles(
 )
 truth = cp.where(voids, GAMMA_VOID, 1.0).astype(sim.dtype)
 
-# the void is what tightens the step at a wide stencil, so measure it against the truth
-# rather than trust the wave speed alone
 limit = stable_timestep(sim_obs, truth)
 if dt_obs > limit:
     raise ValueError(

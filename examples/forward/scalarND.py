@@ -11,11 +11,10 @@ from cuwave.wave import Source, simulate, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # discretization
-DIM = 3  # 1, 2 or 3
+DIM = 3
 PRECISION = "float32"
 SPACE_ORDER = 8
-SAFETY = 0.99  # fraction of the stable time step
-
+SAFETY = 0.99  # fraction of stable time step
 # per dimension
 THREADS = {1: (128,), 2: (4, 128), 3: (1, 16, 32)}[DIM]
 RESOLUTION = {1: 2000, 2: 500, 3: 250}[DIM]
@@ -71,7 +70,7 @@ print(f"elapsed time {toc - tic:.2f} s  ({(toc - tic) / N * 1e3:.4f} ms/step)")
 # ----------------------------------- postprocessing ----------------------------------
 u_np = u.get()
 if DIM == 3:
-    u_np = u_np[Nx[0] // 2]  # the source plane, cutting the sphere at its equator
+    u_np = u_np[Nx[0] // 2]  # source plane cuts sphere at its equator
 scale = float(np.max(np.abs(u_np)))
 
 if DIM == 1:

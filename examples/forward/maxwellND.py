@@ -13,17 +13,16 @@ from cuwave.wave import grid_coords, simulate, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # discretization
-DIM = 2  # 2 or 3; a single in-plane component has no curl, so 1D is ElectricWave
+DIM = 2  # 2-3 (for 1D use ElectricWave)
 PRECISION = "float32"
-SPACE_ORDER = 4  # any even order; higher costs little since the curl is per axis
-SAFETY = 0.9  # fraction of the stable time step
-
+SPACE_ORDER = 4
+SAFETY = 0.9  # fraction of stable time step
 # per dimension
 THREADS = {2: (8, 32), 3: (2, 8, 32)}[DIM]
 RESOLUTION = {2: 400, 3: 140}[DIM]
 FREQUENCY = {2: 12, 3: 5}[DIM]  # bounded by 1 / (24 INDEX max(dx))
 
-# physics, nondimensional: the vacuum wavelength, speed and permittivity are all 1
+# physics
 LENGTH = 1
 INDEX = 2.0
 PERMITTIVITY1, PERMITTIVITY2 = 1.0, INDEX**2
@@ -36,7 +35,7 @@ SOURCE_X = 0.3
 
 # source
 AMPLITUDE = 1.0
-POLARIZATION = 1  # the axis the current runs along, which the source may not vary along
+POLARIZATION = 1  # axis the current runs along, which the source may not vary along
 
 # --------------------------------------- setup ---------------------------------------
 Nx = (RESOLUTION,) * DIM
@@ -68,7 +67,7 @@ print(f"{1.0 / (INDEX * FREQUENCY * max(dx)):.0f} points per wavelength in the s
 t_np = np.linspace(0, (N - 1) * dt, N)
 signal = ricker(t_np, AMPLITUDE * dx[POLARIZATION], FREQUENCY)
 
-# a line of currents spanning the polarization axis: uniform along it, so divergence free
+# line of currents spanning the polarization axis: uniform along it, so divergence free
 line = np.arange(1, Nx[POLARIZATION] - 2) * dx[POLARIZATION]
 origin = [SOURCE_X] + [0.5 * LENGTH] * (DIM - 1)
 coordinates = []
@@ -90,9 +89,9 @@ toc = time.time()
 print(f"elapsed time {toc - tic:.2f} s  ({(toc - tic) / N * 1e3:.4f} ms/step)")
 
 # ----------------------------------- postprocessing ----------------------------------
-u_np = u[POLARIZATION].get()  # the component the current drives
+u_np = u[POLARIZATION].get()  # component the current drives
 if DIM == 3:
-    u_np = u_np[:, :, Nx[2] // 2]  # the source plane, where the line looks like a sheet
+    u_np = u_np[:, :, Nx[2] // 2]  # source plane, where the line looks like a sheet
 scale = 0.2 * float(np.max(np.abs(u_np)))
 
 fig, ax = plt.subplots(figsize=(5, 5))

@@ -27,6 +27,13 @@ Possible applications include
 <td valign="middle"><a href="https://www.science.org/doi/10.1126/sciadv.aay6946"><strong>analog neural networks</strong></a></td>
 <td width="60%" align="right" valign="middle"></td>
 </tr>
+<tr>
+<td valign="middle"><a href="https://opg.optica.org/josab/fulltext.cfm?uri=josab-38-2-496"><strong>transient photonic topology optimization</strong></a></td>
+<td width="60%" align="right" valign="middle"><picture>
+<source media="(prefers-color-scheme: dark)" srcset=".assets/tpto-dark.png">
+<img width="100%" src=".assets/tpto-light.png" alt="transient photonic topology optimization">
+</picture></td>
+</tr>
 </table>
 
 ## Documentation

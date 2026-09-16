@@ -12,22 +12,23 @@ from cuwave.sensitivity import (
     superposition_sensitivity,
 )
 from cuwave.signals import ricker
-from cuwave.wave import Source, grid_coords, simulate, stable_dt
+from cuwave.utils import Sensors, point_source
+from cuwave.wave import grid_coords, simulate, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # discretization
-SPACE_ORDER = 2  # the adjoint is the exact transpose only at order 2
-PRECISION = "float32"  # "float32" | "float64"
-METHOD = "standard"  # "standard" | "superposition", the memory-efficient alternative
-SUPERPOSITION_SCALE = 1e2  # aim for a cancellation near 1e4 in float32
+SPACE_ORDER = 2  # adjoint is exact at order 2
+PRECISION = "float32"
+METHOD = "standard"  # "standard" or "superposition" (memory-efficient alternative)
+SUPERPOSITION_SCALE = 1e2
 RESOLUTION = 240
-SAFETY = 0.99  # fraction of the stable time step
+SAFETY = 0.99
 
 # physics
 LENGTH = 1.0
 WAVESPEED = 1.0
 DENSITY = 1.0
-DENSITY0 = 1e-4  # inside the inclusion
+DENSITY0 = 1e-4
 FREQUENCY = 15.0
 T = 2.0
 
@@ -56,46 +57,49 @@ sim = ScalarWave(
     density=DENSITY,
 )
 
-# a density ratio, so the wave speed is the same inside the inclusion as out
 x, y = grid_coords(Nx, dx, dtype=sim.dtype)
 hole = (x - LENGTH / 2) ** 2 + (y - LENGTH / 2) ** 2 < RADIUS**2
 true_indicator = cp.where(hole, DENSITY0 / DENSITY, 1.0).astype(sim.dtype)
 
 # --------------------------------------- source --------------------------------------
 t = np.linspace(0, (N - 1) * dt, N)
-signal = ricker(t, 1.0, FREQUENCY) / np.prod(dx)
-source = Source(
-    cp.array([[1], [Nx[1] // 2]], dtype=cp.int32),
-    cp.asarray(signal[:, None], dtype=sim.dtype),
+signal = ricker(t, 1.0, FREQUENCY)
+
+source = point_source(sim, [[0.0, LENGTH / 2]], signal)
+sensor_coords = np.stack(
+    [
+        np.full(NUM_SENSORS, 0.0),
+        np.linspace(dx[1], LENGTH - dx[1], NUM_SENSORS),
+    ],
+    axis=1,
 )
-sensors = cp.array(
-    [np.full(NUM_SENSORS, 1), np.linspace(2, Nx[1] - 3, NUM_SENSORS).astype(int)],
-    dtype=cp.int32,
-)
+sensors = Sensors(sim, sensor_coords)
 
 # --------------------------------------- solve ---------------------------------------
 # reference measurement through the true model
-_, observed = simulate(sim, source, true_indicator, sensors=sensors)
+_, record = simulate(sim, source, true_indicator, sensors=sensors.nodes)
+observed = sensors.traces(record)
 
-# sensitivity of the misfit at the homogeneous starting model
+# design field guess
 indicator = cp.ones(sim.Nx_padded, dtype=sim.dtype)
 
-objective = l2_misfit(observed)
+objective = sensors.objective(l2_misfit(observed))
 cp.cuda.Stream.null.synchronize()
 tic = time.time()
 if METHOD == "standard":
-    cost, grads, traces, info = sensitivity(sim, source, indicator, sensors, objective)
+    cost, grads, traces, info = sensitivity(
+        sim, source, indicator, sensors.nodes, objective
+    )
 else:
     cost, grads, traces, info = superposition_sensitivity(
-        sim, source, indicator, sensors, objective, scale=SUPERPOSITION_SCALE
+        sim, source, indicator, sensors.nodes, objective, scale=SUPERPOSITION_SCALE
     )
-# past ~1e6 in float32 the gradient is mostly round-off; raise SUPERPOSITION_SCALE
 note = f"\t cancellation {info['cancellation']:.1e}" if info else ""
 cp.cuda.Stream.null.synchronize()
 elapsed = time.time() - tic
 print(f"{METHOD}: cost {cost:.4e}\t {N:d} steps: {elapsed:.2f}s{note}")
 
-# chain rule from the two material fields back onto the indicator
+# chain rule
 d_mass, d_stiff = sim.parametrization_jacobian(indicator)
 gradient = (d_mass * grads["mass"] + d_stiff * grads["stiff"]).get()
 

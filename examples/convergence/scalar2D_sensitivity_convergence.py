@@ -15,38 +15,38 @@ from cuwave.wave import grid_coords, simulate, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # implementation
-DIM = 2  # fixed
-PRECISION = "float64"  # float32 floors the relative error near 1e-7
+DIM = 2
+PRECISION = "float64"
 THREADS = (4, 128)
-METHOD = "standard"  # "standard" | "superposition", the memory-efficient alternative
-SUPERPOSITION_SCALE = 1e6  # aim for a cancellation near 1e6 in float64
+METHOD = "standard"  # "standard" or "superposition" (memory-efficient alternative)
+SUPERPOSITION_SCALE = 1e6
 
 # discretization
 SPACE_ORDERS = (2, 4, 6, 8)
-LEVELS = (32, 48, 64, 96, 128, 192)  # cells per axis, log-spaced
-REFERENCE = 384  # cells per axis: 2x the finest level, and a multiple of every one
-REFERENCE_SAFETY = 0.5  # the reference refines in time as well as in space
+LEVELS = (32, 48, 64, 96, 128, 192)  # cells per axis
+REFERENCE = 384  # cells per axis (multiple of every entry in LEVELS)
+REFERENCE_SAFETY = 0.5
 REFERENCE_ORDER = 12
-SAFETY = 0.99  # fraction of the stable time step, which every run takes in full
+SAFETY = 0.99
 
 # physics
 LENGTH = 1.0
 WAVESPEED = 1.0
 DENSITY = 1.0
 DENSITY0 = 1e-4  # inside the inclusion
-T = 2.0  # the scattered arrival is back at the sensors by 1.0
+T = 2.0
 
 # source
 AMPLITUDE = 1.0
-FREQUENCY = 4.0  # 8 points per wavelength on the coarsest level, 48 on the finest
-SENSOR_DIVISOR = 16  # sensors at k * LENGTH / this along the left edge, k = 1 .. 15
+FREQUENCY = 4.0
+SENSOR_DIVISOR = 16
 
 # geometry
 RADIUS = 0.1
-SMOOTHING = 0.02  # a finite width resolves on every level; 0.0 is a sharp disk
+SMOOTHING = 0.02  # reduce geometric error through smoothing
 
 # postprocessing
-COLORS = ("k", "b", "g", "r")  # one per entry of SPACE_ORDERS
+COLORS = ("k", "b", "g", "r")
 
 # --------------------------------------- setup ---------------------------------------
 if any(REFERENCE % n_el for n_el in LEVELS):
@@ -70,14 +70,8 @@ def gradient_of(
 ) -> tuple[cpt.NDArray, float, int]:
     """Sensitivity of the misfit at the homogeneous model, on `n_el` cells per axis.
 
-    The inclusion is measured and inverted at the same level, as in the sensitivity
-    driver: the objective is that level's own discrete misfit, and it converges to the
-    continuous one along with everything else.
-
-    Args:
-        space_order: finite difference order of the forward and adjoint passes.
-        n_el: cells per axis, so the grid holds `n_el + 3` nodes including ghosts.
-        dt_stable: upper bound on the timestep, which `T` is then divided into.
+    The inclusion is measured and inverted at the same level, so the objective is that
+    level's own discrete misfit.
 
     Returns:
         (gradient, elapsed, N): the interior nodes of d(cost)/d(gamma) as a density,
@@ -100,7 +94,7 @@ def gradient_of(
         density=DENSITY,
     )
 
-    # a density ratio, so the wave speed is the same inside the inclusion as out
+    # density ratio, so the wave speed is the same inside the inclusion as out
     x, y = grid_coords(Nx, dx, dtype=sim.dtype)
     r = cp.sqrt((x - 0.5 * LENGTH) ** 2 + (y - 0.5 * LENGTH) ** 2)
     if SMOOTHING:
@@ -157,7 +151,7 @@ mempool.free_all_blocks()
 # --------------------------------------- sweep ---------------------------------------
 results = {}
 for space_order in SPACE_ORDERS:
-    gradient_of(space_order, min(LEVELS), T)  # this order's nvcc compiles, untimed
+    gradient_of(space_order, min(LEVELS), T)  # keep nvcc compile outside timings
     dofs, errors, timings = [], [], []
     for n_el in LEVELS:
         dt_stable = SAFETY * stable_dt((LENGTH / n_el,) * DIM, WAVESPEED, space_order)

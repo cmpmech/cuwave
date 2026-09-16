@@ -16,7 +16,7 @@ from cuwave.wave import Source
 
 # -------------------------------------- settings -------------------------------------
 # implementation
-DIM = 2  # fixed
+DIM = 2
 PRECISION = "float32"
 THREADS = (4, 128)
 
@@ -27,25 +27,23 @@ DENSITY = 1
 AMPLITUDE = 1e8
 CYCLES = 5
 
-# superposition holds 3 fields where standard holds N + 2; retune for your device
-RESOLUTIONS = {
-    "standard": np.logspace(0.7, 3.75, 40).astype(np.int32),  # laptop (RTX PRO 500)
+RESOLUTIONS = {  # laptop (RTX PRO 500)
+    "standard": np.logspace(0.7, 3.75, 40).astype(np.int32),
     "superposition": np.logspace(0.7, 4.04, 40).astype(np.int32),
 }
-SUPERPOSITION_SCALE = 1.0  # k; see cuwave/sensitivity.py on how to pick it
+SUPERPOSITION_SCALE = 1.0
 
 mempool = cp.get_default_memory_pool()
 device_total = cp.cuda.Device().mem_info[1]
 
 results = {}
 for method, resolutions in RESOLUTIONS.items():
-    # first resolution repeated, so the compiling run is dropped from the plot
     resolutions = np.insert(resolutions, 1, resolutions[0])
     timings = []
     dofs = []
     memory = []
     for res in resolutions:
-        # --------------------------------------- setup ---------------------------------------
+# --------------------------------------- setup ---------------------------------------
         Nx = (res,) * DIM
         dx = tuple(LENGTH / (n - 3) for n in Nx)
         dt = 0.95 * min(dx) / WAVESPEED / math.sqrt(DIM)
@@ -64,7 +62,7 @@ for method, resolutions in RESOLUTIONS.items():
         )
         indicator = cp.ones(sim.Nx_padded, dtype=sim.dtype)
 
-        # --------------------------------------- helper --------------------------------------
+# --------------------------------------- helper --------------------------------------
         t_np = np.linspace(0, (N - 1) * dt, N)
         signal_np = sineburst(t_np, AMPLITUDE, frequency, CYCLES) / np.prod(dx)
         signal = cp.asarray(signal_np[:, None], dtype=sim.dtype)
@@ -72,11 +70,10 @@ for method, resolutions in RESOLUTIONS.items():
         source_pos = cp.array([[1] for n in Nx], dtype=cp.int32)
         source = Source(source_pos, signal)
 
-        # one sensor mid-grid: any objective drives an adjoint field of the same size
         sensors = cp.array([[n // 2] for n in Nx], dtype=cp.int32)
         objective = l2_misfit(cp.zeros((N, 1), dtype=sim.dtype))
 
-        # --------------------------------------- solve ---------------------------------------
+# --------------------------------------- solve ---------------------------------------
         cp.cuda.Stream.null.synchronize()
         tic = time.time()
         if method == "standard":
@@ -92,7 +89,6 @@ for method, resolutions in RESOLUTIONS.items():
 
         dofs.append(np.prod(Nx))
         timings.append((toc - tic) / N)
-        # total_bytes, not used_bytes: the history is freed before the call returns
         memory.append(mempool.total_bytes())
 
         del grads, traces, sim, source, indicator, sensors, objective

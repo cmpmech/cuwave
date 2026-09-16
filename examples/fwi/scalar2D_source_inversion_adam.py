@@ -16,7 +16,7 @@ from cuwave.wave import simulate, stable_dt
 # -------------------------------------- settings -------------------------------------
 # discretization
 SPACE_ORDER = 4
-SPACE_ORDER_OBS = 8  # the measurement is simulated more accurately than it is inverted
+SPACE_ORDER_OBS = 8  # measurement is simulated more accurately than it is inverted
 PRECISION = "float32"
 RESOLUTION = (256, 256)
 SAFETY = 0.9
@@ -24,8 +24,8 @@ SAFETY = 0.9
 # physics
 T = 2.5  # traversals per length (y)
 WAVESPEED, DENSITY = 1.0, 1.0  # material, homogeneous and known
-AMPLITUDE, FREQUENCY, CYCLES = 1.0, 20.0, 4  # the signal to be recovered
-SIGNAL_WINDOW = 0.3  # the transducer is known to emit within it, the burst needs 0.1
+AMPLITUDE, FREQUENCY, CYCLES = 1.0, 20.0, 4  # signal to be recovered
+SIGNAL_WINDOW = 0.3  # transducer emits within it, the burst needs 0.1
 
 # geometry
 LENGTHS = (1.0, 1.0)
@@ -62,7 +62,7 @@ scalar_wave = lambda N, dt, space_order: ScalarWave(
 sim = scalar_wave(N, dt, SPACE_ORDER)
 sim_obs = scalar_wave(N_obs, dt_obs, SPACE_ORDER_OBS)
 
-# the medium is known, so it is a constant of the inversion rather than its design
+# the medium is known, so it is a constant of the inversion
 indicator = cp.ones(sim.Nx_padded, dtype=sim.dtype)
 
 # ------------------------------------ measurement ------------------------------------
@@ -94,8 +94,8 @@ print(
 
 # ------------------------------------ optimization -----------------------------------
 objective = sensors.objective(l2_misfit(observed))
-signal = cp.zeros(N, dtype=sim.dtype)  # the zero-source start, no prior on the shape
-# outside the window Adam would fit reverberation: it steps on the sign, not the size
+signal = cp.zeros(N, dtype=sim.dtype)  # zero-source start, no prior on the shape
+# outside the window Adam would fit reverberation
 window = cp.asarray(t <= SIGNAL_WINDOW, dtype=sim.dtype)
 optimizer = Adam(lr=LR)
 history = []
@@ -108,12 +108,12 @@ for iteration in range(ITERS):
         sim, source, indicator, sensors.nodes, objective
     )
     gradient = window * collect_source(sim, SOURCE, columns)[:, 0]
-    # no clip: a signal is unbounded, where a material indicator is not
+    # no clip: a signal is unbounded, unlike a material indicator
     signal = optimizer.step(signal, gradient)
 
     history.append(cost)
     print(f"{iteration}/{ITERS}: normalized misfit {cost / history[0]:.4e}")
-# final misfit, so the curve ends at the converged signal rather than one step before
+# final misfit
 final = record(sim, sensors, point_source(sim, SOURCE, signal))
 history.append(l2_misfit(observed)(final)[0])
 cp.cuda.Stream.null.synchronize()

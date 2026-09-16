@@ -29,9 +29,9 @@ from cuwave.wave import grid_coords, stable_dt
 # -------------------------------------- settings -------------------------------------
 # discretization
 SPACE_ORDER = 4
-SPACE_ORDER_OBS = 8  # the measurement is simulated more accurately than it is inverted
+SPACE_ORDER_OBS = 8  # measurement is simulated more accurately than it is inverted
 PRECISION = "float32"
-RESOLUTION = (256, 256)  # of the region of interest, the sponge added outside it
+RESOLUTION = (256, 256)  # of the region of interest, sponge added outside it
 SAFETY = 0.9
 GAMMA_MIN = 1e-3
 
@@ -44,10 +44,10 @@ NUM_SOURCES, NUM_SENSORS = 4, 32
 ARRAY_SPAN = (0.1, 0.9)  # absolute values
 # geometry
 LENGTHS = (1.0, 1.0)
-# boundary, opening the left and right edges while the transducer edge stays reflecting
+# boundary
 SPONGE_FACES = (0, 1)
 THICKNESS = 2.0  # sponge thickness in dominant wavelengths
-SPONGE_BETA = 0.05  # peak sponge damping, the flat optimum from two wavelengths up
+SPONGE_BETA = 0.05  # peak sponge damping
 # defects
 NUM_VOIDS = 4
 VOID_MAX_RADIUS = 0.05
@@ -72,7 +72,7 @@ Lx, Ly = LENGTHS
 Nx, pad, origin, region = pad_for_sponge(
     RESOLUTION, dx, THICKNESS * WAVESPEED / FREQUENCY, SPONGE_FACES
 )
-x0, y0 = origin  # where the region of interest starts, the sponge sitting before it
+x0, y0 = origin  # where the region of interest starts
 
 N = math.ceil(T / (SAFETY * stable_dt(dx, WAVESPEED, SPACE_ORDER))) + 1
 N_obs = math.ceil(T / (SAFETY * stable_dt(dx, WAVESPEED, SPACE_ORDER_OBS))) + 1
@@ -148,7 +148,7 @@ print(
 )
 
 # ------------------------------------ optimization -----------------------------------
-# the sponge is boundary and not design, so the optimizer never sees those nodes
+# sponge is boundary and not design, so the optimizer never sees those nodes
 design = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
 design[region] = 1.0
 
@@ -173,7 +173,7 @@ for iteration in range(ITERS):
         observed,
         adjoint=reconstruction_sensitivity,
     )
-    # the step is taken in x, so the gradient is chained through the map first
+    # the step is taken in x, so the gradient chains through the map
     x = cp.clip(optimizer.step(x, chain(x, gradient) * design), 0.0, 1.0)
 
     history.append(cost)

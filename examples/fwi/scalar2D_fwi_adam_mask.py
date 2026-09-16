@@ -26,7 +26,7 @@ from cuwave.wave import grid_coords, stable_dt
 # -------------------------------------- settings -------------------------------------
 # discretization
 SPACE_ORDER = 4
-SPACE_ORDER_OBS = 8  # the measurement is simulated more accurately than it is inverted
+SPACE_ORDER_OBS = 8  # measurement is simulated more accurately than it is inverted
 PRECISION = "float32"
 RESOLUTION = (256, 256)
 SAFETY = 0.9
@@ -110,7 +110,7 @@ voids = stacked_circles(
 )
 truth = cp.where(voids, GAMMA_VOID, 1.0).astype(sim.dtype)
 
-# the gradient around a transducer is dominated by its own singularity, not by damage
+# the gradient at a transducer is dominated by its own singularity, not by damage
 frozen = circles(coords, np.vstack((source_coords, sensor_coords)), MASK_RADIUS)
 print(
     f"{100 * float(frozen[interior_slice(sim)].mean()):.1f}% of the domain "

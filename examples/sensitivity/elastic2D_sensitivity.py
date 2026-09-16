@@ -17,22 +17,22 @@ from cuwave.wave import grid_coords, simulate, stable_dt, stable_timestep
 
 # -------------------------------------- settings -------------------------------------
 # discretization
-PRECISION = "float32"  # "float32" | "float64"
-SPACE_ORDER = 2  # a wide stencil over a strong inclusion costs stable time step
-METHOD = "standard"  # "standard" | "superposition", the memory-efficient alternative
-SUPERPOSITION_SCALE = 1e-2  # aim for a cancellation near 1e4 in float32
+SPACE_ORDER = 2  # adjoint is exact at order 2
+PRECISION = "float32"
+METHOD = "standard"  # "standard" or "superposition" (memory-efficient alternative)
+SUPERPOSITION_SCALE = 1e2
 RESOLUTION = 240
-SAFETY = 0.9  # fraction of the stable time step
+SAFETY = 0.9  # 0.99 as in the scalar driver is unstable over the density ratio
 
 # physics
 LENGTH = 1.0
 WAVESPEED_P = 1.0
 WAVESPEED_S = 0.5
 DENSITY = 1.0
-DENSITY0 = 1e-4  # inside the inclusion
+DENSITY0 = 1e-4
 PLANE = "strain"
-FREQUENCY = 12.0
-T = 1.2
+FREQUENCY = 12.0  # the shear wavelength is what the grid has to resolve
+T = 2.0
 
 # geometry
 RADIUS = 0.1
@@ -61,13 +61,10 @@ sim = ElasticWave(
     plane=PLANE,
 )
 
-# a density ratio, so both wave speeds are the same inside the inclusion as out
 x, y = grid_coords(Nx, dx, dtype=sim.dtype)
 hole = (x - LENGTH / 2) ** 2 + (y - LENGTH / 2) ** 2 < RADIUS**2
 true_indicator = cp.where(hole, DENSITY0 / DENSITY, 1.0).astype(sim.dtype)
 
-# the inclusion is what tightens the step at a wide stencil, so measure it rather than
-# trust the wave speed alone
 limit = stable_timestep(sim, true_indicator)
 if dt > limit:
     raise ValueError(
@@ -79,23 +76,22 @@ if dt > limit:
 t = np.linspace(0, (N - 1) * dt, N)
 signal = ricker(t, 1.0, FREQUENCY)
 
-# a normal point force on the top edge, read by receivers measuring the same component
-source = point_source(sim, [[LENGTH / 2, LENGTH]], signal, direction=[0.0, 1.0])
+source = point_source(sim, [[0.0, LENGTH / 2]], signal, direction=[1.0, 0.0])
 sensor_coords = np.stack(
     [
-        np.linspace(0.05 * LENGTH, 0.95 * LENGTH, NUM_SENSORS),
-        np.full(NUM_SENSORS, LENGTH),
+        np.full(NUM_SENSORS, 0.0),
+        np.linspace(dx[1], LENGTH - dx[1], NUM_SENSORS),
     ],
     axis=1,
 )
-sensors = Sensors(sim, sensor_coords, direction=[0.0, 1.0])
+sensors = Sensors(sim, sensor_coords, direction=[1.0, 0.0])
 
 # --------------------------------------- solve ---------------------------------------
 # reference measurement through the true model
 _, record = simulate(sim, source, true_indicator, sensors=sensors.nodes)
 observed = sensors.traces(record)
 
-# sensitivity of the misfit at the homogeneous starting model
+# design field guess
 indicator = cp.ones(sim.Nx_padded, dtype=sim.dtype)
 
 objective = sensors.objective(l2_misfit(observed))
@@ -109,13 +105,12 @@ else:
     cost, grads, traces, info = superposition_sensitivity(
         sim, source, indicator, sensors.nodes, objective, scale=SUPERPOSITION_SCALE
     )
-# past ~1e6 in float32 the gradient is mostly round-off; raise SUPERPOSITION_SCALE
 note = f"\t cancellation {info['cancellation']:.1e}" if info else ""
 cp.cuda.Stream.null.synchronize()
 elapsed = time.time() - tic
 print(f"{METHOD}: cost {cost:.4e}\t {N:d} steps: {elapsed:.2f}s{note}")
 
-# chain rule from the two material fields back onto the indicator
+# chain rule
 d_mass, d_stiff = sim.parametrization_jacobian(indicator)
 gradient = (d_mass * grads["mass"] + d_stiff * grads["stiff"]).get()
 

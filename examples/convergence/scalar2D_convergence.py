@@ -15,28 +15,28 @@ from cuwave.wave import grid_coords, simulate, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # implementation
-DIM = 2  # fixed
-PRECISION = "float64"  # float32 floors the relative error near 1e-7
+DIM = 2
+PRECISION = "float64"
 THREADS = (4, 128)
 
 # discretization
 SPACE_ORDERS = (2, 4, 6, 8)
-LEVELS = (32, 48, 64, 96, 128, 192, 256, 384, 512)  # cells per axis, log-spaced
-REFERENCE = 1536  # cells per axis: 3x the finest level, and a multiple of every one
-REFERENCE_SAFETY = 0.25  # the reference refines in time as well as in space
+LEVELS = (32, 48, 64, 96, 128, 192, 256, 384, 512)  # cells per axis
+REFERENCE = 1536  # cells per axis (multiple of every entry in LEVELS)
+REFERENCE_SAFETY = 0.25
 REFERENCE_ORDER = 12
-SAFETY = 0.99  # fraction of the stable time step, which every run takes in full
+SAFETY = 0.99
 
 # physics
 LENGTH = 1.0
 WAVESPEED = 1.0
 DENSITY = 1.0
-T = 4.0  # four traversals, so the wave has reflected off every wall
+T = 4.0
 
 # source
 AMPLITUDE = 1.0
 CYCLES = 3
-FREQUENCY = 4.0  # 8 points per wavelength on the coarsest level, 128 on the finest
+FREQUENCY = 4.0
 
 # geometry
 HETEROGENEOUS = False
@@ -44,7 +44,7 @@ RADIUS = 0.15
 GAMMA_HOLE = 1e-3
 
 # postprocessing
-COLORS = ("k", "b", "g", "r")  # one per entry of SPACE_ORDERS
+COLORS = ("k", "b", "g", "r")
 
 # --------------------------------------- setup ---------------------------------------
 if any(REFERENCE % n_el for n_el in LEVELS):
@@ -52,7 +52,7 @@ if any(REFERENCE % n_el for n_el in LEVELS):
 if len(COLORS) < len(SPACE_ORDERS):
     raise ValueError(f"{len(COLORS)} colors for {len(SPACE_ORDERS)} space orders")
 
-interior = (slice(1, -1),) * DIM  # the returned field still carries its ghost ring
+interior = (slice(1, -1),) * DIM  # remove ghost cells
 
 print(
     f"{WAVESPEED / (FREQUENCY * LENGTH / min(LEVELS)):.0f} points per wavelength "
@@ -65,11 +65,6 @@ def solve(
     space_order: int, n_el: int, dt_stable: float
 ) -> tuple[cpt.NDArray, float, int]:
     """Solve to time `T` on `n_el` cells per axis, at the largest dt below `dt_stable`.
-
-    Args:
-        space_order: finite difference order of the run.
-        n_el: cells per axis, so the grid holds `n_el + 3` nodes including ghosts.
-        dt_stable: upper bound on the timestep, which `T` is then divided into.
 
     Returns:
         (u, elapsed, N): the interior nodes at `T` shaped (n_el + 1,) * DIM, the
@@ -97,7 +92,6 @@ def solve(
         coords = grid_coords(Nx, dx, dtype=sim.dtype)
         indicator[circle(coords, (0.5 * LENGTH,) * DIM, RADIUS)] = GAMMA_HOLE
 
-    # the burst ends far short of T, so the final field is smooth
     signal = sineburst(np.arange(N) * dt, AMPLITUDE, FREQUENCY, CYCLES)
     source = point_source(sim, [(0.0, 0.5 * LENGTH)], signal)
 
@@ -106,7 +100,6 @@ def solve(
     u = simulate(sim, source, indicator)
     cp.cuda.Stream.null.synchronize()
     toc = time.time()
-    # copied off the view simulate returns, which pins its whole two-field buffer
     return u[interior].copy(), toc - tic, N
 
 
@@ -123,7 +116,7 @@ print(
 # --------------------------------------- sweep ---------------------------------------
 results = {}
 for space_order in SPACE_ORDERS:
-    solve(space_order, min(LEVELS), T)  # this order's nvcc compile, outside the timings
+    solve(space_order, min(LEVELS), T)  # keep nvcc compile outside timings
     dofs, errors, timings = [], [], []
     for n_el in LEVELS:
         dt_stable = SAFETY * stable_dt((LENGTH / n_el,) * DIM, WAVESPEED, space_order)
@@ -155,7 +148,6 @@ plt.show()
 
 levels = np.array(LEVELS, dtype=float)
 for space_order, (_, errors, _) in results.items():
-    # pairwise, not one fitted slope, so a curve that floors still shows its rate
     errors = np.array(errors)
     rates = np.log(errors[:-1] / errors[1:]) / np.log(levels[1:] / levels[:-1])
     print(

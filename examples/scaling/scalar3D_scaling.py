@@ -11,7 +11,7 @@ from cuwave.wave import Source, simulate
 
 # -------------------------------------- settings -------------------------------------
 # implementation
-DIM = 3  # fixed
+DIM = 3
 PRECISION = "float32"
 THREADS = (1, 16, 32)
 
@@ -22,7 +22,7 @@ DENSITY = 1
 AMPLITUDE = 1e8
 CYCLES = 5
 
-RESOLUTIONS = np.logspace(0.7, 2.867, 40).astype(np.int32)  # for laptop (RTX PRO 500)
+RESOLUTIONS = np.logspace(0.7, 2.867, 40).astype(np.int32)  # laptop (RTX PRO 500)
 RESOLUTIONS = np.insert(RESOLUTIONS, 1, RESOLUTIONS[0])
 
 mempool = cp.get_default_memory_pool()
@@ -32,7 +32,7 @@ timings = []
 dofs = []
 memory = []
 for res in RESOLUTIONS:
-    # --------------------------------------- setup ---------------------------------------
+# --------------------------------------- setup ---------------------------------------
     Nx = (res,) * DIM
     dx = tuple(LENGTH / (n - 3) for n in Nx)
     dt = 0.95 * min(dx) / WAVESPEED / math.sqrt(DIM)
@@ -51,7 +51,7 @@ for res in RESOLUTIONS:
     )
     indicator = cp.ones(sim.Nx_padded, dtype=sim.dtype)
 
-    # --------------------------------------- helper --------------------------------------
+# --------------------------------------- helper --------------------------------------
     t_np = np.linspace(0, (N - 1) * dt, N)
     signal_np = sineburst(t_np, AMPLITUDE, frequency, CYCLES) / np.prod(dx)
     signal = cp.asarray(signal_np[:, None], dtype=sim.dtype)
@@ -59,7 +59,7 @@ for res in RESOLUTIONS:
     source_pos = cp.array([[1] for n in Nx], dtype=cp.int32)
     source = Source(source_pos, signal)
 
-    # --------------------------------------- solve ---------------------------------------
+# --------------------------------------- solve ---------------------------------------
     cp.cuda.Stream.null.synchronize()
     tic = time.time()
     u = simulate(sim, source, indicator, record_every=None)
@@ -73,7 +73,6 @@ for res in RESOLUTIONS:
     del u, sim, source, indicator
     mempool.free_all_blocks()
 
-    # print(res, dofs[-1])
 
 # ----------------------------------- postprocessing ----------------------------------
 dofs_per_s = np.array(dofs) / np.array(timings)

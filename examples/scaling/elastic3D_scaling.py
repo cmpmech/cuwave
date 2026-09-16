@@ -11,7 +11,7 @@ from cuwave.wave import simulate, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # implementation
-DIM = 3  # fixed
+DIM = 3
 PRECISION = "float32"
 SPACE_ORDER = 2
 THREADS = (2, 8, 32)
@@ -24,7 +24,7 @@ DENSITY = 1
 AMPLITUDE = 1e4
 CYCLES = 5
 
-RESOLUTIONS = np.logspace(0.7, 2.59, 40).astype(np.int32)  # for laptop (RTX PRO 500)
+RESOLUTIONS = np.logspace(0.7, 2.59, 40).astype(np.int32)  # laptop (RTX PRO 500)
 RESOLUTIONS = np.insert(RESOLUTIONS, 1, RESOLUTIONS[0])
 
 mempool = cp.get_default_memory_pool()
@@ -34,7 +34,7 @@ timings = []
 dofs = []
 memory = []
 for res in RESOLUTIONS:
-    # --------------------------------------- setup ---------------------------------------
+# --------------------------------------- setup ---------------------------------------
     Nx = (res,) * DIM
     dx = tuple(LENGTH / (n - 3) for n in Nx)
     dt = 0.95 * stable_dt(dx, WAVESPEED_P, SPACE_ORDER)
@@ -55,23 +55,22 @@ for res in RESOLUTIONS:
     )
     indicator = cp.ones(sim.Nx_padded, dtype=sim.dtype)
 
-    # --------------------------------------- helper --------------------------------------
+# --------------------------------------- helper --------------------------------------
     t_np = np.linspace(0, (N - 1) * dt, N)
     signal = sineburst(t_np, AMPLITUDE, frequency, CYCLES)
 
-    # a point force along the last axis, so both wave types are excited
     centre = [0.5 * LENGTH] * DIM
     direction = [0.0] * (DIM - 1) + [1.0]
     source = point_source(sim, [centre], signal, direction=direction)
 
-    # --------------------------------------- solve ---------------------------------------
+# --------------------------------------- solve ---------------------------------------
     cp.cuda.Stream.null.synchronize()
     tic = time.time()
     u = simulate(sim, source, indicator, record_every=None)
     cp.cuda.Stream.null.synchronize()
     toc = time.time()
 
-    dofs.append(sim.ncomp * np.prod(Nx))  # one displacement component per axis
+    dofs.append(sim.ncomp * np.prod(Nx))
     timings.append((toc - tic) / N)
     memory.append(mempool.used_bytes())
 

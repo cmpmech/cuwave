@@ -14,12 +14,12 @@ from cuwave.wave import Source, simulate, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # discretization
-DIM = 2  # fixed
+DIM = 2
 PRECISION = "float32"
 THREADS = (4, 128)
 SPACE_ORDER = 4
 RESOLUTION = 500
-SAFETY = 0.99  # fraction of the stable time step
+SAFETY = 0.99  # fraction of stable time step
 
 # physics
 LENGTH = 1

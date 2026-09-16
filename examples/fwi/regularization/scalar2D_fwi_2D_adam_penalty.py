@@ -27,7 +27,7 @@ from cuwave.wave import grid_coords, stable_dt
 # -------------------------------------- settings -------------------------------------
 # discretization
 SPACE_ORDER = 4
-SPACE_ORDER_OBS = 8  # the measurement is simulated more accurately than it is inverted
+SPACE_ORDER_OBS = 8  # measurement is simulated more accurately than it is inverted
 PRECISION = "float32"
 RESOLUTION = (256, 256)
 SAFETY = 0.99
@@ -69,7 +69,7 @@ Nx = RESOLUTION
 dx = tuple(LENGTHS[d] / (Nx[d] - 3) for d in range(len(Nx)))
 Lx, Ly = LENGTHS
 
-# both grids end exactly on T, so the record resamples onto dt without extrapolating
+# both grids end exactly on T, so the record resamples without extrapolating
 N = math.ceil(T / (SAFETY * stable_dt(dx, WAVESPEED, SPACE_ORDER))) + 1
 N_obs = math.ceil(T / (SAFETY * stable_dt(dx, WAVESPEED, SPACE_ORDER_OBS))) + 1
 dt, dt_obs = T / (N - 1), T / (N_obs - 1)
@@ -133,18 +133,18 @@ print(
 )
 
 # ------------------------------------ optimization -----------------------------------
-# the penalty covers the pad too, harmlessly: a flat field minimizes both
+# the penalty covers the pad too, harmlessly
 gamma = cp.ones(sim.Nx_padded, dtype=sim.dtype)
 if PENALTY == "tv":
     penalty = TotalVariation(WEIGHT, eps=TV_EPS)
 elif PENALTY == "tikhonov":
-    # the prior is the start model, the sound background: order 0 pulls back towards it
+    # order 0 pulls back towards the start model
     penalty = Tikhonov(WEIGHT, order=TIKHONOV_ORDER, x_ref=gamma.copy())
 else:
     raise ValueError(f"PENALTY is 'tv' or 'tikhonov', not {PENALTY!r}")
 
 optimizer = Adam(lr=LR)
-misfits, penalties = [], []  # the two terms of the objective, kept apart
+misfits, penalties = [], []  # the two terms of the objective
 
 cp.cuda.Stream.null.synchronize()
 tic = time.time()

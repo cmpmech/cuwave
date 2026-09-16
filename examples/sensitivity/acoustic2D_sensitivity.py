@@ -14,12 +14,12 @@ from cuwave.wave import Source, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # discretization
-SPACE_ORDER = 2  # the adjoint is the exact transpose only at order 2
-PRECISION = "float32"  # "float32" | "float64"
-METHOD = "standard"  # "standard" | "superposition", the memory-efficient alternative
-SUPERPOSITION_SCALE = 1e4  # aim for a cancellation near 1e4 in float32
+SPACE_ORDER = 2  # adjoint is exact at order 2
+PRECISION = "float32"
+METHOD = "standard"  # "standard" or "superposition" (memory-efficient alternative)
+SUPERPOSITION_SCALE = 1e4
 RESOLUTION = (192, 192)
-SAFETY = 0.7  # fraction of the stable time step
+SAFETY = 0.7
 
 # physics
 # air, solid
@@ -69,7 +69,7 @@ sim = AcousticWave(
     kappa2=BULK_MODULUS2,
 )
 
-# a design FIELD of zeros, not the number 0: the plot below is a sensitivity per node
+# design field guess
 indicator = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
 
 # --------------------------------------- source --------------------------------------
@@ -93,7 +93,6 @@ sensors = cp.stack([box_i.ravel(), box_j.ravel()]).astype(cp.int32)
 # --------------------------------------- solve ---------------------------------------
 def box_energy(sim: AcousticWave) -> Callable:
     """Objective factory: J = 1/2 int_box int_t p^2, the energy leaking into the box."""
-    # the prod(dx) dt that makes the sum an integral belongs here, not the module
     scale = float(np.prod(sim.dx)) * sim.dt
 
     def objective(traces):
@@ -111,7 +110,6 @@ else:
     cost, grads, traces, info = superposition_sensitivity(
         sim, source, indicator, sensors, objective, scale=SUPERPOSITION_SCALE
     )
-# past ~1e6 in float32 the gradient is mostly round-off; raise SUPERPOSITION_SCALE
 note = f"\t cancellation {info['cancellation']:.1e}" if info else ""
 cp.cuda.Stream.null.synchronize()
 elapsed = time.time() - tic
@@ -121,7 +119,7 @@ print(
     f" {N:d} steps: {elapsed:.2f}s{note}"
 )
 
-# chain rule: linear in 1 / kappa and 1 / rho, so the Jacobian is a pair of constants
+# chain rule
 d_mass, d_stiff = sim.parametrization_jacobian(indicator)
 gradient = (d_mass * grads["mass"] + d_stiff * grads["stiff"]).get()
 

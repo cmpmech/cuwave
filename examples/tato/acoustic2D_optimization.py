@@ -6,7 +6,6 @@ import cupy.typing as cpt
 import matplotlib.pyplot as plt
 import numpy as np
 
-from cuwave.evals import non_discreteness
 from cuwave.geometry import box, nodes
 from cuwave.optimization import Adam
 from cuwave.postprocessing import markers, outline, show
@@ -58,7 +57,7 @@ ETA = 0.5
 BETA0, BETA_GROWTH, BETA_STEP, BETA_MAX = 1.0, 2.0, 8, 64.0
 
 # evaluation
-THRESHOLD = 0.5  # the projection maps onto [0, 1], so its midpoint is the cut
+THRESHOLD = 0.5
 
 # --------------------------------------- setup ---------------------------------------
 Nx = RESOLUTION
@@ -74,7 +73,6 @@ assert FREQUENCY <= f_max, (
     f"lower FREQUENCY or raise RESOLUTION"
 )
 
-# the design enters through the indicator, not the constructor, so one sim serves all
 sim = AcousticWave(
     Nx,
     dx,
@@ -150,16 +148,11 @@ final_cost, wavefield = response(sim, source, final, sensors, objective)
 history.append(grey_cost)
 cp.cuda.Stream.null.synchronize()
 
-# the thresholded design is the one that can be built, so it is the one that is reported
 print(
-    f"\nnoise {history[0]:.4e} -> {grey_cost:.4e} grey -> {final_cost:.4e} thresholded  "
-    f"({10 * math.log10(final_cost / history[0]):+.2f} dB)"
+    f"\nno design {history[0]:.4e}",
+    f"\ngray design {grey_cost:.4e}",
+    f"\nbinary design {final_cost:.4e} with {10 * math.log10(final_cost / history[0]):+.2f} dB",
 )
-print(
-    f"\tdiscretization price {10 * math.log10(final_cost / grey_cost):+.2f} dB  "
-    f"at non-discreteness {non_discreteness(design, region):.3f}"
-)
-print(f"\tsolid fraction {float(design[region].sum()) / int(region.sum()):.3f}")
 
 # ----------------------------------- postprocessing ----------------------------------
 interior = interior_slice(sim)

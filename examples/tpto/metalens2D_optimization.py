@@ -8,11 +8,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from cuwave.boundary import pad_for_sponge, sponge
-from cuwave.evals import non_discreteness
 from cuwave.geometry import box
 from cuwave.maxwell import MagneticWave
 from cuwave.optimization import Adam
-from cuwave.postprocessing import markers, outline, show
+from cuwave.postprocessing import markers, show
 from cuwave.regularization import DensityFilter, Projection
 from cuwave.sensitivity import reconstruction_sensitivity
 from cuwave.signals import ricker
@@ -24,34 +23,34 @@ from cuwave.utils import (
     response_gradient,
     threshold,
 )
-from cuwave.wave import grid_coords, stable_dt
+from cuwave.wave import grid_coords, simulate, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # discretization
-SPACE_ORDER = 2  # the design enters the stiffness, whose transpose is exact only here
+SPACE_ORDER = 2  # design enters the stiffness, whose transpose is exact only here
 PRECISION = "float32"
-POINTS_PER_WAVELENGTH = 20  # in silicon, the short wavelength of the two
+POINTS_PER_WAVELENGTH = 20
 SAFETY = 0.95
 
 # physics, nondimensional in the design wavelength: lambda = c = eps_air = mu = 1
-INDEX_SI = 3.48  # dispersion and loss are not modelled, so one index serves every band
+INDEX_SI = 3.48
 PERMITTIVITY1, PERMITTIVITY2 = 1.0, INDEX_SI**2
 PERMEABILITY = 1.0
-FREQUENCIES = (1.0,)  # (0.917, 1.0, 1.1) is the broadband lens of the paper's case 4
+FREQUENCY = 2.0
 AMPLITUDE = 1.0
-T = 40.0
+T = 10.0
 
-# geometry (design wavelengths), from table 1 of Christiansen & Sigmund 2021 over 550 nm
+# geometry (design wavelengths), from table 1 of Christiansen & Sigmund 2021
 WIDTH, HEIGHT = 8.727, 3.302
-SUBSTRATE = 0.227  # silicon the lens stands on, carried on through the lower layer
+SUBSTRATE = 0.227
 DESIGN_WIDTH, DESIGN_HEIGHT = 5.455, 0.455
-FOCAL_DISTANCE = 1.321  # above the design, giving a numerical aperture of 0.9
-ENVELOPE = 2.727  # gaussian width of the incident beam
-SOURCE_DEPTH = 0.15  # below the substrate top, so the beam enters through the silicon
+FOCAL_DISTANCE = 1.321  # numerical aperture 0.9
+ENVELOPE = 2.727
+SOURCE_DEPTH = 0.15
 
 # boundary
-THICKNESS = 2.0  # sponge thickness in design wavelengths
-SPONGE_DECAY = 4.3  # decay per wavelength travelled, so the layer follows the timestep
+THICKNESS = 2.0
+SPONGE_DECAY = 4.3  # decay per wavelength travelled
 
 # optimization
 ITERATIONS = 60
@@ -59,12 +58,15 @@ LEARNING_RATE = 0.05
 DESIGN_START = 0.5  # range [0, 1]
 
 # regularization
-RMIN = 0.05  # filter radius in design wavelengths
+RMIN = 0.1
 ETA = 0.5
 BETA0, BETA_GROWTH, BETA_STEP, BETA_MAX = 1.0, 2.0, 10, 64.0
 
 # evaluation
-THRESHOLD = 0.5  # the projection maps onto [0, 1], so its midpoint is the cut
+THRESHOLD = 0.5
+
+# postprocessing
+T_SNAPSHOT = 3.5
 
 # --------------------------------------- setup ---------------------------------------
 dx = (1.0 / (INDEX_SI * POINTS_PER_WAVELENGTH),) * 2
@@ -95,7 +97,6 @@ print(
 )
 
 coords = grid_coords(Nx, dx, dtype=sim.dtype)
-# the substrate runs on through the lower layer, so the beam meets no step entering it
 substrate = coords[1] <= origin[1] + SUBSTRATE
 design_center = (0.5 * WIDTH, SUBSTRATE + 0.5 * DESIGN_HEIGHT)
 region = box(coords, shift(design_center), (DESIGN_WIDTH, DESIGN_HEIGHT))
@@ -106,12 +107,13 @@ print(f"{int(region.sum())} design nodes, focus {FOCAL_DISTANCE:.2f} wavelengths
 t = np.linspace(0, (N - 1) * dt, N)
 line = np.linspace(0.0, WIDTH, resolution[0] - 2)
 envelope = np.exp(-(((line - 0.5 * WIDTH) / ENVELOPE) ** 2))
-# scaled by the spacing along the line, so the sheet current does not move with the grid
-signal = np.outer(ricker(t, AMPLITUDE * dx[0], min(FREQUENCIES)), envelope)
+# scaled by the spacing along the line
+# signal = np.outer(sineburst(t, AMPLITUDE * dx[0], FREQUENCY, CYCLES), envelope)
+signal = np.outer(ricker(t, AMPLITUDE * dx[0], FREQUENCY), envelope)
 source = point_source(sim, [shift((x, SUBSTRATE - SOURCE_DEPTH)) for x in line], signal)
 
 receivers = Sensors(sim, [focus])
-objective = receivers.objective(intensity(sim, FREQUENCIES))
+objective = receivers.objective(intensity(sim, FREQUENCY))
 
 # ------------------------------------ optimization -----------------------------------
 density_filter = DensityFilter(RMIN / min(dx), sim.Nx_padded, dtype=sim.dtype)
@@ -137,7 +139,6 @@ variables = cp.where(region, DESIGN_START, 0.0).astype(sim.dtype)
 optimizer = Adam(lr=LEARNING_RATE)
 history = []
 
-# the empty lens is what the focal gain is quoted against, so the units drop out
 bare, _ = response(sim, source, substrate.astype(sim.dtype), receivers.nodes, objective)
 print(f"bare substrate focuses {bare:.4e}")
 
@@ -172,21 +173,17 @@ final = cp.maximum(threshold(design, THRESHOLD, dtype=sim.dtype), substrate)
 
 cp.cuda.Stream.null.synchronize()
 grey_cost, _ = response(sim, source, design, receivers.nodes, objective)
-final_cost, wavefield = response(sim, source, final, receivers.nodes, objective)
+final_cost, _ = response(sim, source, final, receivers.nodes, objective)
 cp.cuda.Stream.null.synchronize()
 
-# the thresholded design is the one that can be built, so it is the one that is reported
 print(
-    f"\nfocus {bare:.4e} bare -> {grey_cost:.4e} grey -> {final_cost:.4e} thresholded  "
-    f"({10 * math.log10(final_cost / bare):+.2f} dB)"
+    f"\nno design {bare:.4e}",
+    f"\ngray design {grey_cost:.4e}",
+    f"\nbinary design {final_cost:.4e} with {10 * math.log10(final_cost / bare):+.2f} dB",
 )
-print(
-    f"\tdiscretization price {10 * math.log10(final_cost / grey_cost):+.2f} dB  "
-    f"at non-discreteness {non_discreteness(design, region):.3f}"
-)
-print(f"\tsilicon fraction {float(design[region].sum()) / int(region.sum()):.3f}")
 
 # ----------------------------------- postprocessing ----------------------------------
+wavefield = simulate(replace(sim, N=math.ceil(T_SNAPSHOT / dt)), source, final)
 scale = 0.5 * float(cp.max(cp.abs(wavefield[domain]))) + 1e-30
 low = (region.nonzero()[0].min().get(), region.nonzero()[1].min().get())
 high = (region.nonzero()[0].max().get(), region.nonzero()[1].max().get())
@@ -194,7 +191,7 @@ high = (region.nonzero()[0].max().get(), region.nonzero()[1].max().get())
 fig, axes = plt.subplots(1, 2, figsize=(7, 3))
 axes[0].semilogy(history, "k")
 show(axes[1], field=wavefield[domain], indicator=final[domain], scale=scale)
-outline(axes[1], low, high, origin=pad + 1, color="k")
+# outline(axes[1], low, high, origin=pad + 1, color="w")
 markers(axes[1], focus, dx=dx, origin=pad + 1, nodes=6, color="k")
 axes[1].set_aspect("equal")
 axes[1].axis("off")

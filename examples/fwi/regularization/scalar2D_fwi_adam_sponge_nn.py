@@ -30,9 +30,9 @@ from cuwave.wave import grid_coords, stable_dt
 # -------------------------------------- settings -------------------------------------
 # discretization
 SPACE_ORDER = 4
-SPACE_ORDER_OBS = 8  # the measurement is simulated more accurately than it is inverted
+SPACE_ORDER_OBS = 8  # measurement is simulated more accurately than it is inverted
 PRECISION = "float32"
-RESOLUTION = (256, 256)  # of the region of interest, the sponge added outside it
+RESOLUTION = (256, 256)  # of the region of interest, sponge added outside it
 SAFETY = 0.9
 GAMMA_MIN = 1e-3
 
@@ -45,10 +45,10 @@ NUM_SOURCES, NUM_SENSORS = 4, 32
 ARRAY_SPAN = (0.1, 0.9)  # absolute values
 # geometry
 LENGTHS = (1.0, 1.0)
-# boundary, opening the left and right edges while the transducer edge stays reflecting
+# boundary
 SPONGE_FACES = (0, 1)
 THICKNESS = 2.0  # sponge thickness in dominant wavelengths
-BETA = 0.05  # peak sponge damping, the flat optimum from two wavelengths up
+BETA = 0.05  # peak sponge damping
 # defects
 NUM_VOIDS = 4
 VOID_MAX_RADIUS = 0.05
@@ -59,7 +59,7 @@ VOID_YRANGE, VOID_X = (0.1, 0.5), 0.5
 # neural network
 CHANNELS = [32, 32, 16, 8, 1]
 KERNEL = 5
-ACTIVATION = nn.Tanh  # over the GELU default, which stalls in a bad basin more often
+ACTIVATION = nn.Tanh  # over the GELU default, which stalls more often
 SEED = 0  # result should be independent of SEED -> check over multiple seeds
 LEARNABLE_INPUT = False
 OUTPUT_BIAS = 3.0
@@ -80,7 +80,7 @@ Lx, Ly = LENGTHS
 Nx, pad, origin, region = pad_for_sponge(
     RESOLUTION, dx, THICKNESS * WAVESPEED / FREQUENCY, SPONGE_FACES
 )
-x0, y0 = origin  # where the region of interest starts, the sponge sitting before it
+x0, y0 = origin  # where the region of interest starts
 
 N = math.ceil(T / (SAFETY * stable_dt(dx, WAVESPEED, SPACE_ORDER))) + 1
 N_obs = math.ceil(T / (SAFETY * stable_dt(dx, WAVESPEED, SPACE_ORDER_OBS))) + 1
@@ -153,7 +153,7 @@ print(
 )
 
 # ------------------------------------ optimization -----------------------------------
-# the design block is the region plus its ghost ring: RESOLUTION nodes per axis
+# the design block is the region plus its ghost ring
 block = tuple(slice(s.start - 1, s.stop + 1) for s in region)
 generator = Generator(
     CHANNELS,
@@ -168,7 +168,7 @@ generator = Generator(
 to_cupy = lambda field: cp.asarray(field.detach())[0, 0]
 chain = lambda gradient: torch.as_tensor((1.0 - GAMMA_MIN) * gradient)[None, None]
 
-# the sponge is boundary and not design, so those nodes keep the background
+# sponge is boundary and not design, so those nodes keep the background
 gamma = cp.ones(sim.Nx_padded, dtype=sim.dtype)
 optimizer = torch.optim.Adam(generator.parameters(), lr=LR)
 history = []
@@ -181,7 +181,7 @@ for iteration in range(ITERS):
     cost, gradient = misfit_gradient(
         sim, sources, gamma, sensors, observed, adjoint=reconstruction_sensitivity
     )
-    # the step is taken in the weights: gradient is chained through the network
+    # the step is taken in the weights, so the gradient chains through the network
     optimizer.zero_grad()
     field.backward(chain(gradient[block]))
     optimizer.step()

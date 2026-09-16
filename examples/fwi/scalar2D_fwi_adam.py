@@ -26,7 +26,7 @@ from cuwave.wave import grid_coords, stable_dt
 # -------------------------------------- settings -------------------------------------
 # discretization
 SPACE_ORDER = 4
-SPACE_ORDER_OBS = 8  # the measurement is simulated more accurately than it is inverted
+SPACE_ORDER_OBS = 8  # measurement is simulated more accurately than it is inverted
 PRECISION = "float32"
 RESOLUTION = (256, 256)
 SAFETY = 0.9

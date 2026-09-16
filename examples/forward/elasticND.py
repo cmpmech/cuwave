@@ -12,11 +12,10 @@ from cuwave.wave import simulate, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # discretization
-DIM = 2  # 1, 2 or 3
+DIM = 2
 PRECISION = "float32"
-SPACE_ORDER = 4  # any even order; higher costs little since the stencil is per axis
-SAFETY = 0.9  # fraction of the stable time step
-
+SPACE_ORDER = 4
+SAFETY = 0.9  # fraction of stable time step
 # per dimension
 THREADS = {1: (128,), 2: (8, 32), 3: (2, 8, 32)}[DIM]
 RESOLUTION = {1: 2000, 2: 400, 3: 140}[DIM]
@@ -27,7 +26,7 @@ LENGTH = 1
 WAVESPEED_P = 1.0
 WAVESPEED_S = 0.5
 DENSITY = 1
-PLANE = "strain"  # "strain" or "stress", 2D only
+PLANE = "strain"  # "strain" or "stress" (for 2D)
 T = 0.6
 
 # source
@@ -61,7 +60,7 @@ print(f"{WAVESPEED_S / (FREQUENCY * max(dx)):.0f} points per shear wavelength")
 t_np = np.linspace(0, (N - 1) * dt, N)
 signal = sineburst(t_np, AMPLITUDE, FREQUENCY, CYCLES)
 
-# a point force along the last axis, so both wave types are excited away from it
+# point force along the last axis, so both wave types are excited away from it
 centre = [0.5 * LENGTH] * DIM
 direction = [0.0] * (DIM - 1) + [1.0]
 source = point_source(sim, [centre], signal, direction=direction)
@@ -75,9 +74,9 @@ toc = time.time()
 print(f"elapsed time {toc - tic:.2f} s  ({(toc - tic) / N * 1e3:.4f} ms/step)")
 
 # ----------------------------------- postprocessing ----------------------------------
-u_np = u[-1].get()  # the component the force acts along
+u_np = u[-1].get()  # component the force acts along
 if DIM == 3:
-    u_np = u_np[Nx[0] // 2]  # the source plane, cutting the sphere at its equator
+    u_np = u_np[Nx[0] // 2]  # source plane cuts the sphere at its equator
 scale = float(np.max(np.abs(u_np)))
 
 if DIM == 1:
