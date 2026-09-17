@@ -30,9 +30,6 @@ python examples/fwi/scalar2D_fwi_adam.py  # drivers are run directly
 - Installing torch here must use the cu128 index
   (`pip install torch --index-url https://download.pytorch.org/whl/cu128`); a plain
   `pip install torch` pulls CUDA 13 wheels that break `cupy-cuda12x` at first kernel launch.
-- `tests/`, `docs/` and `.claude/skills/` are tracked and ship with the repo; only
-  `.claude/settings.local.json` is ignored, alongside the local-only `data/`,
-  `experiments/` and `examples/docs/`.
 
 ## Style is defined by two skills — invoke them
 
@@ -137,16 +134,11 @@ made available to the backward pass:
 | `reconstruction_sensitivity` | 7 grids and `N + 2` copies of the strip | supported, and what the strip pays for | the same transpose, wherever the strip shields it |
 | `superposition_sensitivity` | 5 grids, independent of `N` | rejected (`require_lossless`) | consistent, not exact; `scale` (k) trades a k² bias against round-off |
 
-`reconstruction_sensitivity` marches the forward field backwards instead of storing it,
-recording only the nodes a damping layer makes irreversible — the strip, sized by
-`Simulation.reach`. It reports `info["strip"]` and `info["drift"]`, and is what an **open**
-domain reaches for once the history no longer fits.
-
-`superposition_sensitivity` reconstructs the forward field by time reversal and reads the
-cross term off the diagonal of a bilinear form, which is why it **requires a lossless
-operator** and rejects `damping` outright. It reports `info["cancellation"]`; when that
-exceeds `CANCELLATION_LIMIT` for the precision the gradient is mostly round-off and the
-caller must raise `scale`.
+Both reconstructing variants rebuild the forward field rather than storing it, which is why
+`superposition_sensitivity` needs a **lossless operator** and rejects `damping` outright.
+Each reports its own health: `info["drift"]` and `info["strip"]` for the strip variant,
+`info["cancellation"]` for the superposition one, which past `CANCELLATION_LIMIT` means the
+gradient is mostly round-off and the caller must raise `scale`. See `docs/sensitivity.md`.
 
 All three return gradients with respect to `(mass, stiff)` over the padded grid. Converting
 to a gradient with respect to the design indicator is the caller's chain rule via
@@ -159,29 +151,23 @@ to `source.signal` rather than the material, in four grids and no history.
 - `optimization.py` — `Adam` and `Lbfgs` (two-loop recursion plus Armijo `search`, which
   takes a forward-only `f(design) -> cost` and an optional `project`). Plain CuPy arrays, no
   framework.
-- `regularization.py` — every `Regularization` is a differentiable map (`__call__`) that
-  carries its own adjoint (`grad`), so filters/projections/penalties compose the way the
-  forward/adjoint pair does: chain `__call__` forward, chain `grad` backward. `set(**params)`
-  retunes a live instance so `continuation` schedules can sharpen a `Projection` between
-  iterations. **The driver is the only place the composition order exists** — each class
-  knows only its own adjoint.
+- `regularization.py` — every `Regularization` is a map (`__call__`) carrying its own
+  adjoint (`grad`), so they compose like the forward/adjoint pair. **The driver is the only
+  place the composition order exists**; each class knows only its own adjoint.
 - `nn.py` — torch `Generator` reparametrizing the design field (autograd handles its own
   gradient; only the field-to-cost step is hand-adjointed).
 - `utils.py` — the application glue: `distribute`/`point_source`/`shots`/`Sensors`
   (multilinear interpolation onto the grid and its transpose), `interior_slice`/`threshold`,
   the fwi pair `misfit`/`misfit_gradient` and the tato pair `response`/`response_gradient`,
   both routing the chain rule through the private `_reparametrize`. Objectives live here
-  too: `energy` (a time integral, tato) and `intensity` (a running DFT at chosen
-  frequencies, tpto). An objective sees the whole `(N, num_sensors)` record, which is why a
-  frequency-domain figure of merit needs no new machinery at all, and why one broadband run
-  scores every design wavelength.
+  too: `energy` (a time integral, tato) and `intensity` (a running DFT, tpto). An objective
+  sees the whole `(N, num_sensors)` record, so a spectral figure of merit needs no new
+  machinery.
 - `evals.py`, `geometry.py`, `signals.py` — scoring, region masks, source wavelets.
   For Maxwell use `ricker`, not `sineburst`: the curl-curl null space is driven by the
   divergence of the source, and only a wavelet with zero mean *and* zero first moment
   leaves no static blob behind.
-- `postprocessing.py` — the matplotlib helpers the field figures share: `field_axes`
-  builds a borderless axes the size of the grid, `show` draws a field and/or a design
-  over it, `markers` sizes a dot in grid nodes so it matches across figures.
+- `postprocessing.py` — the shared field-figure helpers, in node-index coordinates.
 
 ### Drivers (`examples/`)
 
@@ -210,4 +196,4 @@ the `docs/cuda_*.md` pages are the only ones that document arguments.
   gradients ~1e-20, whose square underflows Adam's second moment to zero and yields NaN.
 - **Every timing brackets `cp.cuda.Stream.null.synchronize()` on both sides** — launches are
   asynchronous, so a bare `time.time()` pair measures the launch, not the kernel.
-- `README.md` is Leon's; do not edit it unless explicitly asked.
+

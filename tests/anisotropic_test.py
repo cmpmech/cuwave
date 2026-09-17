@@ -112,6 +112,7 @@ def _finite_difference(cost_of, indicator, nodes, h=1e-6):
 
 
 # -------------------------------- element and operator -------------------------------
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class StencilTest(unittest.TestCase):
     def test_the_stencil_has_only_the_rigid_body_null_space(self):
         for ndim, dx in ((1, (0.7,)), (2, (0.7, 1.3)), (3, (0.7, 1.3, 0.9))):

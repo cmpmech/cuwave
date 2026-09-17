@@ -21,3 +21,4 @@ venv/
 data/
 experiments/
 examples/docs/
+examples/benchmarking/

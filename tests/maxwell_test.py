@@ -257,7 +257,8 @@ class TransmissionTest(unittest.TestCase):
 class GradientTest(unittest.TestCase):
     frequencies = (6.0, 10.0)
 
-    def _check(self, cls, space_order, adjoint=sensitivity, tolerance=1e-4):
+    def _check(self, cls, space_order, adjoint=None, tolerance=1e-4):
+        adjoint = sensitivity if adjoint is None else adjoint
         sim = _sim(cls, (48, 48), space_order=space_order)
         source, sensors, indicator = _problem(sim)
         objective = intensity(sim, self.frequencies)
@@ -458,7 +459,8 @@ class VectorGradientTest(unittest.TestCase):
         indicator = cp.asarray(rng.random(sim.Nx_padded), dtype=sim.dtype)
         return source, receivers, objective, indicator
 
-    def _check(self, Nx, space_order, adjoint=sensitivity, cls=None, tolerance=1e-4):
+    def _check(self, Nx, space_order, adjoint=None, cls=None, tolerance=1e-4):
+        adjoint = sensitivity if adjoint is None else adjoint
         sim = _vector(Nx, space_order=space_order, cls=cls)
         source, receivers, objective, indicator = self._problem(sim)
         rng = np.random.default_rng(7)

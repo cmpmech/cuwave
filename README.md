@@ -40,9 +40,12 @@ Possible applications include
 - see the [documentation](https://github.com/Leon-Herrmann/cuwave/blob/main/docs/Home.md) for how the code works (AI-assisted; verify with sources for critical details)
 - see [examples](https://github.com/Leon-Herrmann/cuwave/tree/main/examples) for how to apply the code
 
-**Development Note**
+## Development status
 
-**Scalar** & **acoustic wave** equations have been developed over the last 2 years and are thoroughly validated. **Elastic** & **electromagnetic wave** equations were developed with AI assistance (Claude) and have undergone less validation. The elastic wave equation is currently being validated against experimental results.
+**Scalar** & **acoustic wave** equations have been developed over the last 2 years and are thoroughly validated.
+
+> [!IMPORTANT]
+> **Elastic** & **electromagnetic wave** equations were developed with AI assistance (Claude) and have undergone less validation. The elastic wave equation is currently being validated against experimental results.
 
 ## Install
 Dependencies are kept **lightweight**. Only CuPy is required beyond standard Python library.
@@ -56,6 +59,12 @@ CuPy must be installed separately because the wheel depends on your CUDA toolkit
 all remaining dependencies are declared in `pyproject.toml`.
 
 PyTorch is optional for the regularization via neural optimization; see [pytorch](https://pytorch.org/get-started/locally/) for the installation. Otherwise it is not needed.
+
+> [!NOTE]
+> Match PyTorch's CUDA version to CuPy's, or the two runtimes clash at the first kernel launch. With `cupy-cuda12x`:
+> ```bash
+> pip install torch --index-url https://download.pytorch.org/whl/cu128
+> ```
 
 The tests under `tests/` are `unittest` classes, but `pytest` is the recommended runner:
 
@@ -75,4 +84,4 @@ For questions, bug reports, or collaboration inquiries, please don't hesitate to
 
 ## License
 
-MIT, see [LICENSE](https://github.com/Leon-Herrmann/cuwave/blob/main/LICENSE).
+MIT; see [LICENSE](https://github.com/Leon-Herrmann/cuwave/blob/main/LICENSE).

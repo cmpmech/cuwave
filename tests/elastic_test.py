@@ -169,6 +169,7 @@ def _divergence_error(order, n):
 
 
 # -------------------------------- stencil and operator -------------------------------
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class StencilTest(unittest.TestCase):
     def test_the_weights_are_the_staggered_taylor_ones(self):
         np.testing.assert_allclose(staggered_weights(1), [1.0])
