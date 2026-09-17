@@ -1,4 +1,4 @@
-"""Both adjoint variants: `sensitivity` against finite differences of the cost, and
+"""The adjoint variants: `sensitivity` against finite differences of the cost, and
 `superposition_sensitivity` against `sensitivity`.
 
 The reference cost goes through `simulate`, so no check reuses the adjoint module's own
@@ -73,7 +73,7 @@ if HAS_CUDA:
 NC = 30  # logical grid points per axis (ghosts included)
 NSTEPS = 120  # long enough for the wave to reach the sensors and reflect
 
-# air / solid, as in examples/sensitivity/acoustic_sensitivity_2D.py
+# air / solid, as in examples/sensitivity/acoustic2D_sensitivity.py
 RHO1, RHO2 = 1.204, 2643.0
 KAPPA1, KAPPA2 = 1.419e5, 6.87e8
 

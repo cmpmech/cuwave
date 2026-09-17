@@ -1,7 +1,10 @@
 """Regularization and design-map penalties for gradient-based optimization.
 
 A `Regularization` is both a differentiable map (`__call__`) and its own adjoint
-(`grad`), so filters, projections, and penalties compose the same way the simulation's forward/adjoint pair does: chain the calls forward, chain `grad` backward. `set` lets a `continuation` schedule mutate a live instance's parameters between iterations without rebuilding the pipeline.
+(`grad`), so filters, projections, and penalties compose the same way the simulation's
+forward/adjoint pair does: chain the calls forward, chain `grad` backward. `set` lets a
+`continuation` schedule mutate a live instance's parameters between iterations without
+rebuilding the pipeline.
 """
 
 from __future__ import annotations

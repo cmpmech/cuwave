@@ -5,7 +5,7 @@
   <img src=".assets/readme-light.png" width="100%">
 </picture>
 
-**CuWave** is a single GPU-accelerated differentiable finite difference wave propagation code.
+**CuWave** is a single-GPU, differentiable finite difference wave propagation code.
 Possible applications include
 
 <table width="100%">
@@ -18,7 +18,7 @@ Possible applications include
 </tr>
 <tr>
 <td valign="middle"><a href="https://doi.org/10.1007/s00158-025-04237-y"><strong>transient acoustic topology optimization</strong></a></td>
-<td width="60%" align="right" valign="middle"><picture>
+<td width="60%" align="center" valign="middle"><picture>
 <source media="(prefers-color-scheme: dark)" srcset=".assets/tato-dark.png">
 <img width="46.512%" src=".assets/tato-light.png" alt="transient acoustic topology optimization">
 </picture></td>
@@ -71,7 +71,7 @@ Dependencies are kept **lightweight**. Only CuPy is required beyond standard Pyt
 
 ```bash
 pip install cupy-cuda12x        # or cupy-cuda11x, to match your CUDA
-pip install -e .                
+pip install -e .
 ```
 
 CuPy must be installed separately because the wheel depends on your CUDA toolkit;
@@ -90,7 +90,7 @@ The tests under `tests/` are `unittest` classes, but `pytest` is the recommended
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q # ~3s; CUDA and PyTorch tests skipped when unavailable
+python -m pytest tests/ -q  # ~20 s on a GPU, ~3 s without: CUDA and PyTorch tests skip when unavailable
 ```
 
 ## References

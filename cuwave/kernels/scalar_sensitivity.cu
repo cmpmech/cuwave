@@ -84,7 +84,7 @@ gradient_kernel(real_t *__restrict__ g_mass, real_t *__restrict__ g_stiff,
   // dJ/dmass: no neighbour and no material load
   g_mass[idx] -= inv_dt2 * lc * (u2[idx] - 2.f * uc + u0[idx]);
 
-  // dJ/dstiff: wave.cu's harmonic cell mean differentiated in place
+  // dJ/dstiff: scalar.cu's harmonic cell mean differentiated in place
   const real_t sc = stiff[idx];
 #if NDIM == 1
   const real_t g =

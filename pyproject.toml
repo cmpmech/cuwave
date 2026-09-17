@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cuwave"
-version = "0.2.0"
+version = "0.1.0"
 description = "GPU finite-difference wave solver with differentiable adjoints"
 readme = "README.md"
 license = "MIT"
@@ -29,7 +29,7 @@ Documentation = "https://github.com/Leon-Herrmann/cuwave/blob/main/docs/Home.md"
 packages = ["cuwave"]
 
 [tool.setuptools.package-data]
-cuwave = ["kernels/*.cu"]
+cuwave = ["kernels/*.cu", "kernels/*.cuh"]
 
 [tool.ruff]
 line-length = 88

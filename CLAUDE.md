@@ -15,7 +15,7 @@ optimization.
 The project uses a dedicated virtualenv; the commands below assume it is active.
 
 ```bash
-python -m pytest tests/ -q          # whole suite, ~3 s
+python -m pytest tests/ -q          # whole suite, ~20 s on a GPU
 python -m pytest tests/sensitivity_test.py -q
 python -m pytest \
     "tests/boundary_test.py::DispatchTest::test_mixed_faces_2D" -q
@@ -25,8 +25,10 @@ python examples/fwi/scalar2D_fwi_adam.py  # drivers are run directly
 - Tests are `unittest` classes run under pytest. Everything CUDA is behind a
   `HAS_CUDA` guard and everything torch behind `@unittest.skipUnless`, so a run on a
   machine without a GPU silently skips rather than fails — check the pass/skip counts.
-- `ruff` is not a project dependency; run it from wherever it is installed
-  (format/check, 88 columns). `.cu` files are clang-format LLVM defaults, 80 columns.
+- `ruff` is not a project dependency; run `ruff check` from wherever it is installed
+  (88 columns). Do not run `ruff format`: the house-style banners sit at column 0 even
+  inside a block, which the formatter would indent. `.cu` files are clang-format LLVM
+  defaults, 80 columns.
 - Installing torch here must use the cu128 index
   (`pip install torch --index-url https://download.pytorch.org/whl/cu128`); a plain
   `pip install torch` pulls CUDA 13 wheels that break `cupy-cuda12x` at first kernel launch.

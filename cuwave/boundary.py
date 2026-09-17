@@ -1,8 +1,12 @@
 """Boundary conditions, one per (axis, side).
 
-A `BoundaryCondition` is a declarative marker: it names a kernel and nothing more, so a setup can place one per face in `Simulation.boundary` long before the module is compiled. `define_boundary` turns the markers into the launch closures once `compile_kernels` has run, which is why `simulate` needs no separate preparation phase.
+A `BoundaryCondition` is a declarative marker: it names a kernel and nothing more, so a
+setup can place one per face in `Simulation.boundary` long before the module is
+compiled. `define_boundary` turns the markers into the launch closures once
+`compile_kernels` has run, which is why `simulate` needs no separate preparation phase.
 
-`sponge` opens the domain from the other side: it dissipates in the material behind a face rather than acting on the ghost ring, so it needs no kernel and no marker of its own.
+`sponge` opens the domain from the other side: it dissipates in the material behind a
+face rather than acting on the ghost ring, so it needs no kernel and no marker of its own.
 """
 
 from __future__ import annotations

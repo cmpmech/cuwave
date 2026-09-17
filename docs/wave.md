@@ -1,9 +1,10 @@
 # Wave
 a wave simulation is set up as follows:
 1. define wave equation (& parametrization) with a `Simulation` subclass
-	- `PressureWave`, with `ScalarWave` and `AcousticWave`
+	- `PressureWave`, with `ScalarWave` and `AcousticWave`, and the 2D Maxwell reductions `ElectricWave` and `MagneticWave`
 	- `ElasticWave`
 	- `AnisotropicElasticWave`
+	- `MaxwellWave`, with `DielectricWave`
 2. define source with `Source`
 3. define `indicator` (if heterogeneous)
 4. define postprocessing (which signals to save)

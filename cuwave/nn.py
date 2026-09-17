@@ -9,13 +9,12 @@ import torch
 from torch import nn
 
 CONVOLUTIONS = {1: nn.Conv1d, 2: nn.Conv2d, 3: nn.Conv3d}
-POOLINGS = {1: nn.AvgPool1d, 2: nn.AvgPool2d, 3: nn.AvgPool3d}
 OUTPUT_STD = 0.01
 
 
 # -------------------------------------- helpers --------------------------------------
 def _initialize(model: nn.Module) -> None:
-    """Xavier normal with zero bias."""
+    """Xavier uniform with zero bias."""
     for module in model.modules():
         if isinstance(module, tuple(CONVOLUTIONS.values())):
             nn.init.xavier_uniform_(module.weight)
@@ -34,25 +33,6 @@ def _convolution(
     if dim not in CONVOLUTIONS:
         raise ValueError(f"dim is 1, 2 or 3, not {dim!r}")
     return CONVOLUTIONS[dim](in_channels, out_channels, kernel, padding=kernel // 2)
-
-
-def _block(
-    in_channels: int,
-    out_channels: int,
-    kernel: int,
-    activation: type[nn.Module],
-    dim: int,
-) -> nn.Sequential:
-    """convolve, normalize, activate: the unit a stack is built from
-
-    `GroupNorm(1, channels)` normalizes each sample over channels and space (layer
-    normalization).
-    """
-    return nn.Sequential(
-        _convolution(in_channels, out_channels, kernel, dim),
-        nn.GroupNorm(1, out_channels),
-        activation(),
-    )
 
 
 # -------------------------------------- networks -------------------------------------

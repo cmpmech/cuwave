@@ -3,8 +3,9 @@
 `MaxwellWave` is the Yee lattice written as `-C^T nu C` with a diagonal permittivity,
 which is the staggered `ElasticWave` layout with its normal-stress block deleted, and
 it is what 3D needs. Out of plane one component survives and the curl-curl collapses to
-a flux divergence, so 2D needs neither: `ElectricWave` carries E_z with the permittivity as its inertia and `MagneticWave` carries H_z with the inverse
-permittivity as its stiffness, both `PressureWave` on the scalar kernels.
+a flux divergence, so 2D needs neither: `ElectricWave` carries E_z with the permittivity
+as its inertia and `MagneticWave` carries H_z with the inverse permittivity as its
+stiffness, both `PressureWave` on the scalar kernels.
 """
 
 from __future__ import annotations

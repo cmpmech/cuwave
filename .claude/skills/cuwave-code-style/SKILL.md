@@ -137,10 +137,10 @@ about five lines.
 
 Present, and why:
 
-- `wave.py`, the layering: `Simulation` holds grid and compile configuration,
-  `PressureWave` adds the nodal material fields, `ScalarWave` / `AcousticWave` supply the
-  parametrization, and the `define_*` factories bind kernels to that configuration for
-  `simulate` to loop over.
+- `wave.py`, the layering: `Simulation` holds grid and compile configuration, the
+  equation modules (`scalar.py`, `elastic.py`, `anisotropic.py`, `maxwell.py`) subclass it
+  with their material hooks, and the `define_*` factories bind kernels to that
+  configuration for `simulate` to loop over.
 - `boundary.py`: a condition is a declarative marker that becomes a launch closure once
   the module is compiled, which is why `simulate` needs no preparation phase.
 - `regularization.py`: a map that is its own adjoint, so filters compose the way the
@@ -150,7 +150,7 @@ Present, and why:
 - test files: which contracts the file pins.
 
 Absent, and correctly so: `evals.py`, `signals.py`, `stencils.py`, `utils.py`,
-`optimization.py`. `superposition.py`'s long derivation is a deliberate exception for a
+`optimization.py`. `sensitivity.py`'s long derivation is a deliberate exception for a
 subtle algorithm with a knob the caller must set; do not propagate its length.
 
 ## Banners
@@ -367,9 +367,9 @@ the bug are an investigation log, and the assertion that now guards it is the re
 ## CUDA
 
 The `.cu` files are the one place where the code does **not** carry the explanation: there
-are no docstrings, so the derivation lives in `docs/cuda_wave.md` and
-`docs/cuda_wave_sensitivity.md` and the file keeps only labels. Ground truth to imitate:
-`cuwave/kernels/wave.cu`, then `cuwave/kernels/wave_sensitivity.cu`.
+are no docstrings, so the derivation lives in `docs/cuda_scalar.md` and
+`docs/cuda_scalar_sensitivity.md` and the file keeps only labels. Ground truth to imitate:
+`cuwave/kernels/scalar.cu`, then `cuwave/kernels/scalar_sensitivity.cu`.
 
 ### Formatting
 
@@ -402,7 +402,7 @@ Every `.cu` opens with the compile-time configuration it responds to, and nothin
 //   OP_COEFFS
 ```
 
-List only the flags that file actually uses: `wave_sensitivity.cu` omits `USE_DAMPING`,
+List only the flags that file actually uses: `scalar_sensitivity.cu` omits `USE_DAMPING`,
 which `require_lossless` rejects before either module is compiled. A new flag is added to
 this block and to `Simulation.compile_flags` together.
 

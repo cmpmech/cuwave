@@ -12,7 +12,7 @@ docstring.
 
 **Ground truth to imitate**, in this order: `docs/regularization.md` and
 `docs/optimization.md` (the class-family register), `docs/wave.md` (a module whose pieces
-build on one another), `docs/cuda_wave.md` (the kernel register), `docs/sensitivity.md` (a
+build on one another), `docs/cuda_scalar.md` (the kernel register), `docs/sensitivity.md` (a
 module that is two alternatives, and the page that says when to pick which),
 `docs/Home.md` (the index).
 
@@ -162,7 +162,7 @@ natural: "the pair the [sensitivity](sensitivity.md) analysis contracts the adjo
 
 ## CUDA pages
 
-`docs/cuda_wave.md` and `docs/cuda_wave_sensitivity.md` carry a register of their own,
+`docs/cuda_scalar.md` and `docs/cuda_scalar_sensitivity.md` carry a register of their own,
 because a `.cu` has no docstrings: **here the arguments must be documented, and only here**.
 
 Order: `## compilation logic` -> the helpers (macros, then `__device__` functions) ->
