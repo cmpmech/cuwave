@@ -37,6 +37,7 @@ Possible applications include
 </table>
 
 ## Documentation
+
 - see the [documentation](https://github.com/Leon-Herrmann/cuwave/blob/main/docs/Home.md) for how the code works (AI-assisted; verify with sources for critical details)
 - see [examples](https://github.com/Leon-Herrmann/cuwave/tree/main/examples) for how to apply the code
 
@@ -47,7 +48,25 @@ Possible applications include
 > [!IMPORTANT]
 > **Elastic** & **electromagnetic wave** equations were developed with AI assistance (Claude) and have undergone less validation. The elastic wave equation is currently being validated against experimental results.
 
+## Performance
+
+CuWave's runtime for identical discretizations is comparable to that of other established wave propagation finite difference codes. Speedups in 2D with reflecting boundaries (**a ratio above 1 means CuWave is that many times faster**) compared to the following frameworks:
+- **scalar wave equation**
+	- [Deepwave](https://github.com/ar4/deepwave) (forward: ~1.1x, sensitivity: ~1x)
+	- [NVIDIA Warp](https://github.com/NVIDIA/warp) (forward: ~2.1x, sensitivity: ~1.8x)
+	- [SeismicWaves.jl](https://github.com/GinvLab/SeismicWaves.jl) (forward: ~4.4x, sensitivity: ~4x)
+	- [Devito](https://github.com/devitocodes/devito) on CPU (forward: ~3.6x, sensitivity: ~3.8x)
+- **elastic wave equation**
+	- Deepwave (forward: ~1.1x, sensitivity: ~1.3x)
+	- SeismicWaves.jl (forward: ~4x, sensitivity: ~5x)
+Tested on one NVIDIA RTX PRO 500 Blackwell laptop GPU (6 GB) on the largest possible grids with CuWave's `superposition_sensitivity` as reference for the sensitivities. The specific numbers need to be taken with a grain of salt, as they are subject to specific hardware and simulation setup. All implementations operate on the same order of magnitude.
+
+Additional benefits of **CuWave** are
+- the built-in **higher order finite difference** schemes, allowing for fewer grid points
+- a sensitivity analysis whose **memory is independent of the number of timesteps**, allowing for orders of magnitude larger grids
+
 ## Install
+
 Dependencies are kept **lightweight**. Only CuPy is required beyond standard Python library.
 
 ```bash
@@ -61,7 +80,8 @@ all remaining dependencies are declared in `pyproject.toml`.
 PyTorch is optional for the regularization via neural optimization; see [pytorch](https://pytorch.org/get-started/locally/) for the installation. Otherwise it is not needed.
 
 > [!NOTE]
-> Match PyTorch's CUDA version to CuPy's, or the two runtimes clash at the first kernel launch. With `cupy-cuda12x`:
+> Match PyTorch's CUDA version to CuPy's, or the two runtimes clash at the first kernel launch. 
+> With `cupy-cuda12x`:
 > ```bash
 > pip install torch --index-url https://download.pytorch.org/whl/cu128
 > ```
@@ -80,6 +100,7 @@ If you use our code for your scientific research, please acknowledge this by ref
 _Herrmann, L., Bürchner, T., Kudela, L., Kollmannsberger, S., 2026, **A memory-efficient adjoint method to enable billion parameter optimization on a single GPU in dynamic problems**, Structural and Multidisciplinary Optimization, Volume 69, 52 (2026), DOI: [10.1007/s00158-025-04237-y](https://doi.org/10.1007/s00158-025-04237-y)_
 
 ## Contact
+
 For questions, bug reports, or collaboration inquiries, please don't hesitate to contact Leon Herrmann at [herrmann.leon@pm.me](mailto:herrmann.leon@pm.me).
 
 ## License
