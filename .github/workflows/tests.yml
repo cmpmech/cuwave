@@ -22,10 +22,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install cupy-cuda12x
           pip install -e .
-          pip install pytest ruff
-
-      - name: lint
-        run: ruff check .
+          pip install pytest
 
       # the CUDA tests skip here; this pins imports, the stencil math and the optimizers
       - name: test

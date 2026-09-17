@@ -35,5 +35,7 @@ cuwave = ["kernels/*.cu"]
 line-length = 88
 
 [tool.ruff.lint]
+# pinned explicitly so the rule set does not drift with the installed ruff
+select = ["E4", "E7", "E9", "F"]
 # module-level lambda objectives are the driver house style
 ignore = ["E731"]
