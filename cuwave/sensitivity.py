@@ -208,7 +208,7 @@ def sensitivity(
     grads = sim.gradient_fields(mat)
     gradient_step = sim.define_gradient(sens_kernels, mat, grads)
 
-    # ------------------------------------ forward pass -----------------------------------
+# ------------------------------------ forward pass -----------------------------------
     # stepped straight into the history, so the leading zeros are u^-2 / u^-1
     V = cp.zeros((sim.N + 2, *sim.field_shape), dtype=sim.dtype)
     # the slot views made once: V[t] is a host slice costing more than its own kernel
@@ -224,11 +224,11 @@ def sensitivity(
 
     cost, dphi = objective(um)
 
-    # --------------------------------- adjoint excitation --------------------------------
+# --------------------------------- adjoint excitation --------------------------------
     signal = adjoint_signal(sim, dphi, sensors)
     adjoint_excitation = define_excitation(sim, sensors, kernels, mat)
 
-    # ----------------------------------- backward pass -----------------------------------
+# ----------------------------------- backward pass -----------------------------------
     P = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
     p0, p1 = P[0], P[1]
     for m in range(sim.N):
@@ -256,9 +256,9 @@ def reconstruction_sensitivity(
     run with them swapped marches the forward field backwards. Damping breaks that, so
     the nodes a damped one reaches are recorded each step and replayed on the way back:
     the reverse march then never reads an irreversible node, and the gradient stays the
-    exact transpose wherever the strip shields it. This is the variant to reach for once
-    the history no longer fits and the domain is open, since `superposition_sensitivity`
-    refuses a damping field outright.
+    exact transpose wherever the strip shields it. This is the variant to reach for
+    once the history no longer fits and the domain is open, since
+    `superposition_sensitivity` refuses a damping field outright.
 
     Args:
         sim: the simulation both passes step, damped or lossless. Damping covering
@@ -299,7 +299,7 @@ def reconstruction_sensitivity(
     # two leading zero rows, so row t + 2 is u^t and the initial states need no branch
     strip_store = cp.zeros((sim.N + 2, num_strip), dtype=sim.dtype)
 
-    # ------------------------------------ forward pass -----------------------------------
+# ------------------------------------ forward pass -----------------------------------
     for t in range(sim.N):
         u2 = fd_step(u0, u1, u2)
         u2 = excitation_step(u2, source.signal, t)
@@ -311,11 +311,11 @@ def reconstruction_sensitivity(
 
     cost, dphi = objective(um)
 
-    # --------------------------------- adjoint excitation --------------------------------
+# --------------------------------- adjoint excitation --------------------------------
     signal = adjoint_signal(sim, dphi, sensors)
     adjoint_excitation = define_excitation(sim, sensors, kernels, mat)
 
-    # ----------------------------------- backward pass -----------------------------------
+# ----------------------------------- backward pass -----------------------------------
     P = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
     p0, p1 = P[0], P[1]
     # the forward rotation left the last three states live, which is the whole seed
@@ -403,7 +403,7 @@ def superposition_sensitivity(
     u0, u1, u2 = U[0], U[1], U[2]
     um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
 
-    # ------------------------------------ forward pass -----------------------------------
+# ------------------------------------ forward pass -----------------------------------
     # records the traces and subtracts the forward diagonal B(u, u)
     for t in range(sim.N):
         u2 = fd_step(u0, u1, u2)
@@ -415,7 +415,7 @@ def superposition_sensitivity(
 
     cost, dphi = objective(um)
 
-    # --------------------------------- adjoint excitation --------------------------------
+# --------------------------------- adjoint excitation --------------------------------
     # the forward diagonal before the backward pass cancels it, for `cancellation`
     before = _accumulated(accs)
     # concatenated into one launch, sound because excitation_kernel uses atomicAdd
@@ -431,7 +431,7 @@ def superposition_sensitivity(
     )
     backward_excitation = define_excitation(sim, backward_position, kernels, mat)
 
-    # ----------------------------------- backward pass -----------------------------------
+# ----------------------------------- backward pass -----------------------------------
     # u0 / u1 hold u^(N-1) / u^(N-2), so the one array carries u + k lambda
     u0, u1 = u1, u0
     for t in range(sim.N):
@@ -499,7 +499,7 @@ def source_sensitivity(
     get_signal = define_get_signal(sim, sensors, kernels)
     probe = define_get_signal(sim, source.position, kernels)
 
-    # ------------------------------------ forward pass -----------------------------------
+# ------------------------------------ forward pass -----------------------------------
     U = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
     u0, u1 = U[0], U[1]
     um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
@@ -513,11 +513,11 @@ def source_sensitivity(
 
     cost, dphi = objective(um)
 
-    # --------------------------------- adjoint excitation --------------------------------
+# --------------------------------- adjoint excitation --------------------------------
     signal = adjoint_signal(sim, dphi, sensors)
     adjoint_excitation = define_excitation(sim, sensors, kernels, mat)
 
-    # ----------------------------------- backward pass -----------------------------------
+# ----------------------------------- backward pass -----------------------------------
     P = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
     p0, p1 = P[0], P[1]
     lam = cp.zeros((sim.N, source.position.shape[1]), dtype=sim.dtype)
@@ -528,7 +528,7 @@ def source_sensitivity(
         p0 = adjoint_excitation(p0, signal, m)
         p0 = bc_step(p0)
         p1, p0 = p0, p1  # p1 now holds lambda^n
-        probe(p1, lam, n)  # row n rather than row m, so the record runs forward in time
+        probe(p1, lam, n)  # row n not row m, so the record runs forward in time
 
     # the transpose of adjoint_signal: over the same weights, and not reversed
     gradient = lam * sim.adjoint_weights(source.position)

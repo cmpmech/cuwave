@@ -8,27 +8,28 @@ misalignment or a missing cell weight.
 
 `sensitivity` is checked damped as well as lossless: the same step kernel serves both
 passes there, since marching the adjoint backwards is what transposes the damped
-recursion, and the finite difference is what pins the one place damping does not cancel:
-the excitation sharing the update's 1 / (1 + beta) divisor. The refusal belongs to
-`superposition_sensitivity` alone, whose time reversal needs a lossless operator.
+recursion, and the finite difference is what pins the one place damping does not
+cancel: the excitation sharing the update's 1 / (1 + beta) divisor. The refusal belongs
+to `superposition_sensitivity` alone, whose time reversal needs a lossless operator.
 
-The superposition variant is pinned against the exact adjoint rather than against finite
-differences, so what these tests fix are the two departures it is allowed (the symmetric
-Frechet form and the k^2 bias) and the property it exists for, that its memory does not
-grow with N.
+The superposition variant is pinned against the exact adjoint rather than against
+finite differences, so what these tests fix are the two departures it is allowed (the
+symmetric Frechet form and the k^2 bias) and the property it exists for, that its
+memory does not grow with N.
 
 `source_sensitivity` differentiates the same cost with respect to the source signal
 instead, so what it has to get right is a transpose rather than a bilinear form: the
-cell weight at the source, the `source_factor` of whichever wave equation is running, the
-damped divisor, and the time index the adjoint is read at. Each is checked against finite
-differences of the signal, and once more through `point_source` and `collect_source`, the
-coordinate path a driver takes.
+cell weight at the source, the `source_factor` of whichever wave equation is running,
+the damped divisor, and the time index the adjoint is read at. Each is checked against
+finite differences of the signal, and once more through `point_source` and
+`collect_source`, the coordinate path a driver takes.
 
-`reconstruction_sensitivity` is allowed no departure at all: replaying the strip leaves the
-reverse march reading only reversible nodes, so it is pinned to `sensitivity` at round-off
-rather than at a tolerance, damped as well as lossless. What can break it is the strip being
-too thin for the stencil, which shows up as a gradient error growing with `space_order`, and
-a damping field that leaves nothing to rebuild from, which has to raise.
+`reconstruction_sensitivity` is allowed no departure at all: replaying the strip leaves
+the reverse march reading only reversible nodes, so it is pinned to `sensitivity` at
+round-off rather than at a tolerance, damped as well as lossless. What can break it is
+the strip being too thin for the stencil, which shows up as a gradient error growing
+with `space_order`, and a damping field that leaves nothing to rebuild from, which has
+to raise.
 """
 
 import math
@@ -368,7 +369,7 @@ class GradientTest(unittest.TestCase):
                 self.assertEqual(expected[-1], 1.0)
 
     def test_high_order_is_only_consistent(self):
-        # above order 2 the transpose is symmetric only to O(dx^2), on a smooth material
+        # above order 2 the transpose is symmetric to O(dx^2), on a smooth material
         sim = _scalar(order=4)
         x, y = grid_coords(sim.Nx, sim.dx, dtype=sim.dtype)
         indicator = cp.ascontiguousarray(
@@ -552,7 +553,7 @@ class ReconstructionTest(unittest.TestCase):
                 self.assertLess(rel, 1e-12, f"order {order}: difference {rel:.3e}")
 
     def test_valid_covers_the_whole_design_region(self):
-        # comparing only on `valid` is self-referential, so pin `valid` against `region`
+        # comparing on `valid` is self-referential, so pin `valid` against `region`
         dx = (1.0 / (NC - 3),) * 2
         region = pad_for_sponge((NC, NC - 2), dx, 5.0 * dx[0])[3]
         for order in (2, 4):

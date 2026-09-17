@@ -13,10 +13,10 @@ no arrival time has to be guessed anywhere.
 
 `WallLayerTest` pins the argument `homogeneous_dirichlet_kernel` rests on: that writing
 only the odd-mirrored ghost holds the wall node at zero without the kernel ever writing
-it (docs/cuda_scalar.md derives it). It is not held there exactly: the fma contraction of
-the two face fluxes leaves the rounding residual of a product, which then drives a stable
-recursion on the wall layer, so the assertion is against machine epsilon rather than
-against zero.
+it (docs/cuda_scalar.md derives it). It is not held there exactly: the fma contraction
+of the two face fluxes leaves the rounding residual of a product, which then drives a
+stable recursion on the wall layer, so the assertion is against machine epsilon rather
+than against zero.
 
 `PadTest` pins `pad_for_sponge`, the arithmetic a driver would otherwise repeat: the
 four returns have to stay consistent with each other, since a `region` that disagrees
@@ -217,7 +217,7 @@ class DispatchTest(unittest.TestCase):
             return _run(_sim(Nx, boundary, N), (source, y), sensors)
 
         mixed = traces(((Dirichlet, Neumann), (Neumann, Neumann)))
-        # same y walls, varying only in x, so each differs in the face its sensor misses
+        # same y walls, varying in x, so each differs in the face its sensor misses
         neumann = traces(Neumann)
         dirichlet = traces(((Dirichlet, Dirichlet), (Neumann, Neumann)))
         scale = float(np.max(np.abs(neumann)))

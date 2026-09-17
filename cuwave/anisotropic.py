@@ -1,13 +1,14 @@
 """Cell-assembled elasticity, the collocated sibling of the staggered `ElasticWave`.
 
-The stencil is a 9-point one in 2D and 27-point in 3D, gathered cell by cell rather than
-axis by axis, since a variable-coefficient elastic operator couples the components through
-mixed derivatives that a per-axis flux cannot carry. Its coefficients are derived as
-`-B^T C B` with `C` on the cell, which is what makes the operator exactly symmetric for a
-varying material, never differentiates the material, leaves the leapfrog reversible, and
-makes a traction-free surface the natural condition of the interior-cell sum. `C` is any
-symmetric Voigt matrix, which is what earns this scheme its keep next to the staggered
-one: order 2 only, but collocated components and a general anisotropy.
+The stencil is a 9-point one in 2D and 27-point in 3D, gathered cell by cell rather
+than axis by axis, since a variable-coefficient elastic operator couples the components
+through mixed derivatives that a per-axis flux cannot carry. Its coefficients are
+derived as `-B^T C B` with `C` on the cell, which is what makes the operator exactly
+symmetric for a varying material, never differentiates the material, leaves the
+leapfrog reversible, and makes a traction-free surface the natural condition of the
+interior-cell sum. `C` is any symmetric Voigt matrix, which is what earns this scheme
+its keep next to the staggered one: order 2 only, but collocated components and a
+general anisotropy.
 """
 
 from __future__ import annotations
@@ -46,22 +47,25 @@ def cell_stencil(
     rather than by inspection. The entries collapse to the 9-point (27-point in 3D)
     finite difference stencil
 
-        f_x = (lame + 2 mu) [M_y * D2_x] u_x + mu [M_x * D2_y] u_x + (lame + mu) [D_x * D_y] u_y
+        f_x = (lame + 2 mu) [M_y * D2_x] u_x + mu [M_x * D2_y] u_x
+              + (lame + mu) [D_x * D_y] u_y
 
-    with the second difference `D2` = (1, -2, 1), the centred first difference `D` and the
-    transverse average `M` = (1, 4, 1) / 6. That average is the only departure from the
-    textbook elastic stencil, and it is what removes the checkerboard from the null space:
-    one quadrature point per axis would give (1, 2, 1) / 4 and leave it there as an
-    undamped hourglass mode.
+    with the second difference `D2` = (1, -2, 1), the centred first difference `D` and
+    the transverse average `M` = (1, 4, 1) / 6. That average is the only departure from
+    the textbook elastic stencil, and it is what removes the checkerboard from the null
+    space: one quadrature point per axis would give (1, 2, 1) / 4 and leave it there as
+    an undamped hourglass mode.
 
     Args:
         ndim: dimensionality of the cell.
         dx: cell side per axis.
-        C: (voigt, voigt) symmetric stiffness matrix, from `elastic.voigt` or the caller.
+        C: (voigt, voigt) symmetric stiffness matrix, from `elastic.voigt` or the
+            caller.
 
     Returns:
         the (n * ndim, n * ndim) matrix for `n = 2**ndim`, node `c` and component `i`
-        occupying row `c * ndim + i`, `c` running over the corners in `corner_bits` order.
+        occupying row `c * ndim + i`, `c` running over the corners in `corner_bits`
+        order.
     """
     corners = corner_bits(ndim)
     nloc = len(corners) * ndim
@@ -95,9 +99,10 @@ def cell_stencil(
 def cell_average(sim: Simulation, field: cpt.NDArray) -> cpt.NDArray:
     """Harmonic mean of `field` over the `2**ndim` corners of a cell, at its low corner.
 
-    Harmonic and not arithmetic for the reason the scalar flux uses it: it keeps the cell
-    stiffness single valued across a material jump, and it is what holds the stable
-    timestep together at a high contrast, where a light node borders a stiff cell.
+    Harmonic and not arithmetic for the reason the scalar flux uses it: it keeps the
+    cell stiffness single valued across a material jump, and it is what holds the
+    stable timestep together at a high contrast, where a light node borders a stiff
+    cell.
     """
     out = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
     safe = cp.maximum(field, cp.finfo(sim.dtype).tiny)
@@ -114,11 +119,12 @@ def cell_average(sim: Simulation, field: cpt.NDArray) -> cpt.NDArray:
 class AnisotropicElasticWave(Simulation):
     """Cell-assembled elasticity, parametrized by a density-scaling indicator gamma.
 
-    Both wave speeds are held fixed and gamma scales the density, so `C = gamma * rho0 * C`
-    scales inertia and stiffness alike and the stable timestep does not move with the
-    design. `C` overrides the isotropic Voigt matrix with an anisotropic one at gamma = 1,
-    which the cell assembly carries where the staggered scheme cannot. Order 2 only: the
-    cell gather costs `(2r)**(2 ndim)` per node, so a wide stencil belongs to `ElasticWave`.
+    Both wave speeds are held fixed and gamma scales the density, so
+    `C = gamma * rho0 * C` scales inertia and stiffness alike and the stable timestep
+    does not move with the design. `C` overrides the isotropic Voigt matrix with an
+    anisotropic one at gamma = 1, which the cell assembly carries where the staggered
+    scheme cannot. Order 2 only: the cell gather costs `(2r)**(2 ndim)` per node, so a
+    wide stencil belongs to `ElasticWave`.
     """
 
     density: float = None  # background density rho0

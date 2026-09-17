@@ -1,9 +1,9 @@
 """Matplotlib helpers for the bare field figures the drivers produce
 
-`matplotlib` is imported here and nowhere else in the package, the way torch is confined
-to `nn.py`, so the solver keeps its cupy-only dependency. Everything works in node index
-coordinates: an axes is the grid at one pixel per node, and a marker is sized in nodes,
-so the same call gives the same figure at any resolution and any dpi
+`matplotlib` is imported here and nowhere else in the package, the way torch is
+confined to `nn.py`, so the solver keeps its cupy-only dependency. Everything works in
+node index coordinates: an axes is the grid at one pixel per node, and a marker is
+sized in nodes, so the same call gives the same figure at any resolution and any dpi
 """
 
 import io

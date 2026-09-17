@@ -31,7 +31,6 @@ class Adam:
 
 class Lbfgs:
     """L-BFGS with Armijo line search over the last `k` secant pairs.
-
     Adapted from https://doi.org/10.33774/coe-2021-qpq2j
     """
 
@@ -64,7 +63,8 @@ class Lbfgs:
             x: the current design.
             grad: its gradient, and the direction the two-loop recursion turns.
             cost: the objective at `x`, which the sufficient decrease is measured from.
-            f: forward only, `f(design) -> cost`, so every trial costs one forward eval.
+            f: forward only, `f(design) -> cost`, so every trial costs one forward
+                eval.
             project: applied to every trial, a constraint on the design variables.
 
         Returns:

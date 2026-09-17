@@ -1,9 +1,9 @@
 """The grid, the compile-time configuration, and the time loop every equation shares.
 
 `Simulation` holds both and leaves the physics to a subclass in its own module
-(`scalar.py`, `elastic.py`, `anisotropic.py`), which names its kernel sources and supplies
-the material and factor hooks. The `define_*` factories bind compiled kernels to one such
-configuration, and `simulate` loops over the closures they return.
+(`scalar.py`, `elastic.py`, `anisotropic.py`), which names its kernel sources and
+supplies the material and factor hooks. The `define_*` factories bind compiled kernels
+to one such configuration, and `simulate` loops over the closures they return.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import numpy.typing as npt
 from .boundary import canonical_boundary, define_boundary
 from .stencils import preamble, weights
 
-# Voigt row order per dimension, as (k, l) strain pairs; the shear rows are PAIRS[d][d:]
+# Voigt row order per dimension as (k, l) strain pairs; the shear rows are PAIRS[d][d:]
 PAIRS = {
     1: ((0, 0),),
     2: ((0, 0), (1, 1), (0, 1)),
@@ -44,10 +44,10 @@ def stable_timestep(
 ) -> float:
     """Largest stable timestep for `sim` under `indicator`, measured not estimated.
 
-    The leapfrog is stable while the spectral radius of `dt**2 minv L` stays under 4, and
-    `L` is symmetric with `minv` diagonal, so a power iteration on the step kernel itself
-    converges to that radius. Exact for any order, any material and any boundary layout,
-    where `stable_dt` only knows the wave speed and the spacing.
+    The leapfrog is stable while the spectral radius of `dt**2 minv L` stays under 4,
+    and `L` is symmetric with `minv` diagonal, so a power iteration on the step kernel
+    itself converges to that radius. Exact for any order, any material and any boundary
+    layout, where `stable_dt` only knows the wave speed and the spacing.
 
     Args:
         sim: the simulation to measure, whose own `dt` sets the scale of the answer.
@@ -280,14 +280,14 @@ class Simulation:
     precision: str = "float32"  # "float32" or "float64"
     space_order: int = 2  # finite difference order: any even number
     boundary: tuple = None  # ((low, high),) per axis; None is the equation's default
-    damping: cpt.NDArray | None = None  # nodal field d, or None for a lossless operator
+    damping: cpt.NDArray | None = None  # nodal field d, None for a lossless operator
 
     @property
     def compile_flags(self) -> tuple[str, ...]:
         """`-DUSE_DAMPING` when a damping field is set, else no extra flags."""
         return ("-DUSE_DAMPING",) if self.damping is not None else ()
 
-    kernel_path = None  # the forward source this equation compiles, set by the subclass
+    kernel_path = None  # forward source this equation compiles, set by the subclass
     sensitivity_path = None  # and the adjoint one
     default_boundary = None  # what `boundary=None` means for this equation
 

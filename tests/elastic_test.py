@@ -1,11 +1,11 @@
 """Contracts of the staggered elastic equation that the scalar tests cannot reach.
 
-Three of them carry the rest. The staggered strains put every stress on a natural point,
-so the operator must converge at its full order while the cost stays flat in the radius.
-The operator is `-B^T C B` with matching taps in both kernels, so it must be exactly
-symmetric at every order and boundary mix, which is what all adjoint variants rest on.
-And the staggering shifts every component off the nodes, so sources, sensors and the
-reconstruction strip must all honour the half-node offsets.
+Three of them carry the rest. The staggered strains put every stress on a natural
+point, so the operator must converge at its full order while the cost stays flat in the
+radius. The operator is `-B^T C B` with matching taps in both kernels, so it must be
+exactly symmetric at every order and boundary mix, which is what all adjoint variants
+rest on. And the staggering shifts every component off the nodes, so sources, sensors
+and the reconstruction strip must all honour the half-node offsets.
 """
 
 import unittest

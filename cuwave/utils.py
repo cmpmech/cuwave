@@ -73,7 +73,7 @@ def resample(
         N_new = int(span + 1e-9 * max(1.0, span)) + 1
 
     dtype = xp.dtype(values.dtype if values.dtype.kind == "f" else xp.float64)
-    t = xp.arange(N_new, dtype=dtype) * dtype.type(dt_new / dt)  # in input sample index
+    t = xp.arange(N_new, dtype=dtype) * dtype.type(dt_new / dt)  # in input samples
     left = xp.clip(xp.floor(t), 0, steps - 2)
     weight = t - left
     index = left.astype(xp.int32)
@@ -136,10 +136,10 @@ def distribute(
 ) -> tuple[cpt.NDArray[cp.int32], cpt.NDArray]:
     """Multilinear interpolation of `coords` onto the grid, along `direction`.
 
-    A vector unknown drives and reads along a direction, which enters as a factor on the
-    weights, so `traces` and `scatter` stay exact transposes of one another. A staggered
-    unknown declares `sim.component_offsets`, and each component is then interpolated on
-    its own shifted grid.
+    A vector unknown drives and reads along a direction, which enters as a factor on
+    the weights, so `traces` and `scatter` stay exact transposes of one another. A
+    staggered unknown declares `sim.component_offsets`, and each component is then
+    interpolated on its own shifted grid.
 
     Args:
         sim: the simulation whose grid the coordinates land on.
@@ -443,14 +443,15 @@ def intensity(
     """Objective factory: J = sum |u_hat(f)|**2, the spectral intensity at the sensors.
 
     Args:
-        sim: the simulation the record comes from, whose `dt` and `N` fix the transform.
+        sim: the simulation the record comes from, whose `dt` and `N` fix the
+            transform.
         frequencies: one frequency, or several scored by the same run.
         weights: (num_frequencies, num_sensors), or anything broadcasting to it, so one
             record scores several ports each at its own frequency. Defaults to 1.
 
     Returns:
-        the objective `sensitivity` takes. The transform is linear in the record, so its
-        adjoint is the same pair of tables read backwards.
+        the objective `sensitivity` takes. The transform is linear in the record, so
+        its adjoint is the same pair of tables read backwards.
     """
     # the phase reaches 1e5 radians over a long run, so it is built in double
     f = np.atleast_1d(np.asarray(frequencies, dtype=np.float64))

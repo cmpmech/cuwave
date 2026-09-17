@@ -1,11 +1,10 @@
 """Maxwell's equations in second-order curl-curl form, and their scalar 2D reductions.
 
-`MaxwellWave` is the Yee lattice written as `-C^T nu C` with a diagonal permittivity, which
-is the staggered `ElasticWave` layout with its normal-stress block deleted, and it is what 3D
-needs. Out of plane one component survives and the curl-curl collapses to a flux
-divergence, so 2D needs neither: `ElectricWave` carries E_z with the permittivity as its
-inertia and `MagneticWave` carries H_z with the inverse permittivity as its stiffness, both
-`PressureWave` on the scalar kernels.
+`MaxwellWave` is the Yee lattice written as `-C^T nu C` with a diagonal permittivity,
+which is the staggered `ElasticWave` layout with its normal-stress block deleted, and
+it is what 3D needs. Out of plane one component survives and the curl-curl collapses to
+a flux divergence, so 2D needs neither: `ElectricWave` carries E_z with the permittivity as its inertia and `MagneticWave` carries H_z with the inverse
+permittivity as its stiffness, both `PressureWave` on the scalar kernels.
 """
 
 from __future__ import annotations
@@ -118,9 +117,9 @@ class ElectricWave(PolarizedWave):
 class MagneticWave(PolarizedWave):
     """Out-of-plane magnetic field, `mu` its inertia and the inverse permittivity its stiffness.
 
-    The polarization Christiansen & Sigmund 2021 label TM, and the one their metalens is
-    designed in. The design enters the stiffness as `1 / eps`, so its jacobian is a field
-    rather than the constant `ElectricWave` gets.
+    The polarization Christiansen & Sigmund 2021 label TM, and the one their metalens
+    is designed in. The design enters the stiffness as `1 / eps`, so its jacobian is a
+    field rather than the constant `ElectricWave` gets.
     """
 
     def parametrization(
@@ -141,12 +140,12 @@ class MagneticWave(PolarizedWave):
 class MaxwellWave(Simulation):
     """Curl-curl Maxwell on the Yee lattice, the staggered scheme 3D needs.
 
-    Component `c` of the electric field lives half a node up axis `c` and the curl of the
-    pair `(k, l)` half a node up both of its axes, which is the `ElasticWave` displacement
-    and shear-stress layout exactly. The operator is assembled as the
+    Component `c` of the electric field lives half a node up axis `c` and the curl of
+    the pair `(k, l)` half a node up both of its axes, which is the `ElasticWave`
+    displacement and shear-stress layout exactly. The operator is assembled as the
     variational derivative of the magnetic energy, so it is `-C^T nu C` with the
-    Levi-Civita signs squared away, symmetric by construction and the exact transpose at
-    every order.
+    Levi-Civita signs squared away, symmetric by construction and the exact transpose
+    at every order.
     """
 
     permeability: float = 1.0  # background mu, designed only where `magnetic` is set
@@ -312,7 +311,7 @@ class MaxwellWave(Simulation):
         for c in range(self.ncomp):
             density = grads["mass"][c] * component_weights(self, c)
             g_mass += point_average_adjoint(self, density, c)
-        # a non-magnetic medium has no stiffness design dependence, and says so with zeros
+        # a non-magnetic medium has no stiffness design dependence: zeros say so
         g_stiff = cp.zeros(self.Nx_padded, dtype=self.dtype)
         if self.magnetic:
             for p, axes in enumerate(PAIRS[self.ndim][self.ndim :]):

@@ -1,5 +1,6 @@
 """Neural networks as reparametrization of design field (using PyTorch)
 see https://www.sciencedirect.com/science/article/pii/S0045782523004024
+or https://link.springer.com/article/10.1007/s00158-024-03908-6
 """
 
 import torch
@@ -56,8 +57,8 @@ def _block(
 class Generator(nn.Module):
     """Fixed noise to field, doubling the resolution at every channel transition.
 
-    Nearest-neighbour upsampling per transition, and the stack ends in a sigmoid, so the
-    field is in [0, 1]. The output convolution starts with small random weights and
+    Nearest-neighbour upsampling per transition, and the stack ends in a sigmoid, so
+    the field is in [0, 1]. The output convolution starts with small random weights and
     `output_bias`, so the field starts flat at 1, where the pixel-wise drivers start.
 
     Args:

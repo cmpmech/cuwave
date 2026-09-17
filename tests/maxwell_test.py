@@ -1,14 +1,14 @@
 """Contracts of the two out-of-plane Maxwell reductions.
 
-Three of them carry the rest. The reductions are `PressureWave` with its two coefficient
-fields exchanged, so `ElectricWave` must reproduce the acoustic solver under the change of
-variables, unknown for unknown, which is what says the physics is a renaming and not a
-rewrite. The permittivity has to reach the kernel as a permittivity, so a slab has to
-transmit what Fabry-Perot says it transmits, which is the one check that ties the material
-units, the spectral objective and the source calibration together. And the design enters
-`ElectricWave` through the inertia but `MagneticWave` through the stiffness, so only the
-first keeps an exact adjoint above `space_order` 2: the wide-stencil gradient is pinned for
-one and deliberately not claimed for the other.
+Three of them carry the rest. The reductions are `PressureWave` with its two
+coefficient fields exchanged, so `ElectricWave` must reproduce the acoustic solver
+under the change of variables, unknown for unknown, which is what says the physics is a
+renaming and not a rewrite. The permittivity has to reach the kernel as a permittivity,
+so a slab has to transmit what Fabry-Perot says it transmits, which is the one check
+that ties the material units, the spectral objective and the source calibration
+together. And the design enters `ElectricWave` through the inertia but `MagneticWave`
+through the stiffness, so only the first keeps an exact adjoint above `space_order` 2:
+the wide-stencil gradient is pinned for one and deliberately not claimed for the other.
 """
 
 import math
@@ -288,7 +288,7 @@ class GradientTest(unittest.TestCase):
         self._check(MagneticWave, 2)
 
     def test_an_inertia_design_survives_a_wide_stencil(self):
-        # dJ/deps carries no stencil, so the wide-order transpose error never reaches it
+        # dJ/deps carries no stencil, so the wide-order transpose error cannot reach it
         self._check(ElectricWave, 4, tolerance=1e-3)
         self._check(ElectricWave, 6, tolerance=1e-3)
 

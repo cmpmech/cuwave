@@ -1,14 +1,8 @@
 """Boundary conditions, one per (axis, side).
 
-A `BoundaryCondition` is a declarative marker: it names a kernel and nothing
-more, so a setup can place one per face in `Simulation.boundary` long before
-the module is compiled. `define_boundary` turns the markers into the launch
-closures once `compile_kernels` has run, which is why `simulate` needs no
-separate preparation phase.
+A `BoundaryCondition` is a declarative marker: it names a kernel and nothing more, so a setup can place one per face in `Simulation.boundary` long before the module is compiled. `define_boundary` turns the markers into the launch closures once `compile_kernels` has run, which is why `simulate` needs no separate preparation phase.
 
-`sponge` opens the domain from the other side: it dissipates in the material behind
-a face rather than acting on the ghost ring, so it needs no kernel and no marker of
-its own.
+`sponge` opens the domain from the other side: it dissipates in the material behind a face rather than acting on the ghost ring, so it needs no kernel and no marker of its own.
 """
 
 from __future__ import annotations
@@ -70,10 +64,10 @@ class BoundaryCondition:
 
 Neumann = BoundaryCondition("homogeneous_neumann_kernel")
 Dirichlet = BoundaryCondition("homogeneous_dirichlet_kernel")
-# an elastic wall is the interior-cell assembly or a zeroed inertia, so neither needs a kernel
+# an elastic wall is the interior-cell assembly or a zeroed inertia: no kernel needed
 Traction = BoundaryCondition(None, "traction")
 Clamped = BoundaryCondition(None, "clamped")
-# the same two walls read electromagnetically, the tangential field held or left natural
+# the same walls read electromagnetically, the tangential field held or left natural
 Conductor = BoundaryCondition(None, "conductor")
 Magnetic = BoundaryCondition(None, "magnetic")
 
@@ -189,13 +183,14 @@ def pad_for_sponge(
 ) -> tuple[tuple[int, ...], int, tuple[float, ...], tuple[slice, ...]]:
     """Grow a region of interest `Nx` by a sponge layer of physical `thickness`.
 
-    The layer is grid the simulation carries but the application does not own, so what a
-    driver needs back is where its region of interest ends up: `origin` shifts the
-    coordinates it places transducers and defects at, and `region` selects it out of the
-    grown grid for a design mask or a figure.
+    The layer is grid the simulation carries but the application does not own, so what
+    a driver needs back is where its region of interest ends up: `origin` shifts the
+    coordinates it places transducers and defects at, and `region` selects it out of
+    the grown grid for a design mask or a figure.
 
     Args:
-        Nx: logical grid points per axis of the region of interest, ghost nodes included.
+        Nx: logical grid points per axis of the region of interest, ghost nodes
+            included.
         dx: grid spacing per axis.
         thickness: layer depth in physical units, taken in nodes off the finest axis so
             that no face comes out thinner than asked for.

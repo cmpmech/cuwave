@@ -2,9 +2,9 @@
 
 One unknown per node and a per-axis flux, so the operator is the cheapest of the three
 families and needs no component offsets. `PressureWave` holds the nodal `stiff`/`minv`
-fields and the adjoint hooks; `ScalarWave` scales both with one indicator gamma, which is
-why `minv` is never formed (`derive_inertia`), and `AcousticWave` interpolates inverse
-density and inverse bulk modulus between two phases for topology optimization.
+fields and the adjoint hooks; `ScalarWave` scales both with one indicator gamma, which
+is why `minv` is never formed (`derive_inertia`), and `AcousticWave` interpolates
+inverse density and inverse bulk modulus between two phases for topology optimization.
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ class PressureWave(Simulation):
             args += (mat["damping"], self.dtype(self.dt))
         return args
 
-    gradient_names = ("mass", "stiff")  # the material fields the adjoint differentiates
+    gradient_names = ("mass", "stiff")  # the fields the adjoint differentiates
 
     def gradient_fields(self, mat: dict) -> dict[str, cpt.NDArray]:
         """Zeroed accumulators the adjoint kernels add into, one per material field."""
@@ -111,7 +111,7 @@ class PressureWave(Simulation):
         self, kernels: cp.RawModule, accs: dict, sign: float
     ) -> Callable:
         """Closure accumulating both Frechet densities of one field triplet, times `sign`."""
-        # sign is fixed per pass, so it is folded into the factors rather than recomputed
+        # sign is fixed per pass, so it is folded into the factors, not recomputed
         frechet_kernel = kernels.get_function("frechet_kernel")
         grid, block = grid_block(self)
         # the stiffness density enters negated, so the epilogue scales both alike
@@ -138,7 +138,7 @@ class PressureWave(Simulation):
         if self.derive_inertia:
             weight = 1.0 / weight
         if self.damping is not None:
-            # the damped update divides by 1 + beta, so the added source has to share it
+            # the damped update divides by 1 + beta, so the source has to share it
             beta = 0.5 * weight * mat["damping"].ravel()[lin_index] * self.dt
             weight = weight / (1.0 + beta)
         return (self.dtype(self.dt**2 * self.source_factor()) * weight).astype(

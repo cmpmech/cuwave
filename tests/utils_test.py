@@ -1,10 +1,11 @@
 """Contracts of the spectral objective, which nothing downstream can check for itself.
 
-`intensity` is a linear transform of the sensor record followed by a squared magnitude, and
-both halves are easy to get subtly wrong: the sign and the `dt` of the transform decide
-whether the reported spectrum is the physical one, and its adjoint is one conjugation away
-from an expression that agrees on real data and disagrees on everything else. So the
-transform is pinned against `numpy.fft` and its derivative against central differences.
+`intensity` is a linear transform of the sensor record followed by a squared magnitude,
+and both halves are easy to get subtly wrong: the sign and the `dt` of the transform
+decide whether the reported spectrum is the physical one, and its adjoint is one
+conjugation away from an expression that agrees on real data and disagrees on
+everything else. So the transform is pinned against `numpy.fft` and its derivative
+against central differences.
 """
 
 import unittest

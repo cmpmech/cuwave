@@ -1,4 +1,4 @@
-// Prelude prepended to every .cu by wave.compile_kernels, after the stencil table.
+// Prelude prepended to every .cu by compile_kernels, after the stencil table.
 // Compile-time configuration (set via -D flags and stencils.preamble):
 //   USE_FLOAT
 //   NDIM = 1 | 2 | 3

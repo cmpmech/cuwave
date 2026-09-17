@@ -2,10 +2,10 @@
 
 Three of them carry the rest. In 1D elasticity *is* the scalar equation, so
 `AnisotropicElasticWave` must reproduce `ScalarWave` to round-off, which pins the whole
-vector pipeline against the already-trusted one. The cell assembly is `-B^T C B`, so the
-operator must be exactly symmetric, which is what all three adjoint variants rest on. And
-full quadrature is what buys that symmetry without an hourglass mode, so the checkerboard
-must not be a null mode.
+vector pipeline against the already-trusted one. The cell assembly is `-B^T C B`, so
+the operator must be exactly symmetric, which is what all three adjoint variants rest
+on. And full quadrature is what buys that symmetry without an hourglass mode, so the
+checkerboard must not be a null mode.
 """
 
 import unittest

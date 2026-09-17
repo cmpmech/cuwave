@@ -1,11 +1,12 @@
 """Isotropic elasticity on a staggered grid, a sibling of `PressureWave` on the same march.
 
-Component `c` lives half a node up its own axis, so every strain lands on a natural point:
-the normal strains on the nodes, the shear `(k, l)` half a node up both of its axes. Each
-is a pure per-axis staggered difference, which is what carries the cross terms a per-axis
-flux cannot and keeps the cost linear in the stencil radius, where the cell gather of
-`AnisotropicElasticWave` pays `(2r)**(2 ndim)`. The operator is `-B^T C B` with the
-material sampled on the stress points, so it stays the exact transpose at every order.
+Component `c` lives half a node up its own axis, so every strain lands on a natural
+point: the normal strains on the nodes, the shear `(k, l)` half a node up both of its
+axes. Each is a pure per-axis staggered difference, which is what carries the cross
+terms a per-axis flux cannot and keeps the cost linear in the stencil radius, where the
+cell gather of `AnisotropicElasticWave` pays `(2r)**(2 ndim)`. The operator is
+`-B^T C B` with the material sampled on the stress points, so it stays the exact
+transpose at every order.
 """
 
 from __future__ import annotations
@@ -65,10 +66,10 @@ def voigt(ndim: int, lame: float, shear: float, plane: str = "strain") -> npt.ND
 class ElasticWave(Simulation):
     """Staggered isotropic elasticity, parametrized by a density-scaling indicator gamma.
 
-    Both wave speeds are held fixed and gamma scales the density, so `C = gamma * rho0 * C`
-    scales inertia and stiffness alike and the stable timestep does not move with the
-    design. This is the parametrization ultrasonic full waveform inversion reaches for,
-    since a void is a density contrast at unchanged speeds.
+    Both wave speeds are held fixed and gamma scales the density, so
+    `C = gamma * rho0 * C` scales inertia and stiffness alike and the stable timestep
+    does not move with the design. This is the parametrization ultrasonic full waveform
+    inversion reaches for, since a void is a density contrast at unchanged speeds.
     """
 
     density: float = None  # background density rho0
