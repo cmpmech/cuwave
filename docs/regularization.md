@@ -58,7 +58,7 @@ with $n$ = `iters`; an unknown `scheme` raises
 
 A ramp is needed because the two ends of the map are useless on their own: at large $\beta$ the derivative vanishes away from the threshold and the design barely moves, at small $\beta$ it moves but converges grey. The price is a cost function that changes between iterations, so the history need not decrease across a step in $\beta$ and stored curvature pairs refer to the previous map
 
-Whether the ramp pays depends on the iteration budget: `examples/fwi_2D_adam_projection.py` and `examples/fwi_2D_lbfgs_projection.py` sweep all four schemes on the same inversion and note the outcome at the bottom of each file
+Whether the ramp pays depends on the iteration budget: `examples/fwi/regularization/scalar2D_fwi_adam_projection.py` and `examples/fwi/regularization/scalar2D_fwi_lbfgs_projection.py` expose the choice as their `SCHEME` setting, so all four can be run against the same inversion
 
 ### SIMP
 `SIMP` (solid isotropic material with penalization) raises the design to the power `p`, so that intermediate values buy less material property per unit of the volume budget and the optimizer is driven towards $0/1$, following [Bendsøe 1989](https://doi.org/10.1007/BF01650949) and [Bendsøe & Sigmund 1999](https://doi.org/10.1007/s004190050248)

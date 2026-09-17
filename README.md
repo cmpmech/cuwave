@@ -37,12 +37,13 @@ Possible applications include
 </table>
 
 ## Documentation
-- see the [documentation](docs/Home.md) for how the code works (AI-assisted; verify with sources for critical details)
+- see the [documentation](https://github.com/Leon-Herrmann/cuwave/blob/main/docs/Home.md) for how the code works (AI-assisted; verify with sources for critical details)
 - see [examples](https://github.com/Leon-Herrmann/cuwave/tree/main/examples) for how to apply the code
 
 **Development Note**
 
-**Scalar** & **acoustic wave** equations have been developed over the last 2 years and are thoroughly validated. **Elastic** & **electromagnetic wave** equations were developed with AI assistance (Claude) and have undergone less validation. The elastic wave equation currently shows promising agreement with experimental results. The elastic wave equation is currently being validated against experimental results.
+**Scalar** & **acoustic wave** equations have been developed over the last 2 years and are thoroughly validated. **Elastic** & **electromagnetic wave** equations were developed with AI assistance (Claude) and have undergone less validation. The elastic wave equation is currently being validated against experimental results.
+
 ## Install
 Dependencies are kept **lightweight**. Only CuPy is required beyond standard Python library.
 
@@ -68,5 +69,10 @@ python -m pytest tests/ -q # ~3s; CUDA and PyTorch tests skipped when unavailabl
 If you use our code for your scientific research, please acknowledge this by referring to the following publication:
 
 _Herrmann, L., Bürchner, T., Kudela, L., Kollmannsberger, S., 2026, **A memory-efficient adjoint method to enable billion parameter optimization on a single GPU in dynamic problems**, Structural and Multidisciplinary Optimization, Volume 69, 52 (2026), DOI: [10.1007/s00158-025-04237-y](https://doi.org/10.1007/s00158-025-04237-y)_
-# Contact
+
+## Contact
 For questions, bug reports, or collaboration inquiries, please don't hesitate to contact Leon Herrmann at [herrmann.leon@pm.me](mailto:herrmann.leon@pm.me).
+
+## License
+
+MIT, see [LICENSE](https://github.com/Leon-Herrmann/cuwave/blob/main/LICENSE).

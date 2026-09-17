@@ -11,7 +11,7 @@ An optimization is set up as follows:
 
 $$C=\frac{1}{2}\int_{\Omega_\textrm{target}}\int_0^Tp^2\,\textrm{d}t\,\textrm{d}\Omega$$
 
-with the pressure $p$ over the target region $\Omega_\textrm{target}$ (the acoustic energy leaking into the box), evaluated on the sensor nodes that tile it and scaled by $\Delta t\prod_d\Delta x_d$ so the sum is an integral. Maximizing instead is a sign change on the gradient, which `examples/tato/acoustic_optimization_2D.py` exposes as `MINIMIZE`
+with the pressure $p$ over the target region $\Omega_\textrm{target}$ (the acoustic energy leaking into the box), evaluated on the sensor nodes that tile it and scaled by $\Delta t\prod_d\Delta x_d$ so the sum is an integral. Maximizing instead is a sign change on the gradient, which `examples/tato/acoustic2D_optimization.py` exposes as `MINIMIZE`
 
 The design variables are filtered then projected then masked to the region, so the chain rule runs backwards through the same three maps before it reaches the optimizer: the driver is the only place that ordering exists, since each `Regularization` knows only its own adjoint
 

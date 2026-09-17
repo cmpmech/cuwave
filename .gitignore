@@ -1,16 +1,23 @@
+# Python
 __pycache__/
 *.egg-info/
-*.pdf
 build/
 dist/
-examples/docs/
-.zed/
-.obsidian/
-.ruff_cache/
-.pytest_cache/
-data/
-experiments/
 .venv/
 venv/
+.ruff_cache/
+.pytest_cache/
+
+# Editors and tooling
+.zed/
+.obsidian/
 .claude/settings.local.json
+
+# Generated output
+*.pdf
 *.webm
+
+# Local only: not part of the release
+data/
+experiments/
+examples/docs/

@@ -1,6 +1,8 @@
-"""Neural networks as reparametrization of design field (using PyTorch)
-see https://www.sciencedirect.com/science/article/pii/S0045782523004024
-or https://link.springer.com/article/10.1007/s00158-024-03908-6
+"""Neural networks as a reparametrization of the design field, in PyTorch.
+
+See Herrmann, Buerchner, Dietrich & Kollmannsberger 2023
+(https://doi.org/10.1016/j.cma.2023.116278) and Herrmann, Sigmund, Li, Vogl &
+Kollmannsberger 2024 (https://doi.org/10.1007/s00158-024-03908-6).
 """
 
 import torch

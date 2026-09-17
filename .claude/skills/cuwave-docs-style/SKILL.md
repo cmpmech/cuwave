@@ -212,5 +212,5 @@ the log of an investigation has taken the wrong half.
 
 A module the repo does not have yet still gets its page and its `Home.md` line, in the shape
 `docs/wave.md` uses for `ElasticWave`: the heading, one sentence naming what it will be, and
-`**TODO** not implemented yet`, so the index never links to nothing. `integrators.md` and
-`uncertainty.md` are the two.
+`**TODO** not implemented yet`, so the index never links to nothing. The repo currently
+carries no such stub: every page in `docs/` documents a module that exists.

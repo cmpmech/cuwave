@@ -5,7 +5,7 @@ import cupy.typing as cpt
 
 
 class Adam:
-    """Adam optimizer (Kingma & Ba, 2015): https://arxiv.org/abs/1412.6980"""
+    """Adam optimizer (Kingma & Ba 2015, https://doi.org/10.48550/arXiv.1412.6980)"""
 
     def __init__(
         self,
@@ -31,7 +31,7 @@ class Adam:
 
 class Lbfgs:
     """L-BFGS with Armijo line search over the last `k` secant pairs.
-    Adapted from https://doi.org/10.33774/coe-2021-qpq2j
+    Adapted from Fichtner 2021 (https://doi.org/10.33774/coe-2021-qpq2j).
     """
 
     def __init__(

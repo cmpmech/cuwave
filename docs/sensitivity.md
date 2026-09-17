@@ -18,6 +18,7 @@ Three variants compute it, with the same arguments and the same return. `sensiti
 | member | signature | description |
 |---|---|---|
 | objective | `l2_misfit(observed)` | factory returning `objective(traces) -> (cost, dcost/dtraces)` for the least-squares misfit against `observed` |
+| windowed objective | `windowed_misfit(observed, window)` | the same misfit restricted to a time window, `window` zero outside the arrivals kept and carried twice so the derivative stays exact |
 | exact gradient | `sensitivity(sim, source, indicator, sensors, objective)` | the cost and both gradient fields, storing the forward history, damped or lossless |
 | strip gradient | `reconstruction_sensitivity(sim, source, indicator, sensors, objective)` | the same, marching the forward field backwards behind a recorded strip rather than storing it |
 | reconstructed region | `reconstruction_nodes(sim)` | the strip nodes that variant records each step, and the mask over which its gradient is exact |
@@ -31,7 +32,7 @@ All three material variants return `(cost, {"mass": ..., "stiff": ...}, traces, 
 
 `source_sensitivity` differentiates the same cost with respect to the **emission** rather than the material, so it returns one $(N,\,\textrm{num sources})$ array in place of the pair and is the exact inverse of `adjoint_signal`: that helper divides the objective derivative by `sim.adjoint_weights` on the way into the sensors ($W\sigma$ for the pressure classes, with the source scaling `source_factor` $\sigma$), and the source gradient multiplies the adjoint field by the same weights on the way out of the source. Being linear in the signal, the cost pairs no forward field against the adjoint one there, which is what removes the history entirely; see [source inversion](source_inversion.md)
 
-The gradients come back with respect to the two material fields, never the design. Contracting them onto the indicator is one line at the call site, with the pair `sim.parametrization_jacobian()` that [wave](wave.md) supplies
+The gradients come back with respect to the two material fields, never the design. Contracting them onto the indicator is one line at the call site, with the pair `sim.parametrization_jacobian(indicator)` that [wave](wave.md) supplies
 
 $$\frac{\textrm{d}C}{\textrm{d}\gamma}=\frac{\partial m}{\partial\gamma}\frac{\textrm{d}C}{\textrm{d}m}+\frac{\partial k}{\partial\gamma}\frac{\textrm{d}C}{\textrm{d}k}$$
 

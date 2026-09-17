@@ -12,25 +12,27 @@ optimization.
 
 ## Environment and commands
 
-The project venv is `/home/leon/.venvs/cuwave` (Zed is pinned to it in `.zed/settings.json`).
+The project uses a dedicated virtualenv; the commands below assume it is active.
 
 ```bash
-/home/leon/.venvs/cuwave/bin/python -m pytest tests/ -q          # whole suite, ~3 s
-/home/leon/.venvs/cuwave/bin/python -m pytest tests/sensitivity_test.py -q
-/home/leon/.venvs/cuwave/bin/python -m pytest \
+python -m pytest tests/ -q          # whole suite, ~3 s
+python -m pytest tests/sensitivity_test.py -q
+python -m pytest \
     "tests/boundary_test.py::DispatchTest::test_mixed_faces_2D" -q
-/home/leon/.venvs/cuwave/bin/python examples/fwi/fwi_2D_adam.py  # drivers are run directly
+python examples/fwi/scalar2D_fwi_adam.py  # drivers are run directly
 ```
 
 - Tests are `unittest` classes run under pytest. Everything CUDA is behind a
   `HAS_CUDA` guard and everything torch behind `@unittest.skipUnless`, so a run on a
   machine without a GPU silently skips rather than fails — check the pass/skip counts.
-- `ruff` is **not** installed in the cuwave venv; use `/home/leon/.venvs/2027_aibookv3/bin/ruff`
+- `ruff` is not a project dependency; run it from wherever it is installed
   (format/check, 88 columns). `.cu` files are clang-format LLVM defaults, 80 columns.
 - Installing torch here must use the cu128 index
   (`pip install torch --index-url https://download.pytorch.org/whl/cu128`); a plain
   `pip install torch` pulls CUDA 13 wheels that break `cupy-cuda12x` at first kernel launch.
-- `tests/` and `.claude/` are currently in `.gitignore` (marked "ADD later").
+- `tests/`, `docs/` and `.claude/skills/` are tracked and ship with the repo; only
+  `.claude/settings.local.json` is ignored, alongside the local-only `data/`,
+  `experiments/` and `examples/docs/`.
 
 ## Style is defined by two skills — invoke them
 
@@ -126,23 +128,31 @@ groups faces by condition into a bitmask so the default stays one launch.
 
 ### Adjoint sensitivities (`sensitivity.py` + `kernels/<equation>_sensitivity.cu`)
 
-Two variants, identical signature and return, differing only in how the forward field is
+Three variants, identical signature and return, differing only in how the forward field is
 made available to the backward pass:
 
-| | memory | gradient |
-|---|---|---|
-| `sensitivity` | stores all `N + 2` fields | exact transpose of the discretization |
-| `superposition_sensitivity` | 3 field slots | consistent, not exact; `scale` (k) trades a k² bias against round-off |
+| | memory | `sim.damping` | gradient |
+|---|---|---|---|
+| `sensitivity` | stores all `N + 2` fields | supported | exact transpose of the discretization |
+| `reconstruction_sensitivity` | 7 grids and `N + 2` copies of the strip | supported, and what the strip pays for | the same transpose, wherever the strip shields it |
+| `superposition_sensitivity` | 5 grids, independent of `N` | rejected (`require_lossless`) | consistent, not exact; `scale` (k) trades a k² bias against round-off |
+
+`reconstruction_sensitivity` marches the forward field backwards instead of storing it,
+recording only the nodes a damping layer makes irreversible — the strip, sized by
+`Simulation.reach`. It reports `info["strip"]` and `info["drift"]`, and is what an **open**
+domain reaches for once the history no longer fits.
 
 `superposition_sensitivity` reconstructs the forward field by time reversal and reads the
 cross term off the diagonal of a bilinear form, which is why it **requires a lossless
-operator** — both variants reject `damping` outright (`require_lossless`). It reports
-`info["cancellation"]`; when that exceeds `CANCELLATION_LIMIT` for the precision the gradient
-is mostly round-off and the caller must raise `scale`.
+operator** and rejects `damping` outright. It reports `info["cancellation"]`; when that
+exceeds `CANCELLATION_LIMIT` for the precision the gradient is mostly round-off and the
+caller must raise `scale`.
 
-Both return gradients with respect to `(mass, stiff)` over the padded grid. Converting to a
-gradient with respect to the design indicator is the caller's chain rule via
-`sim.parametrization_jacobian()` — `utils.misfit_gradient` is the reference for how.
+All three return gradients with respect to `(mass, stiff)` over the padded grid. Converting
+to a gradient with respect to the design indicator is the caller's chain rule via
+`sim.parametrization_jacobian(indicator)` — `utils.misfit_gradient` is the reference for
+how. `source_sensitivity` is the odd one out: it differentiates the same cost with respect
+to `source.signal` rather than the material, in four grids and no history.
 
 ### Optimization layer
 
@@ -179,9 +189,9 @@ Flat top-to-bottom scripts, not functions: an ALL-CAPS settings block, then setu
 measurement → optimization → evaluation → postprocessing, separated by 87-character banners.
 `matplotlib` reaches a driver through `cuwave.postprocessing`.
 `examples/forward/scalarND.py` is the minimal driver and `examples/fwi/scalar2D_fwi_adam.py`
-the full one; copy their shape. `examples/tpto/` holds the two photonic inverse-design
-drivers (a metalens and a wavelength demultiplexer), which are `examples/tato/`'s shape with
-`intensity` in place of `energy` and a sponge plus `reconstruction_sensitivity`.
+the full one; copy their shape. `examples/tpto/` holds the photonic inverse-design
+driver (a metalens), which is `examples/tato/`'s shape with `intensity` in place of
+`energy` and a sponge plus `reconstruction_sensitivity`.
 
 ### Docs (`docs/`)
 
@@ -189,8 +199,6 @@ An Obsidian wiki (one page per module, indexed by `docs/Home.md`) carrying the *
 why* — governing equations, symbol-to-identifier bindings, design trade-offs. Adding a module
 page and its `Home.md` line is one edit. The `.cu` files have no docstrings by design, so
 the `docs/cuda_*.md` pages are the only ones that document arguments.
-`docs/integrators.md` and `docs/uncertainty.md` are TODO stubs for unimplemented
-features.
 
 ## Traps
 

@@ -108,7 +108,6 @@ t = np.linspace(0, (N - 1) * dt, N)
 line = np.linspace(0.0, WIDTH, resolution[0] - 2)
 envelope = np.exp(-(((line - 0.5 * WIDTH) / ENVELOPE) ** 2))
 # scaled by the spacing along the line
-# signal = np.outer(sineburst(t, AMPLITUDE * dx[0], FREQUENCY, CYCLES), envelope)
 signal = np.outer(ricker(t, AMPLITUDE * dx[0], FREQUENCY), envelope)
 source = point_source(sim, [shift((x, SUBSTRATE - SOURCE_DEPTH)) for x in line], signal)
 

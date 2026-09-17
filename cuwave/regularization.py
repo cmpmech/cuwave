@@ -127,7 +127,10 @@ class Projection(Regularization):
 
 
 class SIMP(Regularization):
-    """Power-law penalization making intermediate designs uneconomical (Bendsoe 1989)"""
+    """Power-law penalization making intermediate designs uneconomical (Bendsoe 1989).
+
+    See https://doi.org/10.1007/BF01650949
+    """
 
     def __init__(self, p: float = 3.0, x_min: float = 0.0) -> None:
         self.p, self.x_min = p, x_min
@@ -220,7 +223,8 @@ def continuation(
     * `"linear"`: equal increments, so most of the run is already sharp
     * `"exponential"`: equal factors, spending the early iterations near `start`
     * `"staircase"`: `stages` levels held for `iters // stages` iterations
-      each, the classic continuation (Wang, Lazarov & Sigmund 2011)
+      each, the classic continuation (Wang, Lazarov & Sigmund 2011,
+      https://doi.org/10.1007/s00158-010-0602-y)
     """
     last = max(iters - 1, 1)
     if scheme == "constant":

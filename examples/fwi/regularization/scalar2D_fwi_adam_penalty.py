@@ -50,13 +50,10 @@ GAMMA_VOID = 1e-4
 VOID_YRANGE, VOID_X = (0.1, 0.5), 0.5
 
 # regularization
-PENALTY = "tv"
+PENALTY = "tv"  # or "tikhonov", whose weight wants raising to about 3e-3
 WEIGHT = 3e-4
 TV_EPS = 1e-2  # below this gradient magnitude total variation acts like Tikhonov
-
-# PENALTY = "tikhonov"
-# TIKHONOV_ORDER = 1  # 0 damps towards the start model, 1 smooths
-# WEIGHT = 3e-3
+TIKHONOV_ORDER = 1  # 0 damps towards the start model, 1 smooths
 
 # optimization
 ITERS, LR = 60, 1e-1

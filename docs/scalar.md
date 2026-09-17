@@ -21,7 +21,7 @@ with the background wave speed `wavespeed` $c_0$ and density `density` $\rho_0$,
 | member | specific to `ScalarWave` |
 |---|---|
 | `parametrization(indicator)` | $k=\gamma$ and $m$ derived, as $\gamma$ scales inertia and stiffness alike (`derive_inertia`) |
-| `parametrization_jacobian()` | $\left(1,\,1\right)$ |
+| `parametrization_jacobian(indicator)` | $\left(1,\,1\right)$ |
 | `step_factors()` | $2\,c_0^2\Delta t^2/\Delta x_k^2$, carrying the wave speed |
 | `source_factor()` | $1/\rho_0$ |
 
@@ -33,7 +33,7 @@ with the two materials `rho1`/`kappa1` and `rho2`/`kappa2` that $\gamma$ interpo
 | member | specific to `AcousticWave` |
 |---|---|
 | `parametrization(indicator)` | $m=1/\kappa$ and $k=1/\rho$, both stored as the inverse the kernel wants, so neither $\rho$ nor $\kappa$ is ever formed |
-| `parametrization_jacobian()` | $\left(1/\kappa_2-1/\kappa_1,\,1/\rho_2-1/\rho_1\right)$, constant since both coefficients are affine in $\gamma$ |
+| `parametrization_jacobian(indicator)` | $\left(1/\kappa_2-1/\kappa_1,\,1/\rho_2-1/\rho_1\right)$, constant since both coefficients are affine in $\gamma$ |
 | `step_factors()` | $2\,\Delta t^2/\Delta x_k^2$, the wave speed already sitting in the fields |
 | `source_factor()` | $1$ |
 

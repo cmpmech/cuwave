@@ -25,7 +25,7 @@ with the emitted signal $s_i^t$ of source node $i$ at step $t$, the adjoint fiel
 
 | driver | what it adds |
 |---|---|
-| `examples/fwi/source_inversion_2D_adam.py` | the reference inversion: one transducer in a homogeneous medium, `Adam` from a zero-source start, the measurement simulated at a higher order than it is inverted at |
+| `examples/fwi/scalar2D_source_inversion_adam.py` | the reference inversion: one transducer in a homogeneous medium, `Adam` from a zero-source start, the measurement simulated at a higher order than it is inverted at |
 
 ## no forward field
 

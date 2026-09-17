@@ -1,6 +1,6 @@
 # Neural networks
 
-**Neural networks** reparametrize the design field as the output of a convolutional generator, so the optimizer updates network weights instead of nodal values, following [Herrmann, Bürchner, Dietrich & Kollmannsberger 2023](https://doi.org/10.1016/j.cma.2023.116307)
+**Neural networks** reparametrize the design field as the output of a convolutional generator, so the optimizer updates network weights instead of nodal values, following [Herrmann, Bürchner, Dietrich & Kollmannsberger 2023](https://doi.org/10.1016/j.cma.2023.116278)
 
 The design is then $\gamma=G_\theta(z)$ with the fixed latent `latent` $z$ and the weights `parameters` $\theta$, and the chain rule the driver already applies for a filter or a projection extends by one more factor: the gradient with respect to $\gamma$ is handed to `backward` and PyTorch produces $\partial\gamma/\partial\theta$. This is the only module that uses torch; the solver and its adjoints are cupy throughout
 

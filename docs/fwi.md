@@ -16,12 +16,19 @@ with the simulated traces $u_r^t$ and the measured `observed` $u_{r,\textrm{obs}
 
 | driver | what it adds |
 |---|---|
-| `examples/fwi/fwi_2D_adam.py` | the reference inversion: `Adam`, no regularization, a synthetic measurement simulated at a higher order than it is inverted at |
-| `examples/fwi/fwi_2D_lbfgs.py` | `Lbfgs` with the Armijo line search in place of `Adam` |
-| `examples/fwi/fwi_2D_adam_sponge.py` | a [sponge](boundary.md) on the left and right edges, so the specimen is unbounded across the transducer array; the pad is added outside the region of interest and frozen out of the design |
-| `examples/fwi/regularization/fwi_2D_adam_penalty.py` | a `TotalVariation` or `Tikhonov` term added to the objective |
-| `examples/fwi/regularization/fwi_2D_adam_projection.py` | `DensityFilter` and `Projection` on the design, with a continuation schedule |
-| `examples/fwi/regularization/fwi_2D_adam_nn.py` | the design reparametrized by a [generator](nn.md) |
+| `examples/fwi/scalar2D_fwi_adam.py` | the reference inversion: `Adam`, no regularization, a synthetic measurement simulated at a higher order than it is inverted at |
+| `examples/fwi/scalar2D_fwi_lbfgs.py` | `Lbfgs` with the Armijo line search in place of `Adam` |
+| `examples/fwi/scalar2D_fwi_adam_sponge.py` | a [sponge](boundary.md) on the left and right edges, so the specimen is unbounded across the transducer array; the pad is added outside the region of interest and frozen out of the design |
+| `examples/fwi/regularization/scalar2D_fwi_adam_penalty.py` | a `TotalVariation` or `Tikhonov` term added to the objective |
+| `examples/fwi/regularization/scalar2D_fwi_adam_projection.py` | `DensityFilter` and `Projection` on the design, with a continuation schedule |
+| `examples/fwi/regularization/scalar2D_fwi_adam_nn.py` | the design reparametrized by a [generator](nn.md) |
+| `examples/fwi/scalar2D_fwi_adam_mask.py` | a mask holding the nodes around each transducer intact, so the array itself is never inverted for |
+| `examples/fwi/regularization/scalar2D_fwi_lbfgs_projection.py` | the same projection under `Lbfgs`, where the map changing between iterations is what the stored curvature pairs have to survive |
+| `examples/fwi/regularization/scalar2D_fwi_adam_nn_projection.py` | the generator and the projection composed, the driver fixing the order the two adjoints chain in |
+| `examples/fwi/regularization/scalar2D_fwi_adam_sponge_projection.py` | the projection on the sponged domain, the layer frozen out of the design |
+| `examples/fwi/regularization/scalar2D_fwi_adam_sponge_nn.py` | the generator on the sponged domain, the same freeze |
+| `examples/fwi/elastic2D_fwi_adam.py` | the vector unknown: [elastic](elastic.md) in place of the pressure wave, with `direction` on every source and receiver |
+| `examples/fwi/elastic2D_fwi_adam_sponge.py` | the elastic inversion with the sponge, the two extensions combined |
 
 An inversion is scored twice, on the recovered field and on the same field thresholded, because the two answer different questions: the raw field carries how confident the reconstruction is and the thresholded one is the defect map a caller would act on. `pr_auc` normally drops on thresholding (the ranking it integrates over is exactly what the cut throws away), while `l2_error` improves, since the grey halo around a recovered void costs more in norm than the boundary the cut misplaces
 

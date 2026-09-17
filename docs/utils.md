@@ -11,11 +11,11 @@ Sources and receivers are placed by **coordinate**, not by node index, and multi
 | resampling | `resample(signal, dt, dt_new, N_new=None)` | linear resampling along the leading axis, on either array module, zero past the end of the original span |
 | coordinates | `line(start, stop, count)` | `count` coordinates evenly spaced from `start` to `stop`, endpoints included |
 | interpolation | `distribute(sim, coords, direction=None)` | the `(nodes, weights)` of the surrounding cell corners, per component where `component_offsets` shifts them, raising for a coordinate outside the domain |
-| source | `point_source(sim, coords, signal)` | a `Source` firing `signal` at `coords`, divided by the cell volume so the amplitude does not depend on the spacing |
-| source chain rule | `collect_source(sim, coords, columns)` | the transpose of `point_source`: an $(N,\,\textrm{num}\cdot2^\textrm{ndim})$ node gradient contracted onto the signal of each coordinate |
-| shot list | `shots(sim, coords, signal)` | one single-coordinate `Source` per coordinate, which is the shot list of an inversion |
+| source | `point_source(sim, coords, signal, direction=None)` | a `Source` firing `signal` at `coords`, divided by the cell volume so the amplitude does not depend on the spacing |
+| source chain rule | `collect_source(sim, coords, columns, direction=None)` | the transpose of `point_source`: an $(N,\,\textrm{num}\cdot2^\textrm{ndim})$ node gradient contracted onto the signal of each coordinate |
+| shot list | `shots(sim, coords, signal, direction=None)` | one single-coordinate `Source` per coordinate, which is the shot list of an inversion |
 | stacking | `stack(sources)` | concatenates positions and signal columns, firing several shots in a single simulation |
-| receivers | `Sensors(sim, coords)` | precomputes the interpolation once; `traces(record)` reduces a node record onto receivers and `scatter(dphi)` is its transpose |
+| receivers | `Sensors(sim, coords, direction=None)` | precomputes the interpolation once; `traces(record)` reduces a node record onto receivers and `scatter(dphi)` is its transpose |
 | lifting | `Sensors.objective(objective)` | wraps a receiver-space objective into the node space [sensitivity](sensitivity.md) wants |
 | experiment | `measure(sim, sources, indicator, sensors)` | the receiver traces per shot, i.e. the synthetic experiment an inversion is fitted to |
 | cost | `misfit(sim, sources, indicator, sensors, observed, objective=l2_misfit)` | the summed cost alone, forward passes only |
@@ -24,6 +24,8 @@ Sources and receivers are placed by **coordinate**, not by node index, and multi
 | objective | `intensity(sim, frequencies, weights=None)` | factory for $J=\sum_{fc}w_{fc}\lvert\hat{u}_{fc}\rvert^2$, the spectral intensity at the sensor nodes, `weights` pairing each frequency with the port it is scored on |
 | cost | `response(sim, source, indicator, sensors, objective)` | one forward pass, returning the cost together with the field at the last step |
 | cost and gradient | `response_gradient(sim, source, indicator, sensors, objective, adjoint=sensitivity)` | the same cost with its derivative, reparametrized onto the indicator as above |
+
+`direction` is what makes the same helpers serve a vector unknown: it is optional for the pressure classes, whose single component needs none, and required for [elastic](elastic.md) and [maxwell](maxwell.md), where a source or a receiver has to say which component it drives or reads. `distribute` carries the same argument underneath all four, so the component offsets of a staggered layout are honoured once rather than per caller
 
 The three applications get the same pair twice: `misfit` / `misfit_gradient` sums over a shot list against measured data for [fwi](fwi.md), `response` / `response_gradient` scores one shot against a design objective for [tato](tato.md) and [tpto](tpto.md). Both route the chain rule from $(m,k)$ onto the indicator through the same private `_reparametrize`, so a new `Simulation` subclass changes neither
 

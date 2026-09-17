@@ -96,9 +96,9 @@ class PolarizedWave(PressureWave):
 class ElectricWave(PolarizedWave):
     """Out-of-plane electric field, the permittivity its inertia and `1 / mu` its stiffness.
 
-    The polarization Christiansen & Sigmund 2021 label TE, and the one a waveguide
-    device is designed in, since a guided mode's electric field is the one held
-    continuous across the sidewalls.
+    The polarization Christiansen & Sigmund 2021 (https://doi.org/10.1364/JOSAB.406048)
+    label TE, and the one a waveguide device is designed in, since a guided mode's
+    electric field is the one held continuous across the sidewalls.
     """
 
     def parametrization(

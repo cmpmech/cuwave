@@ -112,11 +112,11 @@ def roc_auc(field: cpt.NDArray, truth: cpt.NDArray) -> float:
 
 
 def non_discreteness(field: cpt.NDArray, region: cpt.NDArray | None = None) -> float:
-    """Sigmund's greyness measure `mean(4 x (1 - x))`, 0 for a design already 0/1.
+    """Greyness measure `mean(4 x (1 - x))` (Sigmund 2007), 0 for a design already 0/1.
 
     Takes no truth, so it also scores a topology optimization result, where the number
     that matters is how far the grey design the optimizer saw is from the thresholded
-    one that gets built.
+    one that gets built. See https://doi.org/10.1007/s00158-006-0087-x
     """
     x = cp.asarray(field)
     x = x if region is None else x[region]

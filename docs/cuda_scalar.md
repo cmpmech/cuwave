@@ -90,6 +90,9 @@ enforce zero flux, $\partial u/\partial n=0$, on every face of the launch
 Same parallelization, input args and grouping as `homogeneous_neumann_kernel`, with the odd mirror in place of the even one
 - `u[ghost] = -u[ghost + 2 * normal]`: antisymmetry about the wall node, the pressure-release or free-surface condition, and reflection comes back with flipped sign
 - homogeneous in the exact sense: the wall node is never written by this kernel, but the odd mirror makes its own `fd_kernel` update self-annihilating ($D^+-D^-=-2u_1$ at radius 1), so from $u^0=u^1=0$ it stays at exactly $0$ for all $n$
+
+The three transfer kernels below live in `kernels/common.cuh` and not in `scalar.cu`, since every equation shares them byte for byte. They are documented here because the scalar case is the one with no component index to fold in, and the other `cuda_*` pages list only what differs
+
 ### excitation_kernel
 **parallelization**
 flat 1D launch, 256 threads per block, one thread per source

@@ -12,7 +12,7 @@ nothing here is about whitespace that a formatter already decides.
 **Ground truth to imitate**, in this order: `cuwave/evals.py` and `cuwave/signals.py` (the
 docstring register), `cuwave/wave.py` (the layering and the closure factories),
 `cuwave/geometry.py` and `cuwave/utils.py` (validation and shapes), `cuwave/nn.py` (torch),
-`examples/forward/scalar_nD.py` (the minimal driver), `examples/fwi/fwi_2D_adam.py` (the
+`examples/forward/scalarND.py` (the minimal driver), `examples/fwi/scalar2D_fwi_adam.py` (the
 full driver). When a rule below is unclear, copy what those files do.
 
 For **comment density** specifically the measure is `cuwave/utils.py`,
@@ -326,7 +326,7 @@ validation underneath (`raise ValueError(f"every level must divide REFERENCE={RE
 {LEVELS}")` says it better than three lines of prose ever did) or does not belong.
 
 Plotting: **a field plot is the bare field and nothing else.** No ticks, no box, no axis
-labels, no colorbar, no title. `examples/forward/scalar_nD.py` is the whole pattern and
+labels, no colorbar, no title. `examples/forward/scalarND.py` is the whole pattern and
 the default to copy:
 
 ```python

@@ -1,9 +1,10 @@
 """The grid, the compile-time configuration, and the time loop every equation shares.
 
 `Simulation` holds both and leaves the physics to a subclass in its own module
-(`scalar.py`, `elastic.py`, `anisotropic.py`), which names its kernel sources and
-supplies the material and factor hooks. The `define_*` factories bind compiled kernels
-to one such configuration, and `simulate` loops over the closures they return.
+(`scalar.py`, `elastic.py`, `anisotropic.py`, `maxwell.py`), which names its kernel
+sources and supplies the material and factor hooks. The `define_*` factories bind
+compiled kernels to one such configuration, and `simulate` loops over the closures they
+return.
 """
 
 from __future__ import annotations

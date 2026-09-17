@@ -6,6 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "cuwave"
 version = "0.2.0"
 description = "GPU finite-difference wave solver with differentiable adjoints"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Leon Herrmann", email = "herrmann.leon@pm.me"}]
 requires-python = ">=3.10"
 # CuPy is intentionally omitted: install the wheel matching your CUDA toolkit,
 # e.g. `pip install cupy-cuda12x`.
@@ -17,8 +21,19 @@ examples = ["matplotlib>=3.7", "pillow>=9.1"]
 # Only `cuwave.nn` needs torch; the solver and its adjoints are cupy throughout.
 nn = ["torch>=2.0"]
 
+[project.urls]
+Homepage = "https://github.com/Leon-Herrmann/cuwave"
+Documentation = "https://github.com/Leon-Herrmann/cuwave/blob/main/docs/Home.md"
+
 [tool.setuptools]
 packages = ["cuwave"]
 
 [tool.setuptools.package-data]
 cuwave = ["kernels/*.cu"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+# module-level lambda objectives are the driver house style
+ignore = ["E731"]
