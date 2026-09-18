@@ -12,6 +12,7 @@ venv/
 .zed/
 .obsidian/
 .claude/settings.local.json
+ruff.toml
 
 # Generated output
 *.pdf
