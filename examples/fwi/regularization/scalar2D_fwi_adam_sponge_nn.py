@@ -202,18 +202,17 @@ print(f"\n{weights} weights for {RESOLUTION[0] * RESOLUTION[1]} dofs\n")
 segmented = threshold(gamma, THRESHOLD, GAMMA_VOID, 1.0, sim.dtype)
 reference, recovered = truth[region], gamma[region]
 thresholded = segmented[region]
-compare = lambda metric, **kwargs: (
-    metric(recovered, reference, **kwargs),
-    metric(thresholded, reference, **kwargs),
-)
 
-print("\neval: raw (thresholded)")
-print("\taverage precision (pr auc): {:.3f} ({:.3f})".format(*compare(pr_auc)))
+print(f"\naverage precision (pr auc): {pr_auc(recovered, reference):.3f}")
 print(
-    f"\tf1 at gamma < {THRESHOLD}: "
+    f"f1 at gamma < {THRESHOLD}: "
     f"{f1_score(recovered, reference, threshold=THRESHOLD):.3f}"
 )
-print("\trelative L2 error: {:.3f} ({:.3f})".format(*compare(l2_error)))
+print(
+    "relative L2 error: {:.3f} (thresholded: {:.3f})".format(
+        l2_error(recovered, reference), l2_error(thresholded, reference)
+    )
+)
 
 # ----------------------------------- postprocessing ----------------------------------
 show_field = lambda ax, field: ax.imshow(
