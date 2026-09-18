@@ -31,7 +31,7 @@ jobs:
           test "v$version" = "${GITHUB_REF_NAME}" \
             || { echo "tag ${GITHUB_REF_NAME} but pyproject says $version"; exit 1; }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: dist
           path: dist/
@@ -43,7 +43,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: dist
           path: dist/
