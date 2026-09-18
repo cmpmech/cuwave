@@ -1,8 +1,8 @@
 # CuWave
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".assets/readme-dark.webp">
-  <img src=".assets/readme-light.webp" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cmpmech/cuwave/main/.assets/readme-dark.webp">
+  <img src="https://raw.githubusercontent.com/cmpmech/cuwave/main/.assets/readme-light.webp" width="100%">
 </picture>
 
 **CuWave** is a single-GPU, differentiable finite difference wave propagation code.
@@ -12,15 +12,15 @@ Possible applications include
 <tr>
 <td valign="middle"><a href="https://www.sciencedirect.com/science/article/pii/S0045782523000166"><strong>nondestructive testing via full waveform inversion</strong></a></td>
 <td width="60%" align="right" valign="middle"><picture>
-<source media="(prefers-color-scheme: dark)" srcset=".assets/fwi-dark.png">
-<img width="100%" src=".assets/fwi-light.png" alt="nondestructive testing via full waveform inversion">
+<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cmpmech/cuwave/main/.assets/fwi-dark.png">
+<img width="100%" src="https://raw.githubusercontent.com/cmpmech/cuwave/main/.assets/fwi-light.png" alt="nondestructive testing via full waveform inversion">
 </picture></td>
 </tr>
 <tr>
 <td valign="middle"><a href="https://doi.org/10.1007/s00158-025-04237-y"><strong>transient acoustic topology optimization</strong></a></td>
 <td width="60%" align="center" valign="middle"><picture>
-<source media="(prefers-color-scheme: dark)" srcset=".assets/tato-dark.webp">
-<img width="46.512%" src=".assets/tato-light.webp" alt="transient acoustic topology optimization">
+<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cmpmech/cuwave/main/.assets/tato-dark.webp">
+<img width="46.512%" src="https://raw.githubusercontent.com/cmpmech/cuwave/main/.assets/tato-light.webp" alt="transient acoustic topology optimization">
 </picture></td>
 </tr>
 <tr>
@@ -30,16 +30,16 @@ Possible applications include
 <tr>
 <td valign="middle"><a href="https://opg.optica.org/josab/fulltext.cfm?uri=josab-38-2-496"><strong>transient photonic topology optimization</strong></a></td>
 <td width="60%" align="right" valign="middle"><picture>
-<source media="(prefers-color-scheme: dark)" srcset=".assets/tpto-dark.webp">
-<img width="100%" src=".assets/tpto-light.webp" alt="transient photonic topology optimization">
+<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cmpmech/cuwave/main/.assets/tpto-dark.webp">
+<img width="100%" src="https://raw.githubusercontent.com/cmpmech/cuwave/main/.assets/tpto-light.webp" alt="transient photonic topology optimization">
 </picture></td>
 </tr>
 </table>
 
 ## Documentation
 
-- see the [documentation](https://github.com/Leon-Herrmann/cuwave/blob/main/docs/Home.md) for how the code works (AI-assisted; verify with sources for critical details)
-- see [examples](https://github.com/Leon-Herrmann/cuwave/tree/main/examples) for how to apply the code
+- see the [documentation](https://github.com/cmpmech/cuwave/blob/main/docs/Home.md) for how the code works (AI-assisted; verify with sources for critical details)
+- see [examples](https://github.com/cmpmech/cuwave/tree/main/examples) for how to apply the code
 
 ## Development status
 
@@ -71,7 +71,7 @@ Dependencies are kept **lightweight**. Only CuPy is required beyond standard Pyt
 
 ```bash
 pip install cupy-cuda12x        # or cupy-cuda11x, to match your CUDA
-pip install -e .
+pip install cuwave               # or `pip install -e .` from a checkout
 ```
 
 CuPy must be installed separately because the wheel depends on your CUDA toolkit;
@@ -105,4 +105,4 @@ For questions, bug reports, or collaboration inquiries, please don't hesitate to
 
 ## License
 
-MIT; see [LICENSE](https://github.com/Leon-Herrmann/cuwave/blob/main/LICENSE).
+MIT; see [LICENSE](https://github.com/cmpmech/cuwave/blob/main/LICENSE).
