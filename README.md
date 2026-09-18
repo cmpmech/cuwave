@@ -1,8 +1,8 @@
 # CuWave
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".assets/readme-dark.png">
-  <img src=".assets/readme-light.png" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset=".assets/readme-dark.webp">
+  <img src=".assets/readme-light.webp" width="100%">
 </picture>
 
 **CuWave** is a single-GPU, differentiable finite difference wave propagation code.
@@ -19,8 +19,8 @@ Possible applications include
 <tr>
 <td valign="middle"><a href="https://doi.org/10.1007/s00158-025-04237-y"><strong>transient acoustic topology optimization</strong></a></td>
 <td width="60%" align="center" valign="middle"><picture>
-<source media="(prefers-color-scheme: dark)" srcset=".assets/tato-dark.png">
-<img width="46.512%" src=".assets/tato-light.png" alt="transient acoustic topology optimization">
+<source media="(prefers-color-scheme: dark)" srcset=".assets/tato-dark.webp">
+<img width="46.512%" src=".assets/tato-light.webp" alt="transient acoustic topology optimization">
 </picture></td>
 </tr>
 <tr>
@@ -30,8 +30,8 @@ Possible applications include
 <tr>
 <td valign="middle"><a href="https://opg.optica.org/josab/fulltext.cfm?uri=josab-38-2-496"><strong>transient photonic topology optimization</strong></a></td>
 <td width="60%" align="right" valign="middle"><picture>
-<source media="(prefers-color-scheme: dark)" srcset=".assets/tpto-dark.png">
-<img width="100%" src=".assets/tpto-light.png" alt="transient photonic topology optimization">
+<source media="(prefers-color-scheme: dark)" srcset=".assets/tpto-dark.webp">
+<img width="100%" src=".assets/tpto-light.webp" alt="transient photonic topology optimization">
 </picture></td>
 </tr>
 </table>
