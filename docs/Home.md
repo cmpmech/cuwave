@@ -13,6 +13,8 @@ Gradients useful in **optimization** scenarios such as inverse problems (full wa
 
 Common **helpers** ease the creation of driver files for applied problem setups
 
+See [install](install.md) for the installation
+
 ## forward simulation
 
 - [wave](wave.md), the grid and the time loop every equation shares

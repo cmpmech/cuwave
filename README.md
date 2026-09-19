@@ -67,31 +67,11 @@ Additional benefits of **CuWave** are
 
 ## Install
 
-Dependencies are kept **lightweight**. Only CuPy is required beyond standard Python library.
-
 ```bash
-pip install cupy-cuda12x        # or cupy-cuda11x, to match your CUDA
-pip install cuwave               # or `pip install -e .` from a checkout
+pip install cuwave
 ```
 
-CuPy must be installed separately because the wheel depends on your CUDA toolkit;
-all remaining dependencies are declared in `pyproject.toml`.
-
-PyTorch is optional for the regularization via neural optimization; see [pytorch](https://pytorch.org/get-started/locally/) for the installation. Otherwise it is not needed.
-
-> [!NOTE]
-> Match PyTorch's CUDA version to CuPy's, or the two runtimes clash at the first kernel launch. 
-> With `cupy-cuda12x`:
-> ```bash
-> pip install torch --index-url https://download.pytorch.org/whl/cu128
-> ```
-
-The tests under `tests/` are `unittest` classes, but `pytest` is the recommended runner:
-
-```bash
-pip install pytest
-python -m pytest tests/ -q  # ~20 s on a GPU, ~3 s without: CUDA and PyTorch tests skip when unavailable
-```
+Requires an NVIDIA GPU and [CuPy](https://docs.cupy.dev/en/stable/install.html) matching your CUDA toolkit (e.g. `pip install cupy-cuda12x`), which is not pulled in automatically. For the full installation, including the optional PyTorch and running the tests, see [docs/install.md](https://github.com/cmpmech/cuwave/blob/main/docs/install.md).
 
 ## References
 
