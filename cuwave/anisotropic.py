@@ -25,7 +25,7 @@ import numpy.typing as npt
 
 from .boundary import Clamped, Traction, faces_with
 from .elastic import voigt
-from .wave import PAIRS, Simulation, apply_cell_weights, grid_block
+from .wave import PAIRS, Simulation, apply_cell_weights, axis_geometry, grid_block
 
 KERNEL_PATH = Path(__file__).parent / "kernels" / "anisotropic.cu"
 SENSITIVITY_PATH = Path(__file__).parent / "kernels" / "anisotropic_sensitivity.cu"
@@ -253,13 +253,6 @@ class AnisotropicElasticWave(Simulation):
         """Source scaling, unscaled since rho0 is already folded into the lumped inertia."""
         return 1.0
 
-    def axis_geometry(self) -> list:
-        """Extents and previous-axis strides, the step kernel's tail without the factors."""
-        geom = [self.Nx[0]]
-        for d in range(1, self.ndim):
-            geom += [self.Nx[d], self.strides[d - 1]]
-        return geom
-
     def gradient_fields(self, mat: dict) -> dict[str, cpt.NDArray]:
         """Nodal accumulators plus the cell one the stiffness density lands in first."""
         grads = {
@@ -285,7 +278,7 @@ class AnisotropicElasticWave(Simulation):
                 grads["material"],
                 grads["design"],
                 self.dtype(1.0 / 2.0**self.ndim),
-                *self.axis_geometry(),
+                *axis_geometry(self),
             ],
         )
         return {"mass": grads["mass"], "stiff": grads["stiff"]}
@@ -302,7 +295,7 @@ class AnisotropicElasticWave(Simulation):
             mat["stencil"],
             mass_factor,
             np.int32(self.comp_stride),
-            *self.axis_geometry(),
+            *axis_geometry(self),
         ]
 
         def gradient_step(u0, u1, u2, l1):
@@ -323,7 +316,7 @@ class AnisotropicElasticWave(Simulation):
             self.dtype(sign * self.density * volume / (2.0 * self.dt) ** 2),
             self.dtype(-sign),
             np.int32(self.comp_stride),
-            *self.axis_geometry(),
+            *axis_geometry(self),
         ]
 
         def frechet_step(u0, u1, u2):

@@ -21,6 +21,7 @@ from .boundary import Neumann
 from .wave import (
     Simulation,
     apply_cell_weights,
+    axis_geometry,
     grid_block,
     mirror_ghosts,
     sensor_cell_weights,
@@ -92,14 +93,8 @@ class PressureWave(Simulation):
         grid, block = grid_block(self)
         # the operator without the dt^2 the step folds into it: L, not dt^2 L
         factors = [self.dtype(float(f) / self.dt**2) for f in self.step_factors()]
-        geom = [factors[0], self.Nx[0]]
-        for d in range(1, self.ndim):
-            geom += [factors[d], self.Nx[d], self.strides[d - 1]]
-        args = [grads["mass"], grads["stiff"], None, None, None, None] + [
-            mat["stiff"],
-            self.dtype(1.0 / self.dt**2),
-            *geom,
-        ]
+        args = [grads["mass"], grads["stiff"], None, None, None, None, mat["stiff"]]
+        args += [self.dtype(1.0 / self.dt**2), *axis_geometry(self, factors)]
 
         def gradient_step(u0, u1, u2, l1):
             args[2], args[3], args[4], args[5] = u0, u1, u2, l1
@@ -115,13 +110,9 @@ class PressureWave(Simulation):
         frechet_kernel = kernels.get_function("frechet_kernel")
         grid, block = grid_block(self)
         # the stiffness density enters negated, so the epilogue scales both alike
-        geom = [self.dtype(sign / (2.0 * self.dt) ** 2)]
-        for d in range(self.ndim):
-            geom.append(self.dtype(-sign / (2.0 * self.dx[d]) ** 2))
-            geom.append(self.Nx[d])
-            if d:
-                geom.append(self.strides[d - 1])
-        args = [accs["mass"], accs["stiff"], None, None, None] + geom
+        factors = [self.dtype(-sign / (2.0 * d) ** 2) for d in self.dx]
+        args = [accs["mass"], accs["stiff"], None, None, None]
+        args += [self.dtype(sign / (2.0 * self.dt) ** 2), *axis_geometry(self, factors)]
 
         def frechet_step(u0, u1, u2):
             args[2], args[3], args[4] = u0, u1, u2

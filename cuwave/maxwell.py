@@ -27,13 +27,12 @@ from .wave import (
     Simulation,
     apply_cell_weights,
     axis_geometry,
-    component_weights,
     grid_block,
     pair_average,
     pair_average_adjoint,
-    pair_weights,
     point_average,
     point_average_adjoint,
+    wall_weights,
 )
 
 KERNEL_PATH = Path(__file__).parent / "kernels" / "maxwell.cu"
@@ -217,7 +216,7 @@ class MaxwellWave(Simulation):
         permittivity = cp.ascontiguousarray(permittivity, dtype=self.dtype)
         minv = cp.zeros((self.ncomp, *self.Nx_padded), dtype=self.dtype)
         for c in range(self.ncomp):
-            mass = component_weights(self, c) * point_average(self, permittivity, c)
+            mass = wall_weights(self, (c,)) * point_average(self, permittivity, c)
             minv[c] = 1.0 / cp.maximum(mass, cp.finfo(self.dtype).tiny)
         # a conductor holds the tangential field, which is what a zeroed inertia does
         for face in faces_with(self, Conductor):
@@ -231,7 +230,7 @@ class MaxwellWave(Simulation):
             nu = cp.ascontiguousarray(nu, dtype=self.dtype)
             pairs = cp.zeros((self.npairs, *self.Nx_padded), dtype=self.dtype)
             for p, axes in enumerate(PAIRS[self.ndim][self.ndim :]):
-                pairs[p] = pair_weights(self, axes) * pair_average(self, nu, axes)
+                pairs[p] = wall_weights(self, axes) * pair_average(self, nu, axes)
             mat["nu_pair"] = cp.ascontiguousarray(pairs)
             mat["nu"] = nu
         if self.damping is not None:
@@ -310,13 +309,13 @@ class MaxwellWave(Simulation):
         """Chain the point densities through the averages onto the nodal design fields."""
         g_mass = cp.zeros(self.Nx_padded, dtype=self.dtype)
         for c in range(self.ncomp):
-            density = grads["mass"][c] * component_weights(self, c)
+            density = grads["mass"][c] * wall_weights(self, (c,))
             g_mass += point_average_adjoint(self, density, c)
         # a non-magnetic medium has no stiffness design dependence: zeros say so
         g_stiff = cp.zeros(self.Nx_padded, dtype=self.dtype)
         if self.magnetic:
             for p, axes in enumerate(PAIRS[self.ndim][self.ndim :]):
-                density = grads["nu"][p] * pair_weights(self, axes)
+                density = grads["nu"][p] * wall_weights(self, axes)
                 g_stiff += pair_average_adjoint(self, density, grads["design"], axes)
         return {"mass": g_mass, "stiff": g_stiff}
 

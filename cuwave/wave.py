@@ -62,7 +62,7 @@ def stable_timestep(
         than to shrink `dt`.
     """
     mat = sim.build_materials(indicator)
-    step = define_step_method(sim, compile_kernels(sim), mat)
+    step = sim.define_step(compile_kernels(sim), mat)
     shifts = sim.component_offsets
     if shifts is None:
         shifts = np.zeros((sim.ncomp, sim.ndim))
@@ -181,25 +181,10 @@ def flatten_indices(
 
 
 # --------------------------------- staggered lattice ---------------------------------
-def component_weights(sim: Simulation, c: int) -> cpt.NDArray:
-    """Cell weights of component `c`: halved on the walls of the unstaggered axes."""
+def wall_weights(sim: Simulation, axes: tuple[int, ...]) -> cpt.NDArray:
+    """Cell weights of a point family staggered along `axes`: halved on the other walls."""
     w = cp.ones(sim.Nx_padded, dtype=sim.dtype)
-    for d in range(sim.ndim):
-        if d == c:
-            continue
-        for index in (1, sim.Nx[d] - 2):
-            wall = [slice(None)] * sim.ndim
-            wall[d] = index
-            w[tuple(wall)] *= 0.5
-    return w
-
-
-def pair_weights(sim: Simulation, axes: tuple[int, int]) -> cpt.NDArray:
-    """Cell weights of a pair point: halved on the walls of the remaining axes."""
-    w = cp.ones(sim.Nx_padded, dtype=sim.dtype)
-    for d in range(sim.ndim):
-        if d in axes:
-            continue
+    for d in set(range(sim.ndim)) - set(axes):
         for index in (1, sim.Nx[d] - 2):
             wall = [slice(None)] * sim.ndim
             wall[d] = index
@@ -380,19 +365,109 @@ def grid_block(sim: Simulation) -> tuple[tuple[int, ...], tuple[int, ...]]:
     return grid, block
 
 
-def axis_geometry(sim: Simulation, factors: list) -> list:
-    """Interleave `factors` with axis extents and strides, in the layout the step kernel expects."""
+def axis_geometry(sim: Simulation, factors: list | None = None) -> list:
+    """Interleave `factors` with axis extents and strides, in the layout the kernels expect."""
     # kernel args after the material arrays: f0, N0, [f1, N1, s0], [f2, N2, s1]
-    geom = [factors[0], sim.Nx[0]]
-    for d in range(1, sim.ndim):
-        geom += [factors[d], sim.Nx[d], sim.strides[d - 1]]
+    geom = []
+    for d in range(sim.ndim):
+        geom += [] if factors is None else [factors[d]]
+        geom += [sim.Nx[d]] + ([sim.strides[d - 1]] if d else [])
     return geom
 
 
+# ----------------------------------- time marching -----------------------------------
+CHUNK = 24  # steps per captured graph, a multiple of every rotation period (2, 3)
+
+
+@dataclass
+class Window:
+    """A record `march` stages for a graph: `step` reads or writes it at row t + offset.
+
+    An input loads the `halo` rows past each chunk as well; a store window writes its
+    rows `halo ..` back and, if it also loads, loads only the `halo` rows it starts from.
+    """
+
+    record: cpt.NDArray
+    halo: int = 0
+    load: bool = True
+    store: bool = False
+
+    def __post_init__(self) -> None:
+        """An output only stores, so `store=True` alone clears `load`."""
+        self.load = self.load and (not self.store or self.halo > 0)
+
+
+def march(N: int, step: Callable, windows: list[Window] = ()) -> None:
+    """Call `step(t, *records)` for t in range(N), replaying chunks as a captured graph.
+
+    Per-step host work is the launch itself, which on a small grid outweighs the kernel,
+    so `CHUNK` steps are captured once and replayed. `step` may launch kernels only,
+    rotate its slots by t modulo a divisor of `CHUNK`, and touch each window's record
+    at rows t .. t + halo. A graph addresses fixed memory, so the windows are staged
+    through buffers of `CHUNK + halo` rows, and only while they fit in L2 (there the
+    staging copy is free); past that the kernels outweigh the launch anyway.
+
+    Args:
+        N: the number of steps.
+        step: launches step t, taking the windows' records in order.
+        windows: the records `step` reads or writes per step, each a `Window`.
+    """
+    shapes = [(CHUNK + w.halo, *w.record.shape[1:]) for w in windows]
+    nbytes = sum(int(np.prod(s)) * w.record.itemsize for s, w in zip(shapes, windows))
+    if N < 2 * CHUNK or nbytes > cp.cuda.Device().attributes["L2CacheSize"]:
+        for t in range(N):
+            step(t, *(w.record for w in windows))
+        return
+
+    staging = [cp.empty(s, dtype=w.record.dtype) for s, w in zip(shapes, windows)]
+    capture = cp.cuda.Stream()
+    with capture:
+        capture.begin_capture()
+        for k in range(CHUNK):
+            step(k, *staging)
+        graph = capture.end_capture()
+    for start in range(0, N, CHUNK):
+        count = min(CHUNK, N - start)
+        for w, buf in zip(windows, staging):
+            if w.load:
+                rows = w.halo if w.store else count + w.halo
+                buf[:rows] = w.record[start : start + rows]
+        if count == CHUNK:
+            graph.launch()
+        else:
+            for k in range(count):
+                step(k, *staging)
+        for w, buf in zip(windows, staging):
+            if w.store:
+                w.record[start + w.halo : start + w.halo + count] = buf[
+                    w.halo : w.halo + count
+                ]
+
+
 # -------------------------------- simulation functions -------------------------------
-def define_step_method(sim: Simulation, kernels: cp.RawModule, mat: dict) -> Callable:
-    """The step closure `sim.define_step` builds, a hook so a scheme may launch several kernels."""
-    return sim.define_step(kernels, mat)
+def _define_transfer(
+    sim: Simulation,
+    name: str,
+    position: cpt.NDArray[cp.int32],
+    kernels: cp.RawModule,
+    *extra: cpt.NDArray,
+) -> Callable:
+    """Closure launching transfer kernel `name` between `u` and row t of a record."""
+    kernel = kernels.get_function(name)
+    threads = 256
+    num = position.shape[1]
+    blocks = ((num + threads - 1) // threads,)
+    # the whole (N, num) record plus a row offset, not a row view
+    args = [None, None, np.int32(0), flatten_indices(sim, position), np.int32(num)]
+    args += extra
+
+    def transfer_step(u, record, t_index):
+        args[0], args[1] = u, record
+        args[2] = np.int32(t_index * num)
+        kernel(blocks, (threads,), args)
+        return u
+
+    return transfer_step
 
 
 def define_excitation(
@@ -401,65 +476,23 @@ def define_excitation(
     kernels: cp.RawModule,
     mat: dict,
 ) -> Callable:
-    """Closure injecting `signal` at `position` into `u` at timestep `t_index`."""
-    excitation_kernel = kernels.get_function("excitation_kernel")
-    threads = 256
-    num_sources = position.shape[1]
-    blocks = (num_sources + threads - 1) // threads
-    lin_index = flatten_indices(sim, position)
-    weight = sim.excitation_weights(mat, lin_index)
-    # the whole (N, num_sources) record plus a row offset, not a row view
-    args = [None, None, np.int32(0), lin_index, np.int32(num_sources), weight]
-
-    def excitation_step(u, signal, t_index):
-        args[0], args[1] = u, signal
-        args[2] = np.int32(t_index * num_sources)
-        excitation_kernel((blocks,), (threads,), args)
-        return u
-
-    return excitation_step
+    """Closure adding row `t_index` of an (N, num_sources) signal into `u` at `position`."""
+    weight = sim.excitation_weights(mat, flatten_indices(sim, position))
+    return _define_transfer(sim, "excitation_kernel", position, kernels, weight)
 
 
 def define_get_signal(
     sim: Simulation, sensors: cpt.NDArray[cp.int32], kernels: cp.RawModule
 ) -> Callable:
     """Closure writing row `t_index` of the (N, num_sensors) record `um` from `u`."""
-    get_signal_kernel = kernels.get_function("get_signal_kernel")
-    threads = 256
-    num_sensors = sensors.shape[1]
-    blocks = (num_sensors + threads - 1) // threads
-    lin_index = flatten_indices(sim, sensors)
-    args = [None, None, np.int32(0), lin_index, np.int32(num_sensors)]
-
-    # writes row t of the whole (N, num_sensors) record, so the caller never slices
-    def get_signal_step(u, um, t_index):
-        args[0], args[1] = u, um
-        args[2] = np.int32(t_index * num_sensors)
-        get_signal_kernel((blocks,), (threads,), args)
-        return um
-
-    return get_signal_step
+    return _define_transfer(sim, "get_signal_kernel", sensors, kernels)
 
 
 def define_set_signal(
     sim: Simulation, sensors: cpt.NDArray[cp.int32], kernels: cp.RawModule
 ) -> Callable:
-    """Closure writing `u` at `sensors` back from row `t_index` of the record `um`."""
-    set_signal_kernel = kernels.get_function("set_signal_kernel")
-    threads = 256
-    num_sensors = sensors.shape[1]
-    blocks = (num_sensors + threads - 1) // threads
-    lin_index = flatten_indices(sim, sensors)
-    args = [None, None, np.int32(0), lin_index, np.int32(num_sensors)]
-
-    # assignment rather than the atomicAdd of define_excitation, so it restores a state
-    def set_signal_step(u, um, t_index):
-        args[0], args[1] = u, um
-        args[2] = np.int32(t_index * num_sensors)
-        set_signal_kernel((blocks,), (threads,), args)
-        return u
-
-    return set_signal_step
+    """Closure writing `u` at `sensors` back from row `t_index`, restoring rather than adding."""
+    return _define_transfer(sim, "set_signal_kernel", sensors, kernels)
 
 
 def simulate(
@@ -483,36 +516,39 @@ def simulate(
         `sensors` is given and the stacked host snapshots when `record_every` is.
     """
     U = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
-    u0, u1 = U[0], U[1]
 
     mat = sim.build_materials(indicator)
     kernels = compile_kernels(sim)
-    fd_step = define_step_method(sim, kernels, mat)
+    fd_step = sim.define_step(kernels, mat)
     bc_step = define_boundary(sim, kernels)
     excitation_step = define_excitation(sim, source.position, kernels, mat)
+    windows = [Window(source.signal)]
     if sensors is not None:
         get_signal = define_get_signal(sim, sensors, kernels)
         um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
+        windows.append(Window(um, store=True))
     interior = (Ellipsis, *(slice(0, n) for n in sim.Nx))
-    snapshots = []
 
-    def field(u):
-        return u[interior]
+    # U[t % 2] takes u^t over u^(t - 2), so the rotation is a function of t alone
+    def step(t, signal, um=None):
+        u = fd_step(U[t % 2], U[1 - t % 2], U[t % 2])
+        excitation_step(u, signal, t)
+        bc_step(u)
+        if um is not None:
+            get_signal(u, um, t)
 
-    for t in range(sim.N):
-        u0 = fd_step(u0, u1, u0)
-        u0 = excitation_step(u0, source.signal, t)
-        u0 = bc_step(u0)
-        u1, u0 = u0, u1
-        if sensors is not None:
-            get_signal(u1, um, t)
-        if record_every is not None and t % record_every == 0:
-            snapshots.append(field(u1).get())
+    if record_every is None:
+        march(sim.N, step, windows)
+    else:
+        snapshots = []
+        for t in range(sim.N):
+            step(t, *(w.record for w in windows))
+            if t % record_every == 0:
+                snapshots.append(U[t % 2][interior].get())
 
-    if sensors is not None and record_every is not None:
-        return field(u1), um, np.stack(snapshots)
+    out = (U[(sim.N - 1) % 2][interior],)
     if sensors is not None:
-        return field(u1), um
+        out += (um,)
     if record_every is not None:
-        return field(u1), np.stack(snapshots)
-    return field(u1)
+        out += (np.stack(snapshots),)
+    return out if len(out) > 1 else out[0]

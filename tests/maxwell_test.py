@@ -43,7 +43,6 @@ if HAS_CUDA:
     from cuwave.utils import Sensors, intensity, point_source, response_gradient
     from cuwave.wave import (
         compile_kernels,
-        define_step_method,
         grid_coords,
         simulate,
         stable_dt,
@@ -319,7 +318,7 @@ def _vector(Nx, N=150, space_order=2, cls=None, **kwargs):
 def _operator(sim, indicator):
     """The mass weighted spatial operator on the free unknowns, an exact transpose."""
     mat = sim.build_materials(indicator)
-    step = define_step_method(sim, compile_kernels(sim), mat)
+    step = sim.define_step(compile_kernels(sim), mat)
     mass = cp.where(mat["minv"] > 0, 1.0 / cp.maximum(mat["minv"], 1e-300), 0.0)
     slices = [
         (c, *(slice(1, n - 1 - (d == c)) for d, n in enumerate(sim.Nx)))

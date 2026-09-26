@@ -34,7 +34,6 @@ if HAS_CUDA:
     from cuwave.utils import Sensors, point_source
     from cuwave.wave import (
         compile_kernels,
-        define_step_method,
         simulate,
         stable_dt,
         stable_timestep,
@@ -85,7 +84,7 @@ def _problem(sim, seed=0):
 def _operator(sim, indicator):
     """The mass weighted spatial operator, which the assembly makes symmetric."""
     mat = sim.build_materials(indicator)
-    step = define_step_method(sim, compile_kernels(sim), mat)
+    step = sim.define_step(compile_kernels(sim), mat)
     interior = (Ellipsis, *(slice(1, n - 1) for n in sim.Nx))
     mass = cp.where(mat["minv"] > 0, 1.0 / cp.maximum(mat["minv"], 1e-300), 0.0)
 
@@ -176,7 +175,7 @@ class OperatorTest(unittest.TestCase):
             )
             u1 = cp.asarray(u, dtype=sim.dtype)
             mat = sim.build_materials(cp.ones(sim.Nx_padded, dtype=sim.dtype))
-            step = define_step_method(sim, compile_kernels(sim), mat)
+            step = sim.define_step(compile_kernels(sim), mat)
             u0, u2 = cp.zeros_like(u1), cp.zeros_like(u1)
             step(u0, u1, u2)
             cp.cuda.Stream.null.synchronize()

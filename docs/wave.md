@@ -15,7 +15,7 @@ a wave simulation is set up as follows:
 	- `fd_step` (spatial discretization)
 	- `bc_step` (modification for boundary conditions)
 	- `excitation_step` (source contribution)
-2. unrolling of the time integration (where kernels are executed at each time step)
+2. unrolling of the time integration (where kernels are executed at each time step), handed to `march`
 
 - the `Simulation`class (and its derived versions) collect the simulation setup
 - the `define_[kernel]` prepare the specific kernels
@@ -74,7 +74,7 @@ def fd_step(u0, u1, u2):
 
 | factory              | module           | kernel              | closure                                          |
 | -------------------- | ---------------- | ------------------- | ------------------------------------------------ |
-| `define_step_method` | `wave.py`        | `fd_kernel`         | `fd_step(u0, u1, u2)`                            |
+| `sim.define_step`    | `wave.py`        | `fd_kernel`         | `fd_step(u0, u1, u2)`                            |
 | `define_boundary`    | `boundary.py`    | one per condition   | `bc_step(u)`                                     |
 | `define_excitation`  | `wave.py`        | `excitation_kernel` | `excitation_step(u, signal, t_index)`            |
 | `define_get_signal`  | `wave.py`        | `get_signal_kernel` | `get_signal_step(u, um, t_index)`                |
@@ -88,12 +88,12 @@ Conventions shared by all of them
 | prebuilt `args` list, field slots overwritten per call | one allocation instead of $N$, see above |
 | scalars pre-cast to `np.int32` / `sim.dtype` | `RawKernel` marshals by the object's own type, so an untyped Python scalar is rejected outright and a mismatched array dtype is read as garbage |
 | grid indices flattened on the host by `flatten_indices` | the padded strides are known at setup, so the device never recomputes them |
-| axis extents and strides packed by `axis_geometry` | one ordering of the trailing kernel arguments for every `ndim`, mirrored by the factor-free variant in `boundary.py` and `sensitivity.py` |
+| axis extents and strides packed by `axis_geometry` | one ordering of the trailing kernel arguments for every `ndim`, with or without the per-axis factors, mirrored by hand only in `boundary.py`, which `wave.py` imports |
 | the closure returns the field it wrote | lets the loop read as `u0 = fd_step(u0, u1, u0)` |
-### define_step_method
+### define_step
 Launches `fd_kernel` over the whole padded grid with `grid_block`, one thread per node
 ### define_excitation
-Flat 1D launch of 256 threads, one thread per source, adding the current signal sample into the field
+Flat 1D launch of 256 threads, one thread per source, adding the current signal sample into the field. It and the two below are one private factory, `_define_transfer`, differing only in the kernel name and the source weights
 ### define_get_signal
 The mirror image of the excitation, one thread per sensor, writing row `t_index` of the recording
 
@@ -104,6 +104,18 @@ The inverse of `define_get_signal`, one thread per node, writing the field back 
 Only the reverse march of the [sensitivity](sensitivity.md) analysis needs it, to replay a recorded boundary strip, which is why it assigns where the excitation adds
 ### define_boundary
 see [boundary](boundary.md)
+## march
+**`march`** runs every time loop in the package, `simulate` and the four [sensitivity](sensitivity.md) variants alike: it calls `step(t, *records)` for `t` in `range(N)`, but captures `CHUNK` steps once as a CUDA graph and replays it
+
+| member | signature | description |
+|---|---|---|
+| time loop | `march(N, step, windows=())` | runs the `N` steps, replaying the captured chunk where the staging fits and looping plainly where it does not |
+| record | `Window(record, halo=0, load=True, store=False)` | a record `step` touches at rows `t .. t + halo`: an input loads those rows per chunk, an output stores them back, and one that does both (the `sensitivity` history) loads only its `halo` |
+| chunk | `CHUNK = 24` | steps per graph, a multiple of every slot rotation period (2 for a pair, 3 for a triplet) |
+
+A graph holds fixed pointers and fixed scalars, so a captured step cannot move along a record. The windows therefore stage each record through a buffer of `CHUNK + halo` rows, copied in before and out after each replay, and `step` addresses that buffer at row `k` where the plain loop addresses the record at row `t`. That fixes what a `step` may do: launch kernels only, pick its slots by `t` modulo a divisor of `CHUNK` (never by rebinding a variable, which a replay would not repeat), and touch each record only through its window. A record the kernels index by row offset has to be contiguous, so a backward pass that reads one in reverse hands over a reversed copy, while the history, whose rows go to the kernels as separate pointers, can be a reversed view
+
+The price is the staging copy, which is free while the buffers sit in L2 and is otherwise a pass over every buffered field. `march` therefore replays only while the staging fits in the device's L2 and falls back to the plain loop past that, which is also where a kernel outlasts its launch and the graph would save nothing
 ### define_gradient
 see [sensitivity](sensitivity.md)
 
@@ -116,7 +128,7 @@ here and both [elastic](elastic.md) and [maxwell](maxwell.md) call it
 | member | signature | description |
 |---|---|---|
 | voigt order | `PAIRS` | the $\left(k,l\right)$ pairs per dimension, the shear or curl rows being `PAIRS[ndim][ndim:]` |
-| weights | `component_weights(sim, c)`, `pair_weights(sim, axes)` | the cell weights $W$ of a point family, halved on the walls of the axes it is not staggered on |
+| weights | `wall_weights(sim, axes)` | the cell weights $W$ of a point family staggered along `axes` (`(c,)` for component `c`, the pair for a pair point), halved on the walls of the other axes |
 | averages | `point_average(sim, field, c)`, `pair_average(sim, field, axes)` | the arithmetic two-node mean at a component point and the harmonic four-node mean at a pair point |
 | average adjoints | `point_average_adjoint(sim, density, c)`, `pair_average_adjoint(sim, density, field, axes)` | their transposes, which is how a point density is chained back onto the nodal design field |
 

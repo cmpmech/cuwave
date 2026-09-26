@@ -91,7 +91,7 @@ which sizes the reconstruction strip.
 
 `maxwell.MaxwellWave` is the Yee lattice as `-C^T nu C`, which is the staggered elastic
 layout with the normal-stress block deleted, so it shares that whole geometry layer:
-`component_weights`, `pair_weights`, `point_average`, `pair_average` and their adjoints are
+`wall_weights`, `point_average`, `pair_average` and their adjoints are
 free functions in `wave.py`, not methods, precisely because two equations need them. It is
 2D/3D only and its kernel-less walls are `Conductor`/`Magnetic`. Its class switch
 `magnetic` (the `derive_inertia` idiom) adds `-DUSE_MAGNETIC` and the pair-point curl
@@ -115,11 +115,21 @@ are *prepended* so CuPy's module cache keys on them without a flag: the stencil 
 the anisotropic adjoint's signature genuinely differs. Any new flag is added to both the
 `.cu` header block and `Simulation.compile_flags`.
 
-**Closure factories.** `define_step_method`, `define_boundary`, `define_excitation`,
+**Closure factories.** `sim.define_step`, `define_boundary`, `define_excitation`,
 `define_get_signal`, `define_gradient`, `define_frechet` each build the launch config and a
 mutable `args` list once, then return a small closure that patches only the changing pointers
 per step. Per-step host work is deliberately near zero — keep it that way when editing the
 loops.
+
+**Every time loop goes through `wave.march`.** It captures `CHUNK` (24) steps as one CUDA
+graph and replays it, since on driver-sized grids (~256²) the ~5 µs CuPy launch, not the
+kernel, is the cost; replay is 2–3x faster there and neutral on large grids. Records the
+kernels index by row (`source.signal`, `um`, the strip, the history) go through a `Window`,
+staged into fixed buffers per chunk. A `step(t, *records)` must therefore only launch
+kernels, pick its slots by `t % 2` / `t % 3` rather than rebinding variables, and touch
+records only via its windows. `march` falls back to the plain loop when the staging exceeds
+L2 (e.g. the `sensitivity` history on large grids). `tests/wave_test.py` pins replay ==
+plain loop bitwise.
 
 `boundary.py` is declarative: `BoundaryCondition` names a kernel string and nothing else, so
 `Simulation.boundary` can carry a per-face layout long before compilation; `define_boundary`

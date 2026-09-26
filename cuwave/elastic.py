@@ -26,13 +26,12 @@ from .wave import (
     Simulation,
     apply_cell_weights,
     axis_geometry,
-    component_weights,
     grid_block,
     pair_average,
     pair_average_adjoint,
-    pair_weights,
     point_average,
     point_average_adjoint,
+    wall_weights,
 )
 
 KERNEL_PATH = Path(__file__).parent / "kernels" / "elastic.cu"
@@ -160,7 +159,7 @@ class ElasticWave(Simulation):
         for c in range(self.ncomp):
             mass = (
                 self.density
-                * component_weights(self, c)
+                * wall_weights(self, (c,))
                 * point_average(self, gamma, c)
             )
             minv[c] = 1.0 / cp.maximum(mass, cp.finfo(self.dtype).tiny)
@@ -178,7 +177,7 @@ class ElasticWave(Simulation):
         if self.ndim > 1:
             gshear = cp.zeros((self.npairs, *self.Nx_padded), dtype=self.dtype)
             for p, axes in enumerate(PAIRS[self.ndim][self.ndim :]):
-                gshear[p] = pair_weights(self, axes) * pair_average(self, gamma, axes)
+                gshear[p] = wall_weights(self, axes) * pair_average(self, gamma, axes)
             mat["gshear"] = cp.ascontiguousarray(gshear)
         if self.damping is not None:
             mat["damping"] = self.damping
@@ -269,12 +268,12 @@ class ElasticWave(Simulation):
         gamma = grads["design"]
         g_mass = cp.zeros(self.Nx_padded, dtype=self.dtype)
         for c in range(self.ncomp):
-            density = grads["mass"][c] * component_weights(self, c) * self.density
+            density = grads["mass"][c] * wall_weights(self, (c,)) * self.density
             g_mass += point_average_adjoint(self, density, c)
         # the normal density sits on the nodes, so its chain rule is the weight alone
         g_stiff = apply_cell_weights(self, grads["normal"].copy())
         for p, axes in enumerate(PAIRS[self.ndim][self.ndim :]):
-            density = grads["shear"][p] * pair_weights(self, axes)
+            density = grads["shear"][p] * wall_weights(self, axes)
             g_stiff += pair_average_adjoint(self, density, gamma, axes)
         return {"mass": g_mass, "stiff": g_stiff}
 

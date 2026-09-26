@@ -80,7 +80,7 @@ Eliminating $\mathbf{H}$ from the classical Yee update recovers exactly this ste
 | $E_x$ | $\left(i+\tfrac{1}{2},\,j,\,k\right)$ | the displacement $u_x$ |
 | $\left(\nabla\times\mathbf{E}\right)_z$, so $H_z$ | $\left(i+\tfrac{1}{2},\,j+\tfrac{1}{2},\,k\right)$ | the shear stress $\sigma_{xy}$ |
 
-So `MaxwellWave` is [ElasticWave](elastic.md) with the normal-stress block deleted, and it reuses that module's whole lattice layer: `component_offsets`, `component_weights`, `point_average` and their adjoints, all promoted into [wave](wave.md). There are $\textrm{ndim}\left(\textrm{ndim}-1\right)/2$ curl components, one per axis pair, so one in 2D and three in 3D
+So `MaxwellWave` is [ElasticWave](elastic.md) with the normal-stress block deleted, and it reuses that module's whole lattice layer: `component_offsets`, `wall_weights`, `point_average` and their adjoints, all promoted into [wave](wave.md). There are $\textrm{ndim}\left(\textrm{ndim}-1\right)/2$ curl components, one per axis pair, so one in 2D and three in 3D
 
 Every Maxwell difference is a **half-point** difference, since each term of $b_p=\partial_kE_l-\partial_lE_k$ differentiates a component along an axis it is not staggered on. The node-centred `rad_node` never appears, and with it go the zero-row closure, the plane-stress condensation and the clamped fold that the elastic normal strains need. At order 2 the curl is therefore full order everywhere including the wall-adjacent points
 

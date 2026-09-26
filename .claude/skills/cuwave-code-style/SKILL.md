@@ -220,7 +220,7 @@ These read oddly without their reason, so do not "clean" them:
   switches a subclass sets, not constructor arguments. A *field* is the opposite case:
   `boundary` and `damping` are setup a caller states once, so every function taking the
   `Simulation` reads the same operator and no two call sites can disagree about it.
-- **A preallocated `args` list inside a closure factory.** `define_step_method` mutates
+- **A preallocated `args` list inside a closure factory.** `define_step` mutates
   `args[0:3]` per call so the hot loop allocates nothing. Never rebuild the list per step.
 - **An assigned `lambda` for a one-line driver-local helper**: `surface`, `show_field`,
   `compare`, `to_index`. Permitted in `examples/` (E731 waived), not in `cuwave/`.

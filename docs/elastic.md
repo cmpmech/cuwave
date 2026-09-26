@@ -60,7 +60,7 @@ The reconstruction strip of [sensitivity](sensitivity.md) follows `reach` $=2r-1
 | coefficients | `parametrization_jacobian(indicator)` | $\left(1,\,1\right)$, since $\gamma$ scales inertia and stiffness alike |
 | per-axis factors | `step_factors()` | $\Delta t^2/\Delta x_d$, the strain carrying the other $1/\Delta x$ |
 | source scaling | `source_factor()` | $1$; the excitation weights divide by the volume the kernel inertia leaves out |
-| lattice geometry | `component_weights`, `pair_weights`, `point_average`, `pair_average` | the point families' cell weights and material means, shared with [maxwell](maxwell.md) and therefore living in [wave](wave.md) |
+| lattice geometry | `wall_weights`, `point_average`, `pair_average` | the point families' cell weights and material means, shared with [maxwell](maxwell.md) and therefore living in [wave](wave.md) |
 | timestep | `stable_timestep(sim, indicator, ...)` | the largest stable step, measured on the step kernel; also in [wave](wave.md), since it names no elastic concept |
 | stiffness matrix | `voigt(ndim, lame, shear, plane="strain")` | the isotropic Voigt matrix, `plane` selecting strain or stress in 2D |
 

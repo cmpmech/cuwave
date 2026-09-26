@@ -23,13 +23,15 @@ from .boundary import define_boundary
 from .wave import (
     Simulation,
     Source,
+    Window,
     compile_kernels,
     define_excitation,
     define_get_signal,
     define_set_signal,
-    define_step_method,
     flatten_indices,
     grid_rows,
+    march,
+    simulate,
 )
 
 ADJOINT_DELAY = 1  # lines the adjoint up with the reconstructed forward triplet
@@ -202,7 +204,7 @@ def sensitivity(
     kernels = compile_kernels(sim)
     sens_kernels = compile_kernels(sim, sim.sensitivity_path)
 
-    fd_step = define_step_method(sim, kernels, mat)
+    fd_step = sim.define_step(kernels, mat)
     bc_step = define_boundary(sim, kernels)
     excitation_step = define_excitation(sim, source.position, kernels, mat)
     grads = sim.gradient_fields(mat)
@@ -211,13 +213,13 @@ def sensitivity(
 # ------------------------------------ forward pass -----------------------------------
     # stepped straight into the history, so the leading zeros are u^-2 / u^-1
     V = cp.zeros((sim.N + 2, *sim.field_shape), dtype=sim.dtype)
-    # the slot views made once: V[t] is a host slice costing more than its own kernel
-    slot = [V[t] for t in range(sim.N + 2)]
 
-    for t in range(sim.N):
-        u = fd_step(slot[t], slot[t + 1], slot[t + 2])
-        u = excitation_step(u, source.signal, t)
-        u = bc_step(u)
+    def forward(t, signal, history):
+        u = fd_step(history[t], history[t + 1], history[t + 2])
+        excitation_step(u, signal, t)
+        bc_step(u)
+
+    march(sim.N, forward, [Window(source.signal), Window(V, halo=2, store=True)])
 
     # gathered off the history rather than probed per step, saving one launch a step
     um = V[2:].reshape(sim.N, -1)[:, flatten_indices(sim, sensors)]
@@ -230,15 +232,16 @@ def sensitivity(
 
 # ----------------------------------- backward pass -----------------------------------
     P = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
-    p0, p1 = P[0], P[1]
-    for m in range(sim.N):
-        n = sim.N - 1 - m
-        p0 = fd_step(p0, p1, p0)
-        p0 = adjoint_excitation(p0, signal, m)
-        p0 = bc_step(p0)
-        p1, p0 = p0, p1  # p1 now holds lambda^n
+
+    # reversed, so row m + 2 - i is u^(n + i) for n = N - 1 - m
+    def backward(m, signal, history):
+        p = fd_step(P[m % 2], P[1 - m % 2], P[m % 2])  # lambda^n
+        adjoint_excitation(p, signal, m)
+        bc_step(p)
         # inertia pairs lambda^n with the whole triplet, stiffness with its middle slot
-        gradient_step(slot[n], slot[n + 1], slot[n + 2], p1)
+        gradient_step(history[m + 2], history[m + 1], history[m], p)
+
+    march(sim.N, backward, [Window(signal), Window(V[::-1], halo=2)])
 
     return cost, sim.finalize_gradients(grads, sens_kernels), um, {}
 
@@ -283,7 +286,7 @@ def reconstruction_sensitivity(
     kernels = compile_kernels(sim)
     sens_kernels = compile_kernels(sim, sim.sensitivity_path)
 
-    fd_step = define_step_method(sim, kernels, mat)
+    fd_step = sim.define_step(kernels, mat)
     bc_step = define_boundary(sim, kernels)
     excitation_step = define_excitation(sim, source.position, kernels, mat)
     get_signal = define_get_signal(sim, sensors, kernels)
@@ -294,20 +297,23 @@ def reconstruction_sensitivity(
         replay_strip = define_set_signal(sim, strip, kernels)
 
     U = cp.zeros((3, *sim.field_shape), dtype=sim.dtype)
-    u0, u1, u2 = U[0], U[1], U[2]
     um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
     # two leading zero rows, so row t + 2 is u^t and the initial states need no branch
     strip_store = cp.zeros((sim.N + 2, num_strip), dtype=sim.dtype)
+    windows = [Window(source.signal), Window(um, store=True)]
+    if num_strip:
+        windows.append(Window(strip_store[2:], store=True))
 
 # ------------------------------------ forward pass -----------------------------------
-    for t in range(sim.N):
-        u2 = fd_step(u0, u1, u2)
-        u2 = excitation_step(u2, source.signal, t)
-        u2 = bc_step(u2)
-        get_signal(u2, um, t)
-        if num_strip:
-            record_strip(u2, strip_store, t + 2)
-        u0, u1, u2 = u1, u2, u0
+    def forward(t, signal, um, strip=None):
+        u = fd_step(U[t % 3], U[(t + 1) % 3], U[(t + 2) % 3])
+        excitation_step(u, signal, t)
+        bc_step(u)
+        get_signal(u, um, t)
+        if strip is not None:
+            record_strip(u, strip, t)
+
+    march(sim.N, forward, windows)
 
     cost, dphi = objective(um)
 
@@ -317,28 +323,37 @@ def reconstruction_sensitivity(
 
 # ----------------------------------- backward pass -----------------------------------
     P = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
-    p0, p1 = P[0], P[1]
     # the forward rotation left the last three states live, which is the whole seed
-    a, b, c = u2, u0, u1
-    seed = float(cp.linalg.norm(c * valid))
+    seed = float(cp.linalg.norm(U[(sim.N + 1) % 3] * valid))
 
-    for m in range(sim.N):
-        n = sim.N - 1 - m
-        p0 = fd_step(p0, p1, p0)
-        p0 = adjoint_excitation(p0, signal, m)
-        p0 = bc_step(p0)
-        p1, p0 = p0, p1  # p1 now holds lambda^n
+    # the triplet (u^(n - 1), u^n, u^(n + 1)) for n = N - 1 - m, rotating backwards
+    def triplet(m):
+        return tuple(U[(sim.N + i - m) % 3] for i in (2, 0, 1))
+
+    def adjoint(m, signal):
+        p = fd_step(P[m % 2], P[1 - m % 2], P[m % 2])  # lambda^n
+        adjoint_excitation(p, signal, m)
+        bc_step(p)
         # inertia pairs lambda^n with the whole triplet, stiffness with its middle slot
-        gradient_step(a, b, c, p1)
-        if n < 1:
-            break
+        gradient_step(*triplet(m), p)
+
+    def backward(m, signal, source_rows, strip_rows=None):
+        adjoint(m, signal)
+        a, b, c = triplet(m)
         # read backwards, so the source rides two steps ahead of the state it rebuilds
         c = fd_step(b, a, c)
-        c = excitation_step(c, source.signal, n - 1)
-        if num_strip:
-            replay_strip(c, strip_store, n - 1)
-        c = bc_step(c)
-        a, b, c = c, a, b
+        excitation_step(c, source_rows, m)
+        if strip_rows is not None:
+            replay_strip(c, strip_rows, m)
+        bc_step(c)
+
+    # row m of each is row n - 1 forwards, contiguous since the kernels index by row
+    windows = [Window(signal), Window(source.signal[sim.N - 2 :: -1].copy())]
+    if num_strip:
+        windows.append(Window(strip_store[sim.N - 2 :: -1].copy()))
+    march(sim.N - 1, backward, windows)
+    adjoint(sim.N - 1, signal)
+    a = triplet(sim.N - 1)[0]
 
     grads = sim.finalize_gradients(grads, sens_kernels)
     # assigned, not multiplied, so a NaN outside cannot survive as 0 * NaN
@@ -391,7 +406,7 @@ def superposition_sensitivity(
     kernels = compile_kernels(sim)
     sens_kernels = compile_kernels(sim, sim.sensitivity_path)
 
-    fd_step = define_step_method(sim, kernels, mat)
+    fd_step = sim.define_step(kernels, mat)
     bc_step = define_boundary(sim, kernels)
     excitation_step = define_excitation(sim, source.position, kernels, mat)
     get_signal = define_get_signal(sim, sensors, kernels)
@@ -400,18 +415,19 @@ def superposition_sensitivity(
     add_step = sim.define_frechet(sens_kernels, accs, 1.0)
 
     U = cp.zeros((3, *sim.field_shape), dtype=sim.dtype)
-    u0, u1, u2 = U[0], U[1], U[2]
     um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
 
 # ------------------------------------ forward pass -----------------------------------
     # records the traces and subtracts the forward diagonal B(u, u)
-    for t in range(sim.N):
-        u2 = fd_step(u0, u1, u2)
-        u2 = excitation_step(u2, source.signal, t)
-        u2 = bc_step(u2)
+    def forward(t, signal, um):
+        u0, u1, u2 = U[t % 3], U[(t + 1) % 3], U[(t + 2) % 3]
+        fd_step(u0, u1, u2)
+        excitation_step(u2, signal, t)
+        bc_step(u2)
         get_signal(u2, um, t)
         subtract_step(u0, u1, u2)
-        u0, u1, u2 = u1, u2, u0
+
+    march(sim.N, forward, [Window(source.signal), Window(um, store=True)])
 
     cost, dphi = objective(um)
 
@@ -432,14 +448,15 @@ def superposition_sensitivity(
     backward_excitation = define_excitation(sim, backward_position, kernels, mat)
 
 # ----------------------------------- backward pass -----------------------------------
-    # u0 / u1 hold u^(N-1) / u^(N-2), so the one array carries u + k lambda
-    u0, u1 = u1, u0
-    for t in range(sim.N):
-        u2 = fd_step(u0, u1, u2)
-        u2 = backward_excitation(u2, backward_signal, t)
-        u2 = bc_step(u2)
+    # starting from u^(N - 1) over u^(N - 2), so the one array carries u + k lambda
+    def backward(t, signal):
+        u0, u1, u2 = (U[(sim.N + i - t) % 3] for i in (1, 0, 2))
+        fd_step(u0, u1, u2)
+        backward_excitation(u2, signal, t)
+        bc_step(u2)
         add_step(u0, u1, u2)
-        u0, u1, u2 = u1, u2, u0
+
+    march(sim.N, backward, [Window(backward_signal)])
 
     after = _accumulated(accs)
     cancellation = before / after if after > 0.0 else float("inf")
@@ -490,28 +507,15 @@ def source_sensitivity(
     require_interior(sim, sensors, "sensor")
     require_interior(sim, source.position, "source")
 
+# ------------------------------------ forward pass -----------------------------------
+    um = simulate(sim, source, indicator, sensors)[1]
+    cost, dphi = objective(um)
+
     mat = sim.build_materials(indicator)
     kernels = compile_kernels(sim)
-
-    fd_step = define_step_method(sim, kernels, mat)
+    fd_step = sim.define_step(kernels, mat)
     bc_step = define_boundary(sim, kernels)
-    excitation_step = define_excitation(sim, source.position, kernels, mat)
-    get_signal = define_get_signal(sim, sensors, kernels)
     probe = define_get_signal(sim, source.position, kernels)
-
-# ------------------------------------ forward pass -----------------------------------
-    U = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
-    u0, u1 = U[0], U[1]
-    um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
-
-    for t in range(sim.N):
-        u0 = fd_step(u0, u1, u0)
-        u0 = excitation_step(u0, source.signal, t)
-        u0 = bc_step(u0)
-        u1, u0 = u0, u1
-        get_signal(u1, um, t)
-
-    cost, dphi = objective(um)
 
 # --------------------------------- adjoint excitation --------------------------------
     signal = adjoint_signal(sim, dphi, sensors)
@@ -519,17 +523,16 @@ def source_sensitivity(
 
 # ----------------------------------- backward pass -----------------------------------
     P = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
-    p0, p1 = P[0], P[1]
     lam = cp.zeros((sim.N, source.position.shape[1]), dtype=sim.dtype)
 
-    for m in range(sim.N):
-        n = sim.N - 1 - m
-        p0 = fd_step(p0, p1, p0)
-        p0 = adjoint_excitation(p0, signal, m)
-        p0 = bc_step(p0)
-        p1, p0 = p0, p1  # p1 now holds lambda^n
-        probe(p1, lam, n)  # row n not row m, so the record runs forward in time
+    def backward(m, signal, lam):
+        p = fd_step(P[m % 2], P[1 - m % 2], P[m % 2])  # lambda^n
+        adjoint_excitation(p, signal, m)
+        bc_step(p)
+        probe(p, lam, m)
 
-    # the transpose of adjoint_signal: over the same weights, and not reversed
-    gradient = lam * sim.adjoint_weights(source.position)
+    march(sim.N, backward, [Window(signal), Window(lam, store=True)])
+
+    # the transpose of adjoint_signal: over the same weights, and reversed back
+    gradient = lam[::-1] * sim.adjoint_weights(source.position)
     return cost, gradient, um, {}
