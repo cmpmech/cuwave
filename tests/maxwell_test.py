@@ -7,8 +7,9 @@ renaming and not a rewrite. The permittivity has to reach the kernel as a permit
 so a slab has to transmit what Fabry-Perot says it transmits, which is the one check
 that ties the material units, the spectral objective and the source calibration
 together. And the design enters `ElectricWave` through the inertia but `MagneticWave`
-through the stiffness, so only the first keeps an exact adjoint above `space_order` 2:
-the wide-stencil gradient is pinned for one and deliberately not claimed for the other.
+through the stiffness, so only the first keeps its gradient in the interior above
+`space_order` 2 (the wide wall closure spoils it only next to a wall): the wide-stencil
+gradient is pinned for one, away from the walls, and deliberately not for the other.
 """
 
 import math
@@ -288,7 +289,7 @@ class GradientTest(unittest.TestCase):
         self._check(MagneticWave, 2)
 
     def test_an_inertia_design_survives_a_wide_stencil(self):
-        # dJ/deps carries no stencil, so the wide-order transpose error cannot reach it
+        # dJ/deps carries no stencil, so the closure error reaches it only near a wall
         self._check(ElectricWave, 4, tolerance=1e-3)
         self._check(ElectricWave, 6, tolerance=1e-3)
 

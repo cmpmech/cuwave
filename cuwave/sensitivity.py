@@ -93,6 +93,15 @@ def require_interior(
             )
 
 
+def require_full_domain(sim: Simulation) -> None:
+    """Raise if `sim.domain` or `sim.dirichlet` is set: the gradient kernels grade no wall."""
+    if sim.masked:
+        raise NotImplementedError(
+            "the gradient kernels read every cell at the full radius, where a domain "
+            "closes some; unset domain, or use source_sensitivity, which needs none"
+        )
+
+
 def require_lossless(sim: Simulation) -> None:
     """Raise if `sim.damping` is set: reconstructing by time reversal needs losslessness."""
     if sim.damping is not None:
@@ -199,6 +208,7 @@ def sensitivity(
     """
     require_interior(sim, sensors, "sensor")
     require_interior(sim, source.position, "source")
+    require_full_domain(sim)
 
     mat = sim.build_materials(indicator)
     kernels = compile_kernels(sim)
@@ -278,6 +288,7 @@ def reconstruction_sensitivity(
     """
     require_interior(sim, sensors, "sensor")
     require_interior(sim, source.position, "source")
+    require_full_domain(sim)
     strip, valid = reconstruction_nodes(sim)
     require_reconstructable(sim, valid)
     num_strip = strip.shape[1]
@@ -401,6 +412,7 @@ def superposition_sensitivity(
     require_lossless(sim)
     require_interior(sim, sensors, "sensor")
     require_interior(sim, source.position, "source")
+    require_full_domain(sim)
 
     mat = sim.build_materials(indicator)
     kernels = compile_kernels(sim)

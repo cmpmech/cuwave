@@ -267,11 +267,23 @@ class Simulation:
     space_order: int = 2  # finite difference order: any even number
     boundary: tuple = None  # ((low, high),) per axis; None is the equation's default
     damping: cpt.NDArray | None = None  # nodal field d, None for a lossless operator
+    domain: cpt.NDArray | None = None  # nodal mask of the physical domain, None for all
+    dirichlet: cpt.NDArray | None = None  # nodal mask held at zero, its cells left open
+
+    accepts_domain = False  # whether the step kernel honours -DUSE_DOMAIN
 
     @property
     def compile_flags(self) -> tuple[str, ...]:
-        """`-DUSE_DAMPING` when a damping field is set, else no extra flags."""
-        return ("-DUSE_DAMPING",) if self.damping is not None else ()
+        """`-DUSE_DAMPING` and `-DUSE_DOMAIN` for the fields that are set."""
+        if self.masked and not self.accepts_domain:
+            raise ValueError(f"{type(self).__name__} steps every node: unset domain")
+        flags = ("-DUSE_DAMPING",) if self.damping is not None else ()
+        return flags + (("-DUSE_DOMAIN",) if self.masked else ())
+
+    @property
+    def masked(self) -> bool:
+        """Whether `domain` or `dirichlet` takes nodes out of the stepped set."""
+        return self.domain is not None or self.dirichlet is not None
 
     kernel_path = None  # forward source this equation compiles, set by the subclass
     sensitivity_path = None  # and the adjoint one
@@ -323,13 +335,13 @@ class Simulation:
         """Closure launching the finite-difference step kernel over (u0, u1, u2)."""
         fd_kernel = kernels.get_function("fd_kernel")
         grid, block = grid_block(self)
-        args = [
-            None,
-            None,
-            None,
-            *self.step_kernel_args(mat),
-            *axis_geometry(self, self.step_factors()),
-        ]
+        args = [None, None, None, *self.step_kernel_args(mat)]
+        if self.masked:
+            cells = domain_cells(self)
+            tiles = domain_tiles(self, cells)
+            grid = (tiles.shape[0],)
+            args += [cells, tiles]
+        args += axis_geometry(self, self.step_factors())
 
         def fd_step(u0, u1, u2):
             args[0], args[1], args[2] = u0, u1, u2
@@ -363,6 +375,104 @@ def grid_block(sim: Simulation) -> tuple[tuple[int, ...], tuple[int, ...]]:
         (extent[d] + sim.threads[d] - 1) // sim.threads[d] for d in range(sim.ndim)
     )[::-1]
     return grid, block
+
+
+DEEP = 1 << 30  # the cell code of a node whose stencil never reaches the wall
+DIRICHLET = 7  # the radius code of a cell open onto a node held at zero
+
+
+def stepped_nodes(sim: Simulation) -> cpt.NDArray[cp.bool_]:
+    """The nodes the step updates: `domain` (all by default) less `dirichlet`."""
+    stepped = cp.ones(sim.Nx_padded, dtype=cp.bool_)
+    if sim.domain is not None:
+        stepped &= sim.domain
+    if sim.dirichlet is not None:
+        stepped &= ~sim.dirichlet
+    return stepped
+
+
+def domain_cells(sim: Simulation) -> cpt.NDArray[cp.int32]:
+    """Per stepped node, the radii of its two cells along each axis, packed.
+
+    A cell's stencil may only reach stepped nodes, so its radius is capped by the run
+    of them on either side, which is zero for the cell leaving them: that is the
+    zero-flux wall, unless the node across is `dirichlet`, which leaves the cell open
+    onto a zero at its midpoint (`DIRICHLET`), where the Neumann wall sits too. The code is 0 for a node not stepped,
+    `DEEP` where every radius is the full one, and otherwise (rp | rm << 3) << 6 * axis.
+    """
+    R = sim.space_order // 2
+    if R >= DIRICHLET:
+        raise ValueError(
+            f"space_order {sim.space_order} overflows the 3-bit cell radius"
+        )
+    interior = tuple(slice(1, n - 1) for n in sim.Nx)
+    # ghost nodes count as stepped, so the closure at the box walls is unchanged
+    inside = cp.ones(sim.Nx_padded, dtype=cp.bool_)
+    inside[interior] = stepped_nodes(sim)[interior]
+    held = cp.zeros(sim.Nx_padded, dtype=cp.bool_)
+    if sim.dirichlet is not None:
+        held[interior] = sim.dirichlet[interior]
+
+    # `mask` k nodes along axis d, `fill` past the array
+    def shifted(mask, d, k, fill):
+        window = [slice(R, R + n) for n in sim.Nx_padded]
+        window[d] = slice(R + k, R + k + sim.Nx_padded[d])
+        return cp.pad(mask, R, constant_values=fill)[tuple(window)]
+
+    code = cp.zeros(sim.Nx_padded, dtype=cp.int32)
+    deep = inside.copy()
+    for d in range(sim.ndim):
+        shape = [1] * sim.ndim
+        shape[d] = -1
+        a = cp.arange(sim.Nx_padded[d]).reshape(shape)
+        wall = cp.minimum(R, cp.minimum(a, sim.Nx[d] - 1 - a))  # CLOSURE
+
+        def run(sign):
+            count, on = cp.zeros(sim.Nx_padded, cp.int32), cp.ones_like(inside)
+            for k in range(1, R + 1):
+                on &= shifted(inside, d, sign * k, True)
+                count += on & (k <= wall)
+            return count
+
+        up, down = run(1), run(-1)
+        rp = cp.minimum(wall, cp.minimum(1 + down, up))
+        rm = cp.minimum(wall, cp.minimum(down, 1 + up))
+        rp = cp.where((rp == 0) & shifted(held, d, 1, False), DIRICHLET, rp)
+        rm = cp.where((rm == 0) & shifted(held, d, -1, False), DIRICHLET, rm)
+        code |= (rp | rm << 3) << (6 * d)
+        deep &= (rp == wall) & (rm == wall)
+    code = cp.where(deep, DEEP, code)
+    return cp.where(inside, code, 0).astype(cp.int32)
+
+
+def domain_tiles(
+    sim: Simulation, cells: cpt.NDArray[cp.int32]
+) -> cpt.NDArray[cp.int32]:
+    """The tiles holding any stepped node, in C order, one packed int each.
+
+    A block index takes 10 bits an axis with the fastest lowest, and bit 30 marks a
+    tile holding a node that is not `DEEP`, the only tiles that read `cells`.
+    """
+    grid = [-(-n // t) for n, t in zip(sim.Nx_padded, sim.threads)]
+    if max(grid) > 1024:
+        raise ValueError(f"{grid} blocks per axis overflow the 10-bit tile packing")
+    interior = tuple(slice(1, n - 1) for n in sim.Nx)
+    within = tuple(range(1, 2 * sim.ndim, 2))
+
+    # per tile, with the nodes the kernel never steps filled so they decide nothing
+    def reduce(fill, test):
+        tiled = cp.full([g * t for g, t in zip(grid, sim.threads)], fill, cp.int32)
+        tiled[interior] = cells[interior]
+        tiled = tiled.reshape([s for g, t in zip(grid, sim.threads) for s in (g, t)])
+        return test(tiled).any(axis=within)
+
+    occupied = reduce(0, lambda t: t != 0)
+    wall = reduce(DEEP, lambda t: t != DEEP)
+    blocks = cp.argwhere(occupied).astype(cp.int32)
+    tiles = wall[tuple(blocks.T)].astype(cp.int32) << 30
+    for d in range(sim.ndim):
+        tiles |= blocks[:, d] << (10 * (sim.ndim - 1 - d))
+    return tiles
 
 
 def axis_geometry(sim: Simulation, factors: list | None = None) -> list:
@@ -453,6 +563,10 @@ def _define_transfer(
     *extra: cpt.NDArray,
 ) -> Callable:
     """Closure launching transfer kernel `name` between `u` and row t of a record."""
+    if sim.masked:
+        inside = stepped_nodes(sim)[tuple(grid_rows(sim, position))]
+        if not bool(inside.all()):
+            raise ValueError(f"{name} reaches a node that is never stepped")
     kernel = kernels.get_function(name)
     threads = 256
     num = position.shape[1]

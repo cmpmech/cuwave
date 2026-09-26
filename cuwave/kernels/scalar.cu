@@ -2,6 +2,7 @@
 // Compile-time configuration this file responds to:
 //   NDIM = 1 | 2 | 3
 //   USE_DAMPING
+//   USE_DOMAIN
 
 // spatial finite difference stencil for Laplacian
 __device__ __forceinline__ real_t flux_divergence_axis(
@@ -24,6 +25,81 @@ __device__ __forceinline__ real_t flux_divergence_axis(
     }
   return factor * (Dp * gp - Dm * gm); // outer grad (incl. inner grad)
 }
+
+// ----------------------------------- domain helpers
+#ifdef USE_DOMAIN
+#define DIRICHLET 7 // the radius code of a cell open onto a node held at zero
+
+// the same with each cell at its own radius, zero for a cell leaving the domain
+__device__ __forceinline__ real_t flux_divergence_cells(
+    const real_t *__restrict__ u1, const real_t *__restrict__ stiff,
+    const int idx, const int s, const real_t uc, const real_t sc,
+    const real_t factor, const int rp, const int rm) {
+  real_t Dp = 0, Dm = 0; // a closed cell carries no flux
+  if (rp == DIRICHLET)
+    Dp = -uc * sc; // onto a zero halfway across, at the node's own stiffness
+  else if (rp) {
+    const real_t sp = stiff[idx + s];
+    Dp = OP_W(rp, 1) * (u1[idx + s] - uc);
+#pragma unroll
+    for (int k = 2; k <= STENCIL_RADIUS; ++k)
+      if (k <= rp)
+        Dp += OP_W(rp, k) * (u1[idx + k * s] - u1[idx - (k - 1) * s]);
+    Dp *= sc * sp / (sc + sp); // harmonic mean
+  }
+  if (rm == DIRICHLET)
+    Dm = uc * sc;
+  else if (rm) {
+    const real_t sm = stiff[idx - s];
+    Dm = OP_W(rm, 1) * (uc - u1[idx - s]);
+#pragma unroll
+    for (int k = 2; k <= STENCIL_RADIUS; ++k)
+      if (k <= rm)
+        Dm += OP_W(rm, k) * (u1[idx + (k - 1) * s] - u1[idx - k * s]);
+    Dm *= sc * sm / (sc + sm); // harmonic mean
+  }
+  return factor * (Dp - Dm);
+}
+#endif
+
+#ifdef USE_DOMAIN
+#define BLOCK_X (tile & 1023) // one block per domain tile, 10 bits an axis
+#define BLOCK_Y ((tile >> 10) & 1023)
+#define BLOCK_Z ((tile >> 20) & 1023)
+#else
+#define BLOCK_X blockIdx.x
+#define BLOCK_Y blockIdx.y
+#define BLOCK_Z blockIdx.z
+#endif
+
+#ifdef USE_DOMAIN
+#define CELLS(s, f, d)                                                         \
+  flux_divergence_cells(u1, stiff, idx, s, uc, sc, f, (code >> 6 * (d)) & 7,   \
+                        (code >> (6 * (d) + 3)) & 7)
+
+// out of line, so the rare wall node costs the deep ones no registers
+__device__ __noinline__ real_t
+wall_laplacian(const real_t *__restrict__ u1, const real_t *__restrict__ stiff,
+               const int idx, const real_t uc, const real_t sc, const int code,
+               const real_t f0
+#if NDIM >= 2
+               ,
+               const real_t f1, const int s0
+#endif
+#if NDIM >= 3
+               ,
+               const real_t f2, const int s1
+#endif
+) {
+#if NDIM == 1
+  return CELLS(1, f0, 0);
+#elif NDIM == 2
+  return CELLS(s0, f0, 0) + CELLS(1, f1, 1);
+#elif NDIM == 3
+  return CELLS(s0, f0, 0) + CELLS(s1, f1, 1) + CELLS(1, f2, 2);
+#endif
+}
+#endif
 
 // ----------------------------- boundary condition helper
 #if NDIM == 1
@@ -81,6 +157,9 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
 #ifdef USE_DAMPING
           const real_t *__restrict__ damping, const real_t dt,
 #endif
+#ifdef USE_DOMAIN
+          const int *__restrict__ cells, const int *__restrict__ tiles,
+#endif
           const real_t f0, const int N0
 #if NDIM >= 2
           ,
@@ -91,23 +170,26 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
           const real_t f2, const int N2, const int s1
 #endif
 ) {
+#ifdef USE_DOMAIN
+  const int tile = tiles[blockIdx.x];
+#endif
 #if NDIM == 1
-  const int a0 = blockIdx.x * blockDim.x + threadIdx.x;
+  const int a0 = BLOCK_X * blockDim.x + threadIdx.x;
   if (!(a0 > 0 && a0 < N0 - 1))
     return;
   const int idx = a0;
   const int r0 = CLOSURE(a0, N0);
 #elif NDIM == 2
-  const int a1 = blockIdx.x * blockDim.x + threadIdx.x;
-  const int a0 = blockIdx.y * blockDim.y + threadIdx.y;
+  const int a1 = BLOCK_X * blockDim.x + threadIdx.x;
+  const int a0 = BLOCK_Y * blockDim.y + threadIdx.y;
   if (!(a0 > 0 && a0 < N0 - 1 && a1 > 0 && a1 < N1 - 1))
     return;
   const int idx = a0 * s0 + a1;
   const int r0 = CLOSURE(a0, N0), r1 = CLOSURE(a1, N1);
 #elif NDIM == 3
-  const int a2 = blockIdx.x * blockDim.x + threadIdx.x;
-  const int a1 = blockIdx.y * blockDim.y + threadIdx.y;
-  const int a0 = blockIdx.z * blockDim.z + threadIdx.z;
+  const int a2 = BLOCK_X * blockDim.x + threadIdx.x;
+  const int a1 = BLOCK_Y * blockDim.y + threadIdx.y;
+  const int a0 = BLOCK_Z * blockDim.z + threadIdx.z;
   if (!(a0 > 0 && a0 < N0 - 1 && a1 > 0 && a1 < N1 - 1 && a2 > 0 &&
         a2 < N2 - 1))
     return;
@@ -117,7 +199,6 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
 
   const real_t uc = u1[idx];    // load once
   const real_t sc = stiff[idx]; // load once
-
 #if NDIM == 1
   real_t laplacian = flux_divergence_axis(u1, stiff, idx, 1, uc, sc, f0, r0);
 #elif NDIM == 2
@@ -127,6 +208,25 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
   real_t laplacian = flux_divergence_axis(u1, stiff, idx, s0, uc, sc, f0, r0) +
                      flux_divergence_axis(u1, stiff, idx, s1, uc, sc, f1, r1) +
                      flux_divergence_axis(u1, stiff, idx, 1, uc, sc, f2, r2);
+#endif
+#ifdef USE_DOMAIN
+  // bit 30 marks a tile touching the wall, so the branch is uniform per block
+  if (tile >> 30) {
+    const int code = cells[idx]; // 0 outside, bit 30 deep, else the cell radii
+    if (!code)
+      return; // outside the domain nothing is stepped
+#if NDIM == 1
+    if (!(code >> 30))
+      laplacian = wall_laplacian(u1, stiff, idx, uc, sc, code, f0);
+#elif NDIM == 2
+    if (!(code >> 30))
+      laplacian = wall_laplacian(u1, stiff, idx, uc, sc, code, f0, f1, s0);
+#elif NDIM == 3
+    if (!(code >> 30))
+      laplacian =
+          wall_laplacian(u1, stiff, idx, uc, sc, code, f0, f1, s0, f2, s1);
+#endif
+  }
 #endif
 
   const real_t mi = derive_inertia ? 1.f / sc : minv[idx];

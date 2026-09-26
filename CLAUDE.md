@@ -103,7 +103,23 @@ collapses to a flux divergence, so `maxwell.ElectricWave` (E_z, permittivity as 
 and `maxwell.MagneticWave` (H_z, inverse permittivity as stiffness) are `PressureWave` on
 the existing `scalar.cu`. Both `examples/tpto/` drivers use them. Trap: `MagneticWave` puts
 the design in the **stiffness**, which is where the wide-order transpose stops being exact,
-so it must run at `space_order = 2`; `ElectricWave` is exact at any order.
+so it must run at `space_order = 2`; `ElectricWave` is exact in the interior at any
+order, off by ~1e-3 only on the nodes next to a box wall (the wide closure is not
+symmetric there, so lambda is).
+
+**`Simulation.domain`** (scalar family only, `accepts_domain`) is a nodal mask of the
+physical domain. Each flux cell's radius is capped by the run of domain nodes on either
+side, 0 across the wall, so the wall is an exact zero-flux staircase and no tap reads
+outside; hence `fd_kernel` launches only tiles holding a domain node (`-DUSE_DOMAIN`,
+`domain_cells` / `domain_tiles`), bitwise equal to launching all, and the outside
+material is never read. ~2x on the voxelized bunny, little on a disk. The material
+gradient kernels are not graded, so `sensitivity` & co. refuse a domain
+(`source_sensitivity` accepts it). Trap: at order > 2 the old void approach (low
+`gamma` outside) couples the solid to the void's wave field through the wide taps.
+`Simulation.dirichlet` is the homogeneous-Dirichlet sibling: held nodes are not stepped
+and the cell onto one stays open with the zero at the cell *midpoint* (radius code
+`DIRICHLET` = 7), exact method of images at order 2; walls/obstacles compose with
+`domain` per node. Masked problems: prefer `space_order = 2`.
 
 **Compile-time configuration is the central idea.** `compile_kernels` builds one
 `cp.RawModule` per `(ndim, precision, damping, space_order)` combination: `NDIM`,

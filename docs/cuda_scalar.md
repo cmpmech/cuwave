@@ -8,6 +8,7 @@
 | `-DNDIM=1\|2\|3`              | `sim.ndim`                                                            | selects the number of stencil axes                            |
 | `-DUSE_FLOAT`                 | `precision == "float32"`                                              | `real_t = float`, otherwise `double`                          |
 | `-DUSE_DAMPING`               | `sim.compile_flags`, once `Simulation.damping` is set | compiles the damping term and its two extra kernel parameters |
+| `-DUSE_DOMAIN`                | `sim.compile_flags`, once `Simulation.domain` is set  | launches `fd_kernel` over a tile list and grades the cells at the domain wall, two extra kernel parameters |
 | `STENCIL_RADIUS`, `OP_COEFFS` | `stencils.preamble(space_order)`                                      | the radius $R$ and the cell-coefficient table                 |
 | `--use_fast_math`             | always                                                                |                                                               |
 
@@ -49,6 +50,26 @@ $$\nabla\cdot(k\nabla u)|_i\approx \frac{1}{h} (k_{i+\frac{1}{2}}\nabla u_{i+\fr
 $$\nabla_{i+\frac{1}{2}}\approx \frac{1}{h}\sum_{k=1}^r w_{r,k}(u_{i+k}-u_{i-(k-1)})$$
 $$\nabla_{i-\frac{1}{2}}\approx \frac{1}{h}\sum_{k=1}^r w_{r,k}(u_{i+(k-1)}-u_{i-k})$$
  - `factor` captures the condensed factor $\frac{1}{h^2}$ of the two nested differences, the $\Delta t^2$ of the time step (and $c_0^2$ for `ScalarWave`), plus the **2** that `gp, gm` are missing (they are $k_ik_{i\pm1}/(k_i+k_{i\pm1})$, so the effective cell stiffness is the full harmonic mean $2k_ik_{i\pm1}/(k_i+k_{i\pm1})$)
+## domain helpers
+Compiled only under `-DUSE_DOMAIN`; the derivation of the cell radii is in [scalar](scalar.md)
+### flux_divergence_cells
+**aim**
+`flux_divergence_axis` with each of the two cells at its own radius, zero for a cell leaving the domain
+**input args**
+as `flux_divergence_axis`, with `rp, rm`: the radii of the cells $i\pm\frac{1}{2}$ in place of the one `r`, or `DIRICHLET` (7) for a cell open onto a held node
+**how?**
+- a cell of radius 0 contributes nothing, so neither its stiffness nor the node across it is read: the zero-flux wall
+- a `DIRICHLET` cell contributes $\mp k_iu_i$ (with `factor`'s 2 that is $k_i(0-u_i)/(h/2)$ per $h$), a zero at the cell midpoint; again nothing across it is read
+- otherwise the same inner gradient and harmonic mean, the full one written out rather than halved into `factor`'s 2
+### wall_laplacian
+**aim**
+the flux divergence summed over the axes for a node near the wall
+**input args**
+`u1, stiff, idx, uc, sc`: as `flux_divergence_axis`; `code`: the node's entry of `cells`, bits $6d..6d+2$ the radius `rp` and $6d+3..6d+5$ the radius `rm` of axis $d$; `f0, f1, f2`, `s0, s1`: as `fd_kernel`
+**how?**
+- `__noinline__`, so the registers the rare wall node needs are not reserved for every deep node of the kernel
+### BLOCK_X, BLOCK_Y, BLOCK_Z
+the block coordinates: `blockIdx` without `-DUSE_DOMAIN`, and with it the 10-bit fields of the block's entry `tile` in the tile list, fastest axis lowest
 ## boundary helpers
 
 ### BC_PARAMS, BC_GEOM
@@ -69,7 +90,7 @@ threads act over entire grid (1D, 2D or 3D)
 **aim**
 compute next step $u^{n+1}$ based on central difference approximation in space & time
 **input args**
-`u0`: array of $u^{n-1}$; `u1`: array of $u^n$; `u2`: array of $u^{n+1}$ to be overwritten; `stiff`: array of $k$; `minv`: array of $1/m$; `derive_inertia`: true when `stiff=1/minv`, i.e., $k=m$; `damping`: array of $d$; `dt` time step size; `f0, f1, f2`: condensed per-axis factors $2\Delta t^2/h_d^2$ (times $c_0^2$ for `ScalarWave`) from `step_factors`; `N0, N1, N2`: logical grid dimensions `sim.Nx`, ghost nodes included and padding excluded; `s0, s1` strides of axis 0 and 1 over the *padded* shape
+`u0`: array of $u^{n-1}$; `u1`: array of $u^n$; `u2`: array of $u^{n+1}$ to be overwritten; `stiff`: array of $k$; `minv`: array of $1/m$; `derive_inertia`: true when `stiff=1/minv`, i.e., $k=m$; `damping`: array of $d$; `dt` time step size; `cells`: the packed cell radii of `domain_cells`, 0 on a node not stepped (outside `domain`, or `dirichlet`) and `DEEP` ($2^{30}$) where every radius is the full one; `tiles`: one int per launched block, its coordinates in 10-bit fields and bit 30 set when the tile holds a node that is not `DEEP`; `f0, f1, f2`: condensed per-axis factors $2\Delta t^2/h_d^2$ (times $c_0^2$ for `ScalarWave`) from `step_factors`; `N0, N1, N2`: logical grid dimensions `sim.Nx`, ghost nodes included and padding excluded; `s0, s1` strides of axis 0 and 1 over the *padded* shape
 **internal args**
 `a0, a1, a2`: grid indices; `idx`: flat index into the padded array, $a_0s_0+a_1s_1+a_2$; `r0, r1, r2`: finite difference radii in axis directions; `uc, sc`: central grid entries; `laplacian`: spatially approximated laplacian; `mi`: `minv`derived via `stiff`; `beta`: damping term
 **how?**
@@ -77,6 +98,7 @@ compute next step $u^{n+1}$ based on central difference approximation in space &
 $$u^{n+1}\approx\frac{1}{1+\beta}\left(2 u^{n} - u^{n-1}(1-\beta) + \frac{1}{m}\nabla\cdot (k\nabla u^n)\right),\qquad\beta=\frac{d\,\Delta t}{2m}$$
 - without `-DUSE_DAMPING` the $\beta$ branch is not compiled at all and the update is
 $$u^{n+1}=-u^{n-1}+2u^n+m^{-1}\nabla\cdot(k\nabla u^n)$$
+- under `-DUSE_DOMAIN` the grid is a 1D launch over `tiles`, and only a tile with bit 30 reads `cells`: a branch uniform per block, so a tile wholly inside runs the plain stencil and pays nothing. There a node outside returns before writing, which leaves it at the zero it started at, and a node near the wall replaces the plain laplacian with `wall_laplacian`
 ### homogeneous_neumann_kernel
 **parallelization**
 flat 1D launch, 256 threads per block, one thread per ghost node (the ghost ring is not a grid-shaped domain, so these kernels decode a linear thread id via `bc_ghost` instead of using the grid mapping of `fd_kernel`)

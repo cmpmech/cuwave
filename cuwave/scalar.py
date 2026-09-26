@@ -41,6 +41,7 @@ class PressureWave(Simulation):
     default_boundary = Neumann
 
     derive_inertia = False  # set where m == k (rho scaling): minv derived from stiff
+    accepts_domain = True
 
     def build_materials(self, indicator: cpt.NDArray) -> dict:
         """Turn `indicator` into the kernel's material dict, `damping` included."""
