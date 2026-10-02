@@ -10,7 +10,10 @@ does is what a driver relies on. The costs below are chosen so that every accept
 * `BacktrackTest` puts a wall in the descent direction, so the first two trials
   overshoot into it and the third is the one that decreases the cost
 * `BailoutTest` offers a cost that never decreases, which is where the `min_alpha`
-  floor is the only thing that ends the search
+  floor is the only thing that ends the search, and the design must come back
+  unchanged rather than as the last, worse, trial
+* `ProjectedArmijoTest` clips the step at a bound, where the sufficient decrease has
+  to be measured on the displacement the projection left, not on `alpha * step`
 * `ProjectionTest` pins that the box the driver hands in is respected by the design
   that comes back, not just by the trials inside
 
@@ -74,10 +77,31 @@ class BailoutTest(unittest.TestCase):
         optimizer = Lbfgs(first_step=1.0, shrink=0.5, min_alpha=1e-3)
         x = np.array([1.0])
 
-        _, _, alpha, trials = optimizer.search(x, np.array([1.0]), 1.0, lambda x: 1.0)
+        design, c, alpha, trials = optimizer.search(
+            x, np.array([1.0]), 1.0, lambda x: 1.0
+        )
 
         self.assertEqual(trials, 11)  # 2 ** -10 = 9.8e-4 is the first below the floor
         self.assertLessEqual(alpha, 1e-3)
+        self.assertEqual(float(design[0]), 1.0)  # no decrease found, so x is kept
+        self.assertEqual(c, 1.0)
+        self.assertEqual(len(optimizer.pairs), 0)
+
+
+class ProjectedArmijoTest(unittest.TestCase):
+    def test_a_clipped_trial_is_judged_by_how_far_it_moved(self):
+        # cost x clipped at 0.9: the full step overshoots the box but still decreases
+        optimizer = Lbfgs(first_step=1.0, armijo=0.5)
+        x = np.array([1.0])
+        project = lambda x: np.clip(x, 0.9, 1.0)
+
+        design, c, alpha, trials = optimizer.search(
+            x, np.array([1.0]), 1.0, lambda x: float(x[0]), project
+        )
+
+        self.assertEqual(trials, 1)  # unclipped, alpha * slope = -1 would demand c < 0.5
+        self.assertAlmostEqual(float(design[0]), 0.9)
+        self.assertAlmostEqual(c, 0.9)
 
 
 class ProjectionTest(unittest.TestCase):

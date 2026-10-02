@@ -68,24 +68,26 @@ class Lbfgs:
             project: applied to every trial, a constraint on the design variables.
 
         Returns:
-            (design, cost, alpha, trials) of the accepted trial, which is the last one
-            attempted even when `alpha` bottomed out at `min_alpha`.
+            (design, cost, alpha, trials) of the accepted trial. A search that reaches
+            `min_alpha` without a decrease returns `x` and `cost` unchanged and drops
+            the secant pairs, so the next call restarts from the scaled gradient.
         """
         step = self.step(x, grad) - x
         if not self.pairs:
             step = step * (self.first_step / float(abs(step).max()))
-        slope = float(grad.ravel() @ step.ravel())
 
         alpha, trials = 1.0, 0
         while True:
             trial = project(x + alpha * step)
             trial_cost = f(trial)
             trials += 1
-            if (
-                trial_cost <= cost + self.armijo * alpha * slope
-                or alpha <= self.min_alpha
-            ):
+            # projected displacement: a clipped trial moves less than alpha * step
+            slope = float(grad.ravel() @ (trial - x).ravel())
+            if trial_cost <= cost + self.armijo * slope:
                 return trial, trial_cost, alpha, trials
+            if alpha <= self.min_alpha:
+                self.pairs.clear()
+                return x, cost, alpha, trials
             alpha *= self.shrink
 
     def step(self, x: cpt.NDArray, grad: cpt.NDArray) -> cpt.NDArray:
