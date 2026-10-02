@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cuwave"
-version = "0.2.0"
+version = "0.3.0"
 description = "GPU finite-difference wave solver with differentiable adjoints"
 readme = "README.md"
 license = "MIT"
