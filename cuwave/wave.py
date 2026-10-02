@@ -271,6 +271,7 @@ class Simulation:
     dirichlet: cpt.NDArray | None = None  # nodal mask held at zero, its cells left open
 
     accepts_domain = False  # whether the step kernel honours -DUSE_DOMAIN
+    fuses_adjoint = False  # whether the gradients ride in the adjoint step kernels
 
     @property
     def compile_flags(self) -> tuple[str, ...]:
@@ -330,6 +331,10 @@ class Simulation:
                 f"{self.ncomp} x {self.comp_stride} nodes overflow the int32 flat "
                 f"index; coarsen the grid"
             )
+
+    def adjoint_mass_factor(self) -> float:
+        """Scale of the inertia gradient density: `1 / dt**2`, the residual's own."""
+        return 1.0 / self.dt**2
 
     def define_step(self, kernels: cp.RawModule, mat: dict) -> Callable:
         """Closure launching the finite-difference step kernel over (u0, u1, u2)."""
@@ -593,6 +598,32 @@ def define_excitation(
     """Closure adding row `t_index` of an (N, num_sources) signal into `u` at `position`."""
     weight = sim.excitation_weights(mat, flatten_indices(sim, position))
     return _define_transfer(sim, "excitation_kernel", position, kernels, weight)
+
+
+def define_adjoint_excitation(
+    sim: Simulation,
+    sensors: cpt.NDArray[cp.int32],
+    kernels: cp.RawModule,
+    mat: dict,
+    grads: dict,
+) -> Callable:
+    """Closure adding row `t_index` of the adjoint signal into `l2`, and its share of the inertia gradient against `u1`."""
+    lin_index = flatten_indices(sim, sensors)
+    kernel = kernels.get_function("adjoint_excitation_kernel")
+    threads = 256
+    num = sensors.shape[1]
+    blocks = ((num + threads - 1) // threads,)
+    args = [None, None, np.int32(0), lin_index, np.int32(num)]
+    args += [sim.excitation_weights(mat, lin_index), grads["mass"], None]
+    args.append(sim.dtype(sim.adjoint_mass_factor()))
+
+    def adjoint_excitation_step(l2, signal, u1, t_index):
+        args[0], args[1], args[7] = l2, signal, u1
+        args[2] = np.int32(t_index * num)
+        kernel(blocks, (threads,), args)
+        return l2
+
+    return adjoint_excitation_step
 
 
 def define_get_signal(

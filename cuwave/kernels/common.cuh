@@ -70,6 +70,22 @@ excitation_kernel(real_t *__restrict__ u, const real_t *__restrict__ source,
 }
 
 // ------------------------------------------------------------------------------------
+__global__ void adjoint_excitation_kernel(
+    real_t *__restrict__ l2, const real_t *__restrict__ signal,
+    const int offset, const int *__restrict__ lin_index, const int num_sensors,
+    const real_t *__restrict__ weight, real_t *__restrict__ g_mass,
+    const real_t *__restrict__ u1, const real_t mf) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < num_sensors) {
+    const int n = lin_index[idx];
+    const real_t load = weight[idx] * signal[offset + idx];
+    atomicAdd(&l2[n], load);
+    // the injected load is part of the second time difference of lambda
+    atomicAdd(&g_mass[n], -mf * u1[n] * load);
+  }
+}
+
+// ------------------------------------------------------------------------------------
 __global__ void get_signal_kernel(const real_t *__restrict__ u,
                                   real_t *__restrict__ um, const int offset,
                                   const int *__restrict__ lin_index,

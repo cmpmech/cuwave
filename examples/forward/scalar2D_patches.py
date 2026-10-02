@@ -22,8 +22,8 @@ from cuwave.wave import (
 DIM = 2
 PRECISION = "float32"
 THREADS = (4, 128)
-SPACE_ORDER = 2  # masked problems: the graded wall is exact at order 2
-RESOLUTION = 500
+SPACE_ORDER = 4  # masked problems: the graded wall is exact at order 2
+RESOLUTION = 1000
 SAFETY = 0.99  # fraction of stable time step
 
 # physics
@@ -35,7 +35,7 @@ T = 1.1
 RADIUS = 0.5  # the box is its bounding square
 
 # source
-AMPLITUDE, FREQUENCY, CYCLES = 1e8, 12, 5
+AMPLITUDE, FREQUENCY, CYCLES = 1e8, 25, 5
 SOURCE = (0.3, 0.6)
 
 # --------------------------------------- setup ---------------------------------------

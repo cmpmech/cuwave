@@ -6,6 +6,13 @@ forward pass. At space_order 2 the adjoint is the exact transpose, so the agreem
 round-off rather than truncation, tight enough to catch a wrong prefactor, a one-step
 misalignment or a missing cell weight.
 
+For the pressure classes `sensitivity` fuses both gradients into the adjoint step and
+sums the inertia term by parts in time, so it is pinned at round-off to the separate
+`gradient_kernel` that `reconstruction_sensitivity` keeps, with a sensor on a source,
+since the injected adjoint load is the one piece the excitation launch adds back on
+its own. `superposition_sensitivity` fuses its integrands one triplet late in the same
+way, and is pinned at round-off to the separate `frechet_kernel` path.
+
 `sensitivity` is checked damped as well as lossless: the same step kernel serves both
 passes there, since marching the adjoint backwards is what transposes the damped
 recursion, and the finite difference is what pins the one place damping does not
@@ -389,6 +396,27 @@ class GradientTest(unittest.TestCase):
             nodes=[(11, 9), (17, 14), (13, 11), (9, 15)],
         )
 
+    def test_the_fused_backward_is_the_separate_gradient_kernel(self):
+        # reconstruction_sensitivity still pairs whole triplets in gradient_kernel
+        for sim in (_scalar(order=4, boundary=Dirichlet), _acoustic(order=8)):
+            indicator = self._random(sim, 0.5, 0.5)
+            source = _source(sim, 4.0, (11, 9))
+            second = cp.array([[17], [14]], dtype=cp.int32)
+            source = Source(
+                cp.concatenate((source.position, second), axis=1),
+                cp.concatenate((source.signal, 0.5 * source.signal[::-1]), axis=1),
+            )
+            # one sensor on a source, one on the wall
+            sensors = cp.array([[11, 1, 20], [9, 5, 20]], dtype=cp.int32)
+            objective = l2_misfit(cp.zeros((sim.N, 3), dtype=sim.dtype))
+            fused = sensitivity(sim, source, indicator, sensors, objective)[1]
+            separate = reconstruction_sensitivity(
+                sim, source, indicator, sensors, objective
+            )[1]
+            for name in ("mass", "stiff"):
+                error = cp.abs(fused[name] - separate[name]).max()
+                error = float(error / cp.abs(separate[name]).max())
+                self.assertLess(error, 1e-12, f"{name} off by {error:.2e}")
 
 @unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class SuperpositionTest(unittest.TestCase):
@@ -422,6 +450,22 @@ class SuperpositionTest(unittest.TestCase):
                 rel, cos = _discrepancy(sim, _combine(sim, g), _combine(sim, gr))
                 self.assertLess(rel, 0.25, f"{name}: relative difference {rel:.3e}")
                 self.assertGreater(cos, 0.98, f"{name}: cosine {cos:.6f}")
+
+    def test_the_fused_step_is_the_separate_frechet_kernel(self):
+        for name, sim, freq, base in self._cases():
+            with self.subTest(formulation=name):
+                separate = replace(sim)
+                separate.fuses_adjoint = False
+                source, sensors, indicator, objective = _problem(sim, freq, base)
+                runs = [
+                    superposition_sensitivity(s, source, indicator, sensors, objective)
+                    for s in (sim, separate)
+                ]
+                for field in ("mass", "stiff"):
+                    a, b = runs[0][1][field], runs[1][1][field]
+                    error = float(cp.abs(a - b).max() / cp.abs(b).max())
+                    # 1e-10: the cancellation magnifies the factor's last bit
+                    self.assertLess(error, 1e-10, f"{name} {field} off by {error:.2e}")
 
     def test_it_is_a_descent_direction(self):
         # what an optimizer needs: stepping against it must reduce the forward cost

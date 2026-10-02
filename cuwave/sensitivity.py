@@ -25,6 +25,7 @@ from .wave import (
     Source,
     Window,
     compile_kernels,
+    define_adjoint_excitation,
     define_excitation,
     define_get_signal,
     define_set_signal,
@@ -218,7 +219,6 @@ def sensitivity(
     bc_step = define_boundary(sim, kernels)
     excitation_step = define_excitation(sim, source.position, kernels, mat)
     grads = sim.gradient_fields(mat)
-    gradient_step = sim.define_gradient(sens_kernels, mat, grads)
 
 # ------------------------------------ forward pass -----------------------------------
     # stepped straight into the history, so the leading zeros are u^-2 / u^-1
@@ -238,10 +238,24 @@ def sensitivity(
 
 # --------------------------------- adjoint excitation --------------------------------
     signal = adjoint_signal(sim, dphi, sensors)
-    adjoint_excitation = define_excitation(sim, sensors, kernels, mat)
 
 # ----------------------------------- backward pass -----------------------------------
     P = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
+    if sim.fuses_adjoint:
+        adjoint_step = sim.define_adjoint_gradient(sens_kernels, mat, grads)
+        adjoint_excitation = define_adjoint_excitation(sim, sensors, kernels, mat, grads)
+
+        # reversed, so row m is the middle slot both gradients of lambda^(n + 1) read
+        def backward(m, signal, history):
+            p = adjoint_step(P[m % 2], P[1 - m % 2], history[m])  # lambda^n
+            adjoint_excitation(p, signal, history[m], m)
+            bc_step(p)
+
+        march(sim.N, backward, [Window(signal), Window(V[::-1])])
+        return cost, sim.finalize_gradients(grads, sens_kernels), um, {}
+
+    gradient_step = sim.define_gradient(sens_kernels, mat, grads)
+    adjoint_excitation = define_excitation(sim, sensors, kernels, mat)
 
     # reversed, so row m + 2 - i is u^(n + i) for n = N - 1 - m
     def backward(m, signal, history):
@@ -418,13 +432,18 @@ def superposition_sensitivity(
     kernels = compile_kernels(sim)
     sens_kernels = compile_kernels(sim, sim.sensitivity_path)
 
-    fd_step = sim.define_step(kernels, mat)
     bc_step = define_boundary(sim, kernels)
     excitation_step = define_excitation(sim, source.position, kernels, mat)
     get_signal = define_get_signal(sim, sensors, kernels)
     accs = sim.gradient_fields(mat)
-    subtract_step = sim.define_frechet(sens_kernels, accs, -1.0)
-    add_step = sim.define_frechet(sens_kernels, accs, 1.0)
+    fused = sim.fuses_adjoint
+    if fused:
+        subtract_step = sim.define_superposed(sens_kernels, mat, accs, -1.0)
+        add_step = sim.define_superposed(sens_kernels, mat, accs, 1.0)
+    else:
+        fd_step = sim.define_step(kernels, mat)
+        subtract_step = sim.define_frechet(sens_kernels, accs, -1.0)
+        add_step = sim.define_frechet(sens_kernels, accs, 1.0)
 
     U = cp.zeros((3, *sim.field_shape), dtype=sim.dtype)
     um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
@@ -433,13 +452,21 @@ def superposition_sensitivity(
     # records the traces and subtracts the forward diagonal B(u, u)
     def forward(t, signal, um):
         u0, u1, u2 = U[t % 3], U[(t + 1) % 3], U[(t + 2) % 3]
-        fd_step(u0, u1, u2)
+        if fused:
+            subtract_step(u0, u1, u2)  # the mass density one triplet late
+        else:
+            fd_step(u0, u1, u2)
         excitation_step(u2, signal, t)
         bc_step(u2)
         get_signal(u2, um, t)
-        subtract_step(u0, u1, u2)
+        if not fused:
+            subtract_step(u0, u1, u2)
 
     march(sim.N, forward, [Window(source.signal), Window(um, store=True)])
+    if fused:
+        t = sim.N - 1
+        last = (U[t % 3], U[(t + 1) % 3], U[(t + 2) % 3])
+        sim.define_frechet(sens_kernels, accs, -1.0, stiffness=False)(*last)
 
     cost, dphi = objective(um)
 
@@ -461,14 +488,26 @@ def superposition_sensitivity(
 
 # ----------------------------------- backward pass -----------------------------------
     # starting from u^(N - 1) over u^(N - 2), so the one array carries u + k lambda
-    def backward(t, signal):
+    def backward(t, signal, row, mass=True):
         u0, u1, u2 = (U[(sim.N + i - t) % 3] for i in (1, 0, 2))
-        fd_step(u0, u1, u2)
-        backward_excitation(u2, signal, t)
+        if fused:
+            add_step(u0, u1, u2, mass)
+        else:
+            fd_step(u0, u1, u2)
+        backward_excitation(u2, signal, row)
         bc_step(u2)
-        add_step(u0, u1, u2)
+        if not fused:
+            add_step(u0, u1, u2)
 
-    march(sim.N, backward, [Window(backward_signal)])
+    def shifted(t, signal):
+        backward(t + 1, signal, t)
+
+    # outside the graph, as the first fused step's triplet before is the forward's last
+    backward(0, backward_signal, 0, mass=False)
+    march(sim.N - 1, shifted, [Window(backward_signal[1:])])
+    if fused:
+        last = (U[(1 + i) % 3] for i in (1, 0, 2))
+        sim.define_frechet(sens_kernels, accs, 1.0, stiffness=False)(*last)
 
     after = _accumulated(accs)
     cancellation = before / after if after > 0.0 else float("inf")

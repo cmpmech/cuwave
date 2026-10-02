@@ -5,7 +5,7 @@ One forward step of [cuda_scalar](cuda_scalar.md), written as a residual instead
 $$C^t=\frac{m}{\Delta t^2}\left(u^t-2u^{t-1}+u^{t-2}\right)-\nabla\cdot(k\nabla u^{t-1})-b^t=0$$
 Making $J-\sum_t\lambda^t C^t$ stationary in $u$ defines the **adjoint field** $\lambda$: the same three-term recursion, run backwards in time, driven at the sensors by $\partial J/\partial u$ in place of the source
 $$\lambda^{t}=2\lambda^{t+1}-\lambda^{t+2}+\frac{\Delta t^2}{m}\left(\nabla\cdot(k\nabla\lambda^{t+1})+\frac{\partial J}{\partial u^{t}}\right)$$
-so $\lambda$ needs no kernel of its own: `sensitivity.py` steps it with `fd_kernel` and the same boundary kernels. What is left over is $dJ/d\theta=-\sum_t\lambda^t\,\partial C^t/\partial\theta$, one sum per material field, and those two sums are all this file computes
+so $\lambda$ needs no kernel of its own: `sensitivity.py` steps it with `fd_kernel` and the same boundary kernels, or, in `sensitivity`, with `adjoint_gradient_kernel`, which steps it and accumulates both gradients in one pass. What is left over is $dJ/d\theta=-\sum_t\lambda^t\,\partial C^t/\partial\theta$, one sum per material field, and those two sums are all this file computes
 $$\frac{dJ}{dm}\bigg|_i=-\frac{1}{\Delta t^2}\sum_t\lambda_i^t\left(u_i^t-2u_i^{t-1}+u_i^{t-2}\right)$$
 $$\frac{dJ}{dk}\bigg|_i=\sum_t\frac{\partial}{\partial k_i}\left[\lambda^t\cdot\nabla\cdot(k\nabla u^{t-1})\right]$$
 Both are exact derivatives of the **discretization**, not of the PDE. And both differentiate the residual rather than the update, which is why neither carries the $\Delta t^2$ that the forward step folds into $f_d$: the mass term gets it back as `inv_dt2`, and the stiffness term runs on $F_d=f_d/\Delta t^2$, i.e. $2c_0^2/h_d^2$ (`ScalarWave`) or $2/h_d^2$ (`AcousticWave`)
@@ -33,6 +33,17 @@ $$\frac{\partial}{\partial k_i}\left[\lambda\cdot\nabla\cdot(k\nabla u)\right]=-
 - and the derivative of the (halved) harmonic cell mean is as cheap as the mean itself
 $$g^\pm=\frac{k_ik_{i\pm1}}{k_i+k_{i\pm1}}\qquad\Longrightarrow\qquad\frac{\partial g^\pm}{\partial k_i}=\left(\frac{k_{i\pm1}}{k_i+k_{i\pm1}}\right)^2$$
 - the function returns the bracket alone, so the outer minus is applied once by the caller (`g_stiff -= g`)
+### adjoint_gradient_axis
+**aim**
+compute one axis of the adjoint step's flux divergence and of the stiffness gradient bracket, from one set of cell stiffnesses
+**input args**
+as `stiffness_gradient_axis`, except `factor`: $f_d$, **with** the $\Delta t^2$, and two accumulators added into: `div_l`: the flux divergence of $\lambda$; `g`: the stiffness gradient bracket
+**internal args**
+`sp, sm, gp, gm, dgp, dgm`: as in `flux_divergence_axis` and `stiffness_gradient_axis`; `lp, lm`: $\lambda_{i\pm1}$; `Lp, Lm` and `Dp, Dm`: the two fluxes of $\lambda$ and of $u$
+**how?**
+- the flux divergence of `flux_divergence_axis` and the bracket of `stiffness_gradient_axis` sharing every load of `stiff` and `l1`, so the caller scales `g` by `mf` once
+### flux_divergence_axis
+byte-identical to the one in [cuda_scalar](cuda_scalar.md), since each `.cu` is its own compilation unit; `superposed_kernel` steps with it
 ## kernels
 ### gradient_kernel
 **parallelization**
@@ -45,6 +56,46 @@ add one time step's contribution to both gradient sums
 `uc, lc, sc`: central entries of $u^{t-1}$, $\lambda^t$ and $k$; `g`: the stiffness gradient summed over the axes
 **how?**
 - the cell weights $W$ and the chain rule down to the design field are applied on the host afterwards, see [sensitivity](sensitivity.md)
+### adjoint_gradient_kernel
+**parallelization**
+same grid mapping as `gradient_kernel`
+**aim**
+step the adjoint field one level and add the gradient contribution of the level it steps from, in one pass over the grid
+**input args**
+`l0`: $\lambda^{t+2}$, overwritten with $\lambda^{t}$; `l1`: $\lambda^{t+1}$; `g_mass`, `g_stiff`: the two accumulators, added into; `u1`: the stored forward field paired with `l1`, the middle slot of its triplet; `stiff`, `minv`, `derive_inertia`, and under `USE_DAMPING` `damping`, `dt`: as in `fd_kernel`; `mf`: $1/\Delta t^2$; `f0, f1, f2`: the per-axis factors of `fd_kernel`; `N0, N1, N2`, `s0, s1`: as above
+**internal args**
+`uc, lc, sc`: central entries of $u$, $\lambda^{t+1}$ and $k$; `div_l`, `g`: the sums of `adjoint_gradient_axis` over the axes; `mi`: inverse inertia; `lo, ln`: the old and the new adjoint level at the node
+**how?**
+- the step is `fd_kernel`'s update applied to $\lambda$, damped or not, and the stiffness term is that of `gradient_kernel` for $\lambda^{t+1}$, whose stencil the step has already loaded
+- the mass term is summed by parts in time: with $\lambda$ and $u$ both zero past their ends, the two second differences trade places exactly
+$$\sum_t\lambda_i^t\left(u_i^t-2u_i^{t-1}+u_i^{t-2}\right)=\sum_t u_i^{t-1}\left(\lambda_i^{t-1}-2\lambda_i^{t}+\lambda_i^{t+1}\right)$$
+and the second difference of $\lambda$ is what the step has in registers, `ln - 2 lc + lo`, so the forward field is read at the middle slot only, not as a triplet
+- what the step does not see is the adjoint load the sensors add afterwards, which `adjoint_excitation_kernel` accounts for
+- the same derivative as `gradient_kernel`, not an approximation, which reads three history fields and $\lambda$ again in a launch of its own; `reconstruction_sensitivity` still pairs whole triplets there
+### adjoint_excitation_kernel
+**parallelization**
+one thread per sensor, as `excitation_kernel`; it lives in `kernels/common.cuh` next to it, as nothing in it is scalar
+**aim**
+inject the adjoint signal and add its share of the mass gradient, the part of $\lambda$'s second difference `adjoint_gradient_kernel` steps past
+**input args**
+`l2`: the adjoint level just stepped, added into; `signal`, `offset`, `lin_index`, `num_sensors`, `weight`: as in `excitation_kernel`; `g_mass`: the mass accumulator; `u1`: the stored forward field `adjoint_gradient_kernel` paired with the same step; `mf`: $1/\Delta t^2$, as in `adjoint_gradient_kernel`
+**internal args**
+`n`: the flat index of the sensor; `load`: the injected value
+**how?**
+- `l2` and `g_mass` both take `atomicAdd`, since a sensor may repeat a node
+### superposed_kernel
+**parallelization**
+same grid mapping as `gradient_kernel`
+**aim**
+one step of the superposition variant: the `fd_kernel` update plus both Frechet integrands, in one pass
+**input args**
+`u0, u1, u2`: the field slots of `fd_kernel`, `u2` holding the oldest level until it is overwritten; `acc_mass`, `acc_stiff`: the two accumulators; `stiff`, `minv`, `derive_inertia`: as in `fd_kernel`; `ft`: $\pm1/(2\Delta t)^2$, zero on the first backward step; `fs`: the ratio of $\pm1/(2h_d)^2$ to $f_d$, one number since both go as $1/h_d^2$; `f0, f1, f2`, `N0, N1, N2`, `s0, s1`: as in `fd_kernel`
+**internal args**
+`dudt`: $u^{t-1}-u^{t-3}$ of the triplet before; `g0, g1, g2`: the central space differences of `u1`; `sum`: their weighted square sum
+**how?**
+- the stiffness integrand of `frechet_kernel` for this triplet, whose middle slot `u1` the step reads anyway
+- the mass integrand for the triplet **before**: its newest level is final only once the excitation and the boundary kernels have run on it, which is one step later, and its oldest is what `u2` holds until the update overwrites it
+- so `sensitivity.py` adds the mass integrand of each pass's last triplet with `frechet_kernel` at zero `fs`, and takes the first backward step at zero `ft`, whose triplet before is the forward's last
 ### frechet_kernel
 **parallelization**
 same grid mapping as `gradient_kernel`

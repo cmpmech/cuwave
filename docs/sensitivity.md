@@ -40,7 +40,7 @@ with the inertia $m$, the stiffness $k$ and the design field $\gamma$. `misfit_g
 
 ## the adjoint field
 
-Making $C-\sum_t\lambda^tC^t$ stationary in $u$ gives the adjoint field $\lambda$: the same three-term recursion run backwards in time, driven at the sensors by $\partial C/\partial u$ in place of the source. So $\lambda$ needs no kernel of its own: both variants step it with `fd_kernel` and the same boundary kernels, and only the two gradient sums are new. [backward CUDA](cuda_scalar_sensitivity.md) derives them and documents the kernels
+Making $C-\sum_t\lambda^tC^t$ stationary in $u$ gives the adjoint field $\lambda$: the same three-term recursion run backwards in time, driven at the sensors by $\partial C/\partial u$ in place of the source. So $\lambda$ needs no kernel of its own: both variants step it with `fd_kernel` and the same boundary kernels, and only the two gradient sums are new. Where the simulation sets `fuses_adjoint` (the pressure classes), `sensitivity` folds the step and both sums into one kernel, summing the inertia term by parts in time so that the stored forward field is read once per step instead of three times, and `superposition_sensitivity` folds its two Frechet integrands into the step the same way; the gradients are the same. [backward CUDA](cuda_scalar_sensitivity.md) derives them and documents the kernels
 
 ## cell weights
 

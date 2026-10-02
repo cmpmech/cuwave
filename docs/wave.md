@@ -82,6 +82,9 @@ def fd_step(u0, u1, u2):
 | `define_get_signal`  | `wave.py`        | `get_signal_kernel` | `get_signal_step(u, um, t_index)`                |
 | `define_set_signal`  | `wave.py`        | `set_signal_kernel` | `set_signal_step(u, um, t_index)`                |
 | `define_gradient`    | `sensitivity.py` | `gradient_kernel`   | `gradient_step(g_mass, g_stiff, u0, u1, u2, l1)` |
+| `define_adjoint_gradient` | `scalar.py` | `adjoint_gradient_kernel` | `adjoint_gradient_step(l0, l1, u1)` |
+| `define_adjoint_excitation` | `wave.py` | `adjoint_excitation_kernel` | `adjoint_excitation_step(l2, signal, u1, t_index)` |
+| `define_superposed` | `scalar.py` | `superposed_kernel` | `superposed_step(u0, u1, u2, mass=True)` |
 
 Conventions shared by all of them
 

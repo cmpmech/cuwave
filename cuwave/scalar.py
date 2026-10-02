@@ -67,6 +67,7 @@ class PressureWave(Simulation):
         return args
 
     gradient_names = ("mass", "stiff")  # the fields the adjoint differentiates
+    fuses_adjoint = True  # one kernel steps the adjoint and accumulates both gradients
 
     def gradient_fields(self, mat: dict) -> dict[str, cpt.NDArray]:
         """Zeroed accumulators the adjoint kernels add into, one per material field."""
@@ -103,15 +104,59 @@ class PressureWave(Simulation):
 
         return gradient_step
 
+    def define_adjoint_gradient(
+        self, kernels: cp.RawModule, mat: dict, grads: dict
+    ) -> Callable:
+        """Closure stepping the adjoint `l0` over `l1`, accumulating both gradients of `l1`."""
+        adjoint_gradient_kernel = kernels.get_function("adjoint_gradient_kernel")
+        grid, block = grid_block(self)
+        args = [None, None, grads["mass"], grads["stiff"], None]
+        args += [*self.step_kernel_args(mat), self.dtype(self.adjoint_mass_factor())]
+        args += axis_geometry(self, self.step_factors())
+
+        def adjoint_gradient_step(l0, l1, u1):
+            args[0], args[1], args[4] = l0, l1, u1
+            adjoint_gradient_kernel(grid, block, args)
+            return l0
+
+        return adjoint_gradient_step
+
+    def define_superposed(
+        self, kernels: cp.RawModule, mat: dict, accs: dict, sign: float
+    ) -> Callable:
+        """Closure stepping (u0, u1, u2), adding `sign` times the stiffness density of this triplet and the mass density of the one before."""
+        superposed_kernel = kernels.get_function("superposed_kernel")
+        grid, block = grid_block(self)
+        factors = self.step_factors()
+        # both per-axis factors go as 1 / dx**2, so their ratio is one number
+        ratios = [-sign / (2.0 * d) ** 2 / float(f) for d, f in zip(self.dx, factors)]
+        if not np.allclose(ratios, ratios[0]):
+            raise ValueError(
+                f"step factors {factors} are not proportional to 1 / dx**2"
+            )
+        args = [None, None, None, accs["mass"], accs["stiff"]]
+        args += [*self.step_kernel_args(mat), self.dtype(sign / (2.0 * self.dt) ** 2)]
+        args += [self.dtype(ratios[0]), *axis_geometry(self, factors)]
+        massless = list(args)
+        massless[8] = self.dtype(0.0)
+
+        def superposed_step(u0, u1, u2, mass=True):
+            launch = args if mass else massless
+            launch[0], launch[1], launch[2] = u0, u1, u2
+            superposed_kernel(grid, block, launch)
+            return u2
+
+        return superposed_step
+
     def define_frechet(
-        self, kernels: cp.RawModule, accs: dict, sign: float
+        self, kernels: cp.RawModule, accs: dict, sign: float, stiffness: bool = True
     ) -> Callable:
         """Closure accumulating both Frechet densities of one field triplet, times `sign`."""
         # sign is fixed per pass, so it is folded into the factors, not recomputed
         frechet_kernel = kernels.get_function("frechet_kernel")
         grid, block = grid_block(self)
         # the stiffness density enters negated, so the epilogue scales both alike
-        factors = [self.dtype(-sign / (2.0 * d) ** 2) for d in self.dx]
+        factors = [self.dtype(-sign * stiffness / (2.0 * d) ** 2) for d in self.dx]
         args = [accs["mass"], accs["stiff"], None, None, None]
         args += [self.dtype(sign / (2.0 * self.dt) ** 2), *axis_geometry(self, factors)]
 

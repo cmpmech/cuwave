@@ -22,6 +22,8 @@ The void a driver otherwise sets outside is a low-impedance medium, not a wall. 
 
 `derive_inertia` marks the parametrizations in which $m=k$, so that the fields carry the impedance only and the wave speed sits in `step_factors`: `minv` is then recovered from `stiff` in the kernel, saving one field pass per step and one grid field of memory
 
+`fuses_adjoint` has `sensitivity` and `superposition_sensitivity` accumulate the gradients inside the step kernel (`define_adjoint_gradient`, `define_superposed`, see [backward CUDA](cuda_scalar_sensitivity.md)) rather than in a launch of their own, which reads the stored forward field once per step instead of three times and spares a pass over the material. The vector equations keep the separate gradient kernels: their step is two launches already, so there is no single pass to fold the gradient into
+
 The hooks a parametrization fills in are the ones [wave](wave.md) lists for every specialization; the two below differ only in what they put into them
 
 ## ScalarWave
