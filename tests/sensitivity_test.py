@@ -2,9 +2,13 @@
 `superposition_sensitivity` against `sensitivity`.
 
 The reference cost goes through `simulate`, so no check reuses the adjoint module's own
-forward pass. At space_order 2 the adjoint is the exact transpose, so the agreement is
-round-off rather than truncation, tight enough to catch a wrong prefactor, a one-step
-misalignment or a missing cell weight.
+forward pass. The adjoint steps the exact transpose of the forward operator at every
+`space_order`, so the agreement is round-off rather than truncation, tight enough to
+catch a wrong prefactor, a one-step misalignment or a missing cell weight. Above order 2
+that transpose departs from the forward step only near the walls (the graded rows, the
+halved wall cell and the ghost folded onto its mirror), so the high-order checks probe
+walls, corners and rows 2 .. 2R on a sharp material, and one adjoint step is pinned to the
+transpose of one forward step on its own, across dimensions, orders and face layouts.
 
 For the pressure classes `sensitivity` fuses both gradients into the adjoint step and
 sums the inertia term by parts in time, so it is pinned at round-off to the separate
@@ -53,7 +57,13 @@ except Exception:  # cupy missing or no GPU
     HAS_CUDA = False
 
 if HAS_CUDA:
-    from cuwave.boundary import Dirichlet, Neumann, pad_for_sponge, sponge
+    from cuwave.boundary import (
+        Dirichlet,
+        Neumann,
+        define_boundary,
+        pad_for_sponge,
+        sponge,
+    )
     from cuwave.scalar import AcousticWave, ScalarWave
     from cuwave.sensitivity import (
         l2_misfit,
@@ -375,26 +385,66 @@ class GradientTest(unittest.TestCase):
                 self.assertEqual(expected[1], 0.5)
                 self.assertEqual(expected[-1], 1.0)
 
-    def test_high_order_is_only_consistent(self):
-        # above order 2 the transpose is symmetric to O(dx^2), on a smooth material
-        sim = _scalar(order=4)
-        x, y = grid_coords(sim.Nx, sim.dx, dtype=sim.dtype)
-        indicator = cp.ascontiguousarray(
-            1.0 + 0.25 * cp.sin(3.0 * math.pi * x) * cp.cos(2.0 * math.pi * y),
-            dtype=sim.dtype,
-        )
-        source = _source(sim, 4.0, (7, (NC - 2) // 2))
-        sensors = cp.array([[20, 11], [7, 20]], dtype=cp.int32)
+    def _sharp(self, sim, base, hz, damp=None):
+        # a sharp random material, sources off the wall and sensors on it
+        indicator = self._random(sim, base, 0.5 * base)
+        source = _source(sim, hz, (5, sim.Nx[1] // 2))
+        hi0, hi1 = sim.Nx[0] - 2, sim.Nx[1] - 2
+        sensors = cp.array([[1, hi0, hi0, 11, 3], [5, hi1, 9, hi1, 1]], dtype=cp.int32)
+        if damp:
+            sim = _damp(sim, indicator, damp)
         observed = simulate(sim, source, indicator, sensors=sensors)[1] * 0.7
-        self._check(
-            sim,
-            indicator,
-            l2_misfit(observed),
-            source,
-            sensors,
-            tol=5e-2,
-            nodes=[(11, 9), (17, 14), (13, 11), (9, 15)],
+        return sim, indicator, l2_misfit(observed), source, sensors
+
+    def _graded_nodes(self, sim):
+        # walls, corners and the graded rows 2 .. 2R, where the transpose departs
+        hi0, hi1 = sim.Nx[0] - 2, sim.Nx[1] - 2
+        return [(1, 12), (hi0, 12), (1, 1), (2, 7), (3, 9), (4, 4), (5, 2), (7, 12)] + [
+            (hi0 - 2, hi1 - 3),
+            (11, 9),
+            (17, 14),
+            (8, hi1),
+            (2, 2),
+        ]
+
+    def test_high_order_gradient_matches_finite_differences(self):
+        mixed = ((Dirichlet, Neumann), (Neumann, Dirichlet))
+        for name, sim, base, hz, damp in (
+            ("scalar order 4", _scalar(order=4), 1.0, 4.0, None),
+            ("scalar order 8", _scalar(order=8), 1.0, 4.0, None),
+            ("mixed walls order 4", _scalar(order=4, boundary=mixed), 1.0, 4.0, None),
+            ("acoustic order 8", _acoustic(order=8), 0.3, 400.0, None),
+            ("damped acoustic order 4", _acoustic(order=4), 0.3, 400.0, 0.02),
+        ):
+            with self.subTest(case=name):
+                problem = self._sharp(sim, base, hz, damp)
+                self._check(*problem, nodes=self._graded_nodes(sim))
+
+    def test_high_order_gradient_matches_finite_differences_in_3D(self):
+        Nx, dx = (20, 18, 16), (1.0 / 17,) * 3
+        sim = ScalarWave(
+            Nx,
+            dx,
+            90,
+            0.85 * stable_dt(dx, 1.0, 4),
+            (2, 4, 32),
+            precision="float64",
+            space_order=4,
+            wavespeed=1.0,
+            density=1.3,
+            boundary=((Dirichlet, Neumann), (Neumann, Neumann), (Neumann, Dirichlet)),
         )
+        indicator = self._random(sim, 1.0, 0.5)
+        t = np.linspace(0, (sim.N - 1) * sim.dt, sim.N)
+        signal = ricker(t, 1.0, 4.0) / np.prod(sim.dx)
+        source = Source(
+            cp.array([[6], [9], [8]], dtype=cp.int32),
+            cp.asarray(signal[:, None], dtype=sim.dtype),
+        )
+        sensors = cp.array([[2, 18, 9], [5, 16, 1], [7, 10, 12]], dtype=cp.int32)
+        observed = simulate(sim, source, indicator, sensors=sensors)[1] * 0.7
+        nodes = [(1, 5, 7), (2, 3, 4), (18, 16, 14), (9, 9, 8), (4, 1, 2), (10, 2, 13)]
+        self._check(sim, indicator, l2_misfit(observed), source, sensors, nodes=nodes)
 
     def test_the_fused_backward_is_the_separate_gradient_kernel(self):
         # reconstruction_sensitivity still pairs whole triplets in gradient_kernel
@@ -417,6 +467,59 @@ class GradientTest(unittest.TestCase):
                 error = cp.abs(fused[name] - separate[name]).max()
                 error = float(error / cp.abs(separate[name]).max())
                 self.assertLess(error, 1e-12, f"{name} off by {error:.2e}")
+
+
+@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
+class TransposeTest(unittest.TestCase):
+    def _sim(self, ndim, order, faces, kind):
+        Nx = {1: (41,), 2: (37, 29), 3: (27, 23, 21)}[ndim]
+        dx = (0.1,) * ndim
+        threads = {1: (64,), 2: (4, 32), 3: (2, 4, 32)}[ndim]
+        mixed = tuple((Dirichlet, Neumann)[:: 1 - 2 * (d % 2)] for d in range(ndim))
+        boundary = {"Neumann": Neumann, "Dirichlet": Dirichlet, "mixed": mixed}[faces]
+        dt = 0.3 * stable_dt(dx, 1.0, order)
+        common = dict(precision="float64", space_order=order, boundary=boundary)
+        if kind == "scalar":
+            return ScalarWave(
+                Nx, dx, 1, dt, threads, wavespeed=1.0, density=1.0, **common
+            )
+        return AcousticWave(
+            Nx, dx, 1, dt, threads, rho1=1.0, rho2=3.0, kappa1=1.0, kappa2=5.0, **common
+        )
+
+    def _error(self, sim):
+        rng = np.random.default_rng(0)
+        indicator = cp.asarray(0.2 + rng.random(sim.Nx_padded), dtype=sim.dtype)
+        mat = sim.build_materials(indicator)
+        kernels = compile_kernels(sim)
+        step = sim.define_step(kernels, mat)
+        adjoint_step = sim.define_adjoint_step(
+            kernels, compile_kernels(sim, sim.sensitivity_path), mat
+        )
+        bc_step = define_boundary(sim, kernels)
+        mask = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
+        mask[tuple(slice(1, n - 1) for n in sim.Nx)] = 1.0
+        u, p = (cp.asarray(rng.standard_normal(sim.Nx_padded)) * mask for _ in "up")
+        bc_step(u)
+        bc_step(p)  # whatever lands on lambda's ghosts must not matter
+        zero = cp.zeros_like(u)
+        Au = step(zero, u, cp.zeros_like(u)) - 2 * u
+        Ap = adjoint_step(zero, p, cp.zeros_like(p)) - 2 * p
+        Wm = apply_cell_weights(sim, mask.copy()) / sim.inverse_inertia(indicator)
+        scale = float(cp.sqrt(cp.sum(Wm * Ap**2) * cp.sum(Wm * u**2)))
+        return abs(float(cp.sum(Wm * Ap * u) - cp.sum(Wm * p * Au))) / scale
+
+    def test_one_adjoint_step_is_the_transpose_of_one_forward_step(self):
+        for ndim, orders in ((1, (2, 4)), (2, (2, 4, 8, 16)), (3, (2, 4))):
+            for order in orders:
+                for faces in ("Neumann", "Dirichlet", "mixed"):
+                    for kind in ("scalar", "acoustic"):
+                        with self.subTest(
+                            ndim=ndim, space_order=order, faces=faces, kind=kind
+                        ):
+                            error = self._error(self._sim(ndim, order, faces, kind))
+                            self.assertLess(error, 1e-12, f"off by {error:.2e}")
+
 
 @unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class SuperpositionTest(unittest.TestCase):
@@ -610,22 +713,28 @@ class ReconstructionTest(unittest.TestCase):
 
     def test_it_matches_finite_differences_through_a_sponge(self):
         # the check no other variant runs damped: superposition refuses the field
-        sim = _sponged()
-        source, sensors, indicator, objective = _problem(sim, 5.0, 1.0)
-        _, grads, _, _ = reconstruction_sensitivity(
-            sim, source, indicator, sensors, objective
-        )
-        nodes = [(11, 9), (17, 14), (13, 11), (22, 15)]
+        for order in (2, 4):
+            with self.subTest(space_order=order):
+                sim = _sponged(order=order)
+                source, sensors, indicator, objective = _problem(sim, 5.0, 1.0)
+                _, grads, _, _ = reconstruction_sensitivity(
+                    sim, source, indicator, sensors, objective
+                )
+                nodes = [(11, 9), (17, 14), (13, 11), (22, 15)]
 
-        def cost():
-            return objective(simulate(sim, source, indicator, sensors=sensors)[1])[0]
+                def cost():
+                    traces = simulate(sim, source, indicator, sensors=sensors)[1]
+                    return objective(traces)[0]
 
-        reference = _finite_difference(cost, indicator, nodes)
-        gradient = _combine(sim, grads)
-        for node, expected in zip(nodes, reference):
-            self.assertAlmostEqual(
-                float(gradient[node]) / expected, 1.0, delta=1e-4, msg=f"node {node}"
-            )
+                reference = _finite_difference(cost, indicator, nodes)
+                gradient = _combine(sim, grads)
+                for node, expected in zip(nodes, reference):
+                    self.assertAlmostEqual(
+                        float(gradient[node]) / expected,
+                        1.0,
+                        delta=1e-4,
+                        msg=f"node {node}",
+                    )
 
     def test_a_closed_lossless_domain_needs_no_strip(self):
         # nothing is irreversible, so the reverse march runs on the two seeds alone
@@ -717,6 +826,16 @@ class SourceGradientTest(unittest.TestCase):
         sensors = self._sensors(sim)
         observed = simulate(sim, source, indicator, sensors=sensors)[1] * 0.7
         self._check(sim, indicator, l2_misfit(observed), source, sensors)
+
+    def test_high_order_source_gradient_matches_finite_differences(self):
+        for order in (4, 8):
+            with self.subTest(space_order=order):
+                sim = _scalar(order=order)
+                indicator = self._random(sim, 1.0, 0.5)
+                source = self._shot(sim, 4.0)
+                sensors = self._sensors(sim)
+                observed = simulate(sim, source, indicator, sensors=sensors)[1] * 0.7
+                self._check(sim, indicator, l2_misfit(observed), source, sensors)
 
     def test_acoustic_source_gradient_matches_finite_differences(self):
         # the one thing the parametrization changes here is source_factor

@@ -9,6 +9,7 @@
 | `-DUSE_FLOAT`                 | `precision == "float32"`                                              | `real_t = float`, otherwise `double`                          |
 | `-DUSE_DAMPING`               | `sim.compile_flags`, once `Simulation.damping` is set | compiles the damping term and its two extra kernel parameters |
 | `-DUSE_DOMAIN`                | `sim.compile_flags`, once `Simulation.domain` is set  | launches `fd_kernel` over a tile list and grades the cells at the domain wall, two extra kernel parameters |
+| `-DUSE_STREAM`, `-DSTREAM_TX` | `sim.compile_flags`, where `PressureWave.streams` (a wide unmasked 2D stencil on a full grid) | compiles the streaming `fd_kernel` below instead of the per-thread one, its tile `STREAM_TX = threads[-1]` wide |
 | `STENCIL_RADIUS`, `OP_COEFFS` | `stencils.preamble(space_order)`                                      | the radius $R$ and the cell-coefficient table                 |
 | `--use_fast_math`             | always                                                                |                                                               |
 
@@ -99,6 +100,19 @@ $$u^{n+1}\approx\frac{1}{1+\beta}\left(2 u^{n} - u^{n-1}(1-\beta) + \frac{1}{m}\
 - without `-DUSE_DAMPING` the $\beta$ branch is not compiled at all and the update is
 $$u^{n+1}=-u^{n-1}+2u^n+m^{-1}\nabla\cdot(k\nabla u^n)$$
 - under `-DUSE_DOMAIN` the grid is a 1D launch over `tiles`, and only a tile with bit 30 reads `cells`: a branch uniform per block, so a tile wholly inside runs the plain stencil and pays nothing. There a node outside returns before writing, which leaves it at the zero it started at, and a node near the wall replaces the plain laplacian with `wall_laplacian`
+### fd_kernel (streaming)
+Same aim, operator and update as `fd_kernel`, compiled in its place under `-DUSE_STREAM`: the taps are taken in the same order, so the two agree bit for bit at order 2 and to the last bit of a contracted fma above it
+**parallelization**
+a 2D launch, `blockIdx.x` a tile of `STREAM_TX` columns of axis 1 and `blockIdx.y` a chunk of `CHUNK_ROWS` rows of axis 0, which the block marches row by row
+**input args**
+as `fd_kernel` without `cells, tiles`, plus `chunk`: the rows of axis 0 a block marches, `CHUNK_ROWS` from `scalar.py`
+**internal args**
+`q`: register queue of $u^n$ on rows $a_0-R\ldots a_0+R$ of the thread's column; `sm, sc, sp`: $k$ on rows $a_0-1, a_0, a_0+1$; `su, sk`: the current row of $u^n$ and $k$ in shared memory, with a halo of $R$; `old`: $u^{n-1}$, read before the barriers so its latency hides behind the tile loads
+**how?**
+- each row: shift the queues by one, load row $a_0+R$ of $u$ and row $a_0+1$ of $k$ into them, write the row's tile and its halo, barrier
+- axis 0 from the registers, axis 1 by `flux_divergence_axis` on the tile, then the update of `fd_kernel`
+- every value is read from memory once per step and the stencil's reuse along axis 0 stays in registers, which is what the plain kernel leaves to L1. That pays for a wide stencil only: below order 6, on a grid too small to fill the device with chunks, and in 3D, L1 serves the per-thread kernel as well, and a mask keeps the per-thread kernel for its tile list, which the stream would not fit
+
 ### homogeneous_neumann_kernel
 **parallelization**
 flat 1D launch, 256 threads per block, one thread per ghost node (the ghost ring is not a grid-shaped domain, so these kernels decode a linear thread id via `bc_ghost` instead of using the grid mapping of `fd_kernel`)

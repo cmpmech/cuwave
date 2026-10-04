@@ -17,7 +17,7 @@ import cupy as cp
 import cupy.typing as cpt
 import numpy as np
 
-from .boundary import Neumann
+from .boundary import Dirichlet, Neumann, face_mask
 from .wave import (
     Simulation,
     apply_cell_weights,
@@ -29,6 +29,19 @@ from .wave import (
 
 KERNEL_PATH = Path(__file__).parent / "kernels" / "scalar.cu"
 SENSITIVITY_PATH = Path(__file__).parent / "kernels" / "scalar_sensitivity.cu"
+CHUNK_ROWS = 64  # axis-0 rows one streaming block marches
+STREAM_ORDER = 6  # below it L1 serves the plain step as well as the stream would
+STREAM_BLOCKS = 8  # per multiprocessor the stream needs to fill the device
+
+
+def split_grid_block(sim: Simulation) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """`grid_block` with the fast axis split: every row's near-wall columns packed, then the deep ones."""
+    grid, block = grid_block(sim)
+    radius = sim.space_order // 2
+    reach = 2 * radius if radius > 1 else 3  # WALL_REACH in scalar_sensitivity.cu
+    walls = -(-2 * (reach - 1) // block[0])
+    deep = -(-max(sim.Nx[-1] - 2 * reach, 0) // block[0])
+    return (walls + deep, *grid[1:]), block
 
 
 # -------------------------------- discretization setup -------------------------------
@@ -42,6 +55,62 @@ class PressureWave(Simulation):
 
     derive_inertia = False  # set where m == k (rho scaling): minv derived from stiff
     accepts_domain = True
+
+    @property
+    def streams(self) -> bool:
+        """Whether the step streams along axis 0: a wide unmasked 2D stencil on a full grid."""
+        # in 3D, or below STREAM_ORDER, L1 serves the plain step as well
+        if self.ndim != 2 or self.masked or self.space_order < STREAM_ORDER:
+            return False
+        tiles = -(-self.Nx_padded[1] // self.threads[-1])
+        chunks = -(-(self.Nx[0] - 2) // CHUNK_ROWS)
+        sms = cp.cuda.Device().attributes["MultiProcessorCount"]
+        return tiles * chunks >= STREAM_BLOCKS * sms
+
+    @property
+    def compile_flags(self) -> tuple[str, ...]:
+        """The base flags, plus the streaming block where the step streams."""
+        flags = super().compile_flags
+        if not self.streams:
+            return flags
+        return flags + ("-DUSE_STREAM", f"-DSTREAM_TX={self.threads[-1]}")
+
+    def define_step(self, kernels: cp.RawModule, mat: dict) -> Callable:
+        """Closure launching the step, streamed along axis 0 unless a mask tiles it."""
+        if not self.streams:
+            return super().define_step(kernels, mat)
+        fd_kernel = kernels.get_function("fd_kernel")
+        # a block marches CHUNK_ROWS of axis 0 under its tile of axis 1
+        block = (self.threads[-1],)
+        grid = (-(-self.Nx_padded[1] // block[0]), -(-(self.Nx[0] - 2) // CHUNK_ROWS))
+        args = [None, None, None, *self.step_kernel_args(mat), np.int32(CHUNK_ROWS)]
+        args += axis_geometry(self, self.step_factors())
+
+        def fd_step(u0, u1, u2):
+            args[0], args[1], args[2] = u0, u1, u2
+            fd_kernel(grid, block, args)
+            return u2
+
+        return fd_step
+
+    def define_adjoint_step(
+        self, kernels: cp.RawModule, sens_kernels: cp.RawModule, mat: dict
+    ) -> Callable:
+        """Closure stepping the adjoint by the exact transpose of the step's operator."""
+        # a mask grades its cells per node, which the transposed kernel does not read
+        if self.masked:
+            return self.define_step(kernels, mat)
+        adjoint_kernel = sens_kernels.get_function("adjoint_kernel")
+        grid, block = split_grid_block(self)
+        args = [None, None, None, *self.step_kernel_args(mat)]
+        args += [face_mask(self, Dirichlet), *axis_geometry(self, self.step_factors())]
+
+        def adjoint_step(l0, l1, l2):
+            args[0], args[1], args[2] = l0, l1, l2
+            adjoint_kernel(grid, block, args)
+            return l2
+
+        return adjoint_step
 
     def build_materials(self, indicator: cpt.NDArray) -> dict:
         """Turn `indicator` into the kernel's material dict, `damping` included."""
@@ -92,7 +161,7 @@ class PressureWave(Simulation):
         """Closure accumulating both gradient densities from a forward triplet and `l1`."""
         # one kernel for both gradients: a launch costs more host time than either body
         gradient_kernel = kernels.get_function("gradient_kernel")
-        grid, block = grid_block(self)
+        grid, block = split_grid_block(self)
         # the operator without the dt^2 the step folds into it: L, not dt^2 L
         factors = [self.dtype(float(f) / self.dt**2) for f in self.step_factors()]
         args = [grads["mass"], grads["stiff"], None, None, None, None, mat["stiff"]]
@@ -109,9 +178,10 @@ class PressureWave(Simulation):
     ) -> Callable:
         """Closure stepping the adjoint `l0` over `l1`, accumulating both gradients of `l1`."""
         adjoint_gradient_kernel = kernels.get_function("adjoint_gradient_kernel")
-        grid, block = grid_block(self)
+        grid, block = split_grid_block(self)
         args = [None, None, grads["mass"], grads["stiff"], None]
-        args += [*self.step_kernel_args(mat), self.dtype(self.adjoint_mass_factor())]
+        args += [*self.step_kernel_args(mat), face_mask(self, Dirichlet)]
+        args += [self.dtype(self.adjoint_mass_factor())]
         args += axis_geometry(self, self.step_factors())
 
         def adjoint_gradient_step(l0, l1, u1):

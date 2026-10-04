@@ -101,11 +101,8 @@ the stiffness with no design dependence.
 **2D Maxwell needs none of that.** Out of plane one component survives and the curl-curl
 collapses to a flux divergence, so `maxwell.ElectricWave` (E_z, permittivity as inertia)
 and `maxwell.MagneticWave` (H_z, inverse permittivity as stiffness) are `PressureWave` on
-the existing `scalar.cu`. Both `examples/tpto/` drivers use them. Trap: `MagneticWave` puts
-the design in the **stiffness**, which is where the wide-order transpose stops being exact,
-so it must run at `space_order = 2`; `ElectricWave` is exact in the interior at any
-order, off by ~1e-3 only on the nodes next to a box wall (the wide closure is not
-symmetric there, so lambda is).
+the existing `scalar.cu`. Both `examples/tpto/` drivers use them, and both get exact
+gradients at any order through the transposed pressure adjoint below.
 
 **`Simulation.domain`** (scalar family only, `accepts_domain`) is a nodal mask of the
 physical domain. Each flux cell's radius is capped by the run of domain nodes on either
@@ -167,6 +164,16 @@ Both reconstructing variants rebuild the forward field rather than storing it, w
 Each reports its own health: `info["drift"]` and `info["strip"]` for the strip variant,
 `info["cancellation"]` for the superposition one, which past `CANCELLATION_LIMIT` means the
 gradient is mostly round-off and the caller must raise `scale`. See `docs/sensitivity.md`.
+
+`sensitivity` and `reconstruction_sensitivity` are exact at any order. Above order 2 the
+pressure operator is not its own transpose (graded wall rows, wide flux under a varying
+stiffness), so `PressureWave.define_adjoint_step` steps lambda with `adjoint_kernel`,
+`W^-1 A^T W` written as a gather, and the fused and gradient kernels carry the matching
+wall terms. Those three kernels launch on `split_grid_block`: the near-wall columns of the
+fast axis are packed into leading blocks, so only those blocks and the near-wall rows run
+the general wall path (a warp holding one wall node would otherwise run it for all 32
+lanes). Masked runs (`domain`/`dirichlet`) are not covered: material gradients refuse them
+and `source_sensitivity` falls back to `define_step`, exact at order 2 only.
 
 All three return gradients with respect to `(mass, stiff)` over the padded grid. Converting
 to a gradient with respect to the design indicator is the caller's chain rule via

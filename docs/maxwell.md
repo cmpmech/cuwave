@@ -59,7 +59,7 @@ The damped update is $m\ddot{u}+d\dot{u}=\nabla\cdot\left(k\nabla u\right)$, and
 
 ## limits
 
-The adjoint is the exact transpose of the discretization at `space_order` 2 only. Above it the graded wall closure is not symmetric even for a constant stiffness (a node near the wall reads one its neighbour does not read back), so the adjoint field $\lambda$ itself is off near the walls. For `ElectricWave` that is all: the design enters its inertia, and the inertia density $-\lambda^n\left(u^{n+1}-2u^n+u^{n-1}\right)/\Delta t^2$ carries no stencil of its own, so the gradient stays exact in the interior and is off by up to about 1e-3 on the nodes next to a wall. `MagneticWave` puts the design in the **stiffness**, where the telescoped flux adds its own asymmetry across every material jump, and a permittivity contrast of 12 makes that error large rather than academic. **Run `MagneticWave` at `space_order` 2**; [sensitivity](sensitivity.md) carries the general statement
+Both reductions get the exact transpose of their discretization at every `space_order`: they are `PressureWave` subclasses, so $\lambda$ is stepped by the transposed pressure kernel whether the design sits in the inertia (`ElectricWave`) or in the stiffness (`MagneticWave`), see [sensitivity](sensitivity.md)
 
 Order 2 costs nothing in accuracy here. A binary design is a material jump defined at grid resolution, and the harmonic cell mean across a jump is first order whatever the stencil, so the interface sets the error: a quarter-wave silicon slab transmits within 2% of Fabry-Perot at 20 points per silicon wavelength at order 2 and at order 4 alike
 

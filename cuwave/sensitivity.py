@@ -254,12 +254,13 @@ def sensitivity(
         march(sim.N, backward, [Window(signal), Window(V[::-1])])
         return cost, sim.finalize_gradients(grads, sens_kernels), um, {}
 
+    adjoint_step = sim.define_adjoint_step(kernels, sens_kernels, mat)
     gradient_step = sim.define_gradient(sens_kernels, mat, grads)
     adjoint_excitation = define_excitation(sim, sensors, kernels, mat)
 
     # reversed, so row m + 2 - i is u^(n + i) for n = N - 1 - m
     def backward(m, signal, history):
-        p = fd_step(P[m % 2], P[1 - m % 2], P[m % 2])  # lambda^n
+        p = adjoint_step(P[m % 2], P[1 - m % 2], P[m % 2])  # lambda^n
         adjoint_excitation(p, signal, m)
         bc_step(p)
         # inertia pairs lambda^n with the whole triplet, stiffness with its middle slot
@@ -312,6 +313,7 @@ def reconstruction_sensitivity(
     sens_kernels = compile_kernels(sim, sim.sensitivity_path)
 
     fd_step = sim.define_step(kernels, mat)
+    adjoint_step = sim.define_adjoint_step(kernels, sens_kernels, mat)
     bc_step = define_boundary(sim, kernels)
     excitation_step = define_excitation(sim, source.position, kernels, mat)
     get_signal = define_get_signal(sim, sensors, kernels)
@@ -356,7 +358,7 @@ def reconstruction_sensitivity(
         return tuple(U[(sim.N + i - m) % 3] for i in (2, 0, 1))
 
     def adjoint(m, signal):
-        p = fd_step(P[m % 2], P[1 - m % 2], P[m % 2])  # lambda^n
+        p = adjoint_step(P[m % 2], P[1 - m % 2], P[m % 2])  # lambda^n
         adjoint_excitation(p, signal, m)
         bc_step(p)
         # inertia pairs lambda^n with the whole triplet, stiffness with its middle slot
@@ -564,7 +566,8 @@ def source_sensitivity(
 
     mat = sim.build_materials(indicator)
     kernels = compile_kernels(sim)
-    fd_step = sim.define_step(kernels, mat)
+    sens_kernels = compile_kernels(sim, sim.sensitivity_path)
+    adjoint_step = sim.define_adjoint_step(kernels, sens_kernels, mat)
     bc_step = define_boundary(sim, kernels)
     probe = define_get_signal(sim, source.position, kernels)
 
@@ -577,7 +580,7 @@ def source_sensitivity(
     lam = cp.zeros((sim.N, source.position.shape[1]), dtype=sim.dtype)
 
     def backward(m, signal, lam):
-        p = fd_step(P[m % 2], P[1 - m % 2], P[m % 2])  # lambda^n
+        p = adjoint_step(P[m % 2], P[1 - m % 2], P[m % 2])  # lambda^n
         adjoint_excitation(p, signal, m)
         bc_step(p)
         probe(p, lam, m)

@@ -1,4 +1,5 @@
 import itertools
+import warnings
 from collections.abc import Callable, Sequence
 
 import cupy as cp
@@ -470,3 +471,94 @@ def intensity(
         return cost, 2.0 * scale * (cos @ (w * re) - sin @ (w * im))
 
     return objective
+
+
+# ---------------------------------- time dispersion ----------------------------------
+def _warn_low_order(sim: Simulation) -> None:
+    """Warn where removing the time error costs accuracy: order 2 cancels it in space."""
+    if sim.space_order == 2:
+        warnings.warn(
+            "at space_order 2 the leapfrog time error offsets the spatial one, so "
+            "removing it makes the result less accurate; use space_order 4 or higher",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
+def _warp(
+    sim: Simulation, values: cpt.NDArray | npt.NDArray, offset: int, read: Callable
+) -> cpt.NDArray | npt.NDArray:
+    """Re-sample the spectrum of `values` at `read(omega)`, back onto the same rows."""
+    xp = cp.get_array_module(values)
+    rows = xp.asarray(values).reshape(values.shape[0], -1)
+    steps = rows.shape[0]
+    size = 2 * steps  # the warp moves a sample, so the period must outrun the signal
+    omega = 2.0 * np.pi * np.fft.rfftfreq(size, sim.dt)
+    target = read(omega)  # nan where a frequency has no counterpart
+    keep = np.isfinite(target)
+    complex_dtype = xp.complex64 if rows.dtype == xp.float32 else xp.complex128
+    # the phase reaches pi * N radians, so the tables are built in double
+    times = xp.asarray((np.arange(steps) + offset) * sim.dt)
+    freqs = xp.asarray(np.where(keep, target, 0.0))
+    rows = rows.astype(complex_dtype)
+    spectrum = xp.empty((omega.size, rows.shape[1]), dtype=complex_dtype)
+    block = max(1, 2**23 // steps)  # bounds the table at 2**23 entries
+    for k in range(0, omega.size, block):
+        table = xp.exp(-1j * xp.outer(freqs[k : k + block], times))
+        spectrum[k : k + block] = table.astype(complex_dtype) @ rows
+    shift = xp.asarray(keep * np.exp(1j * omega * offset * sim.dt), dtype=complex_dtype)
+    out = xp.fft.irfft(spectrum * shift[:, None], size, axis=0)[:steps]
+    return out.astype(values.dtype).reshape(values.shape)
+
+
+def tdt(
+    sim: Simulation, signal: cpt.NDArray | npt.NDArray, offset: int = 0
+) -> cpt.NDArray | npt.NDArray:
+    """Time-dispersion transform: what leapfrog must be fed for `signal` to come out exact.
+
+    Args:
+        sim: the simulation whose `dt` fixes the transform; lossless for it to be exact.
+        signal: (N, ...) samples along the leading axis, on either array module.
+        offset: the time of row 0 in steps: 0 for a source signal, 1 for a sensor
+            record, whose row t is the field after step t.
+
+    Returns:
+        the transformed samples in the shape and dtype of `signal`: a source signal
+        to inject, or a measured record to compare against `simulate`'s.
+    """
+    _warn_low_order(sim)
+    return _warp(sim, signal, offset, lambda w: 2.0 / sim.dt * np.sin(0.5 * w * sim.dt))
+
+
+def itdt(
+    sim: Simulation, record: cpt.NDArray | npt.NDArray, offset: int = 1
+) -> cpt.NDArray | npt.NDArray:
+    """Inverse of `tdt`: the record leapfrog would have made without its time error.
+
+    Args:
+        sim: the simulation the record comes from.
+        record: (N, ...) samples along the leading axis, on either array module.
+        offset: the time of row 0 in steps: 1 for a record from `simulate`, 0 for a
+            signal indexed like a source.
+
+    Returns:
+        the record in the shape and dtype it came in, zero above the highest
+        frequency leapfrog can carry at this `dt`.
+    """
+    _warn_low_order(sim)
+
+    def read(omega):
+        half = 0.5 * omega * sim.dt
+        inverse = 2.0 / sim.dt * np.arcsin(np.minimum(half, 1.0))
+        return np.where(half <= 1.0, inverse, np.nan)
+
+    return _warp(sim, record, offset, read)
+
+
+def leapfrog_frequency(sim: Simulation, frequency: npt.ArrayLike) -> npt.NDArray:
+    """Leapfrog frequency answering exactly for `frequency`: what `intensity` should read."""
+    _warn_low_order(sim)
+    phase = np.pi * np.asarray(frequency, dtype=np.float64) * sim.dt
+    if np.any(phase >= 1.0):
+        raise ValueError(f"{frequency} is above 1 / (pi dt) = {1 / (np.pi * sim.dt):g}")
+    return np.arcsin(phase) / (np.pi * sim.dt)

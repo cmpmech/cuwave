@@ -27,7 +27,7 @@ from cuwave.wave import grid_coords, simulate, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # discretization
-SPACE_ORDER = 2  # design enters the stiffness, whose transpose is exact only here
+SPACE_ORDER = 2  # a binary interface is first order whatever the stencil
 PRECISION = "float32"
 POINTS_PER_WAVELENGTH = 20
 SAFETY = 0.95

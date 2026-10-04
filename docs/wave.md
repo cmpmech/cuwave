@@ -29,6 +29,7 @@ From those it derives everything the kernels are launched and compiled with: so 
 | derived layout | `__post_init__()` | resolves the dimension `ndim`, the padded shape `Nx_padded`, the C-contiguous `strides` and the `dtype`, and rejects a `space_order` that is odd or below 2 |
 | kernel options | `compile_flags`   | extra `nvcc -D` flags, empty here and extended by the derived classes                                                                                       |
 | step | `define_step(kernels, mat)` | the step closure, one `fd_kernel` launch here; a scheme needing several launches per step overrides it, which is how the staggered [elastic](elastic.md) exists without touching `simulate` |
+| adjoint step | `define_adjoint_step(kernels, sens_kernels, mat)` | the closure stepping the adjoint field by the transpose of the step's operator under the cell weights: `define_step` itself here, for an operator that is its own transpose, and overridden by [scalar](scalar.md) `PressureWave`, whose operator is not above order 2 |
 | staggering | `component_offsets` | `(ncomp, ndim)` grid offsets of each component, `None` for a nodal unknown; what [distribute](utils.md) shifts by |
 | domain | `domain` | a nodal mask of the physical domain, `None` for the whole box: its tiles alone are stepped and its wall is a zero-flux staircase, see [scalar](scalar.md), the one family that takes it |
 | held nodes | `dirichlet` | a nodal mask held at zero and never stepped, the cells onto it left open onto a zero at their midpoint: a homogeneous Dirichlet wall or obstacle, anywhere in the box |
@@ -82,6 +83,7 @@ def fd_step(u0, u1, u2):
 | `define_get_signal`  | `wave.py`        | `get_signal_kernel` | `get_signal_step(u, um, t_index)`                |
 | `define_set_signal`  | `wave.py`        | `set_signal_kernel` | `set_signal_step(u, um, t_index)`                |
 | `define_gradient`    | `sensitivity.py` | `gradient_kernel`   | `gradient_step(g_mass, g_stiff, u0, u1, u2, l1)` |
+| `sim.define_adjoint_step` | `scalar.py` | `adjoint_kernel` | `adjoint_step(l0, l1, l2)` |
 | `define_adjoint_gradient` | `scalar.py` | `adjoint_gradient_kernel` | `adjoint_gradient_step(l0, l1, u1)` |
 | `define_adjoint_excitation` | `wave.py` | `adjoint_excitation_kernel` | `adjoint_excitation_step(l2, signal, u1, t_index)` |
 | `define_superposed` | `scalar.py` | `superposed_kernel` | `superposed_step(u0, u1, u2, mass=True)` |

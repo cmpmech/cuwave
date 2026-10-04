@@ -17,7 +17,7 @@ from cuwave.wave import grid_coords, simulate, stable_dt
 
 # -------------------------------------- settings -------------------------------------
 # discretization
-SPACE_ORDER = 2  # adjoint is exact at order 2
+SPACE_ORDER = 2  # cheapest operator; the adjoint is exact at any order
 PRECISION = "float32"
 METHOD = "standard"  # "standard" or "superposition" (memory-efficient alternative)
 SUPERPOSITION_SCALE = 1e2

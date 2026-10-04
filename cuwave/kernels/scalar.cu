@@ -3,6 +3,7 @@
 //   NDIM = 1 | 2 | 3
 //   USE_DAMPING
 //   USE_DOMAIN
+//   USE_STREAM, STREAM_TX
 
 // spatial finite difference stencil for Laplacian
 __device__ __forceinline__ real_t flux_divergence_axis(
@@ -149,6 +150,92 @@ __device__ __forceinline__ bool bc_ghost(int t, const int faces, const int *n,
 // -------------------------------------- kernels
 extern "C" {
 
+#ifdef USE_STREAM
+// ------------------------------------------------------------------------------------
+__global__ void
+fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
+          real_t *__restrict__ u2, const real_t *__restrict__ stiff,
+          const real_t *__restrict__ minv, const int derive_inertia,
+#ifdef USE_DAMPING
+          const real_t *__restrict__ damping, const real_t dt,
+#endif
+          const int chunk, const real_t f0, const int N0, const real_t f1,
+          const int N1, const int s0) {
+  // u and stiff of the current row, tiled with a halo of R both alike
+  __shared__ real_t su[STREAM_TX + 2 * STENCIL_RADIUS];
+  __shared__ real_t sk[STREAM_TX + 2 * STENCIL_RADIUS];
+  const int tx = threadIdx.x, x0 = blockIdx.x * STREAM_TX, a1 = x0 + tx;
+  const int cx = tx + STENCIL_RADIUS; // this node in the tile
+  const bool in_row = a1 < N1, inner = a1 > 0 && a1 < N1 - 1;
+  const int r1 = CLOSURE(a1, N1);
+  const int a_first = 1 + blockIdx.y * chunk;
+  const int a_last = min(N0 - 1, a_first + chunk);
+
+  // axis 0 marches, its taps and three stiffnesses queued in registers
+  real_t q[2 * STENCIL_RADIUS + 1]; // u on rows a0 - R .. a0 + R
+#pragma unroll
+  for (int k = 1; k <= 2 * STENCIL_RADIUS; ++k) {
+    const int row = a_first - STENCIL_RADIUS - 1 + k;
+    q[k] = (in_row && row >= 0 && row < N0) ? u1[row * s0 + a1] : (real_t)0;
+  }
+  real_t sm, sc = in_row ? stiff[(a_first - 1) * s0 + a1] : (real_t)1;
+  real_t sp = in_row ? stiff[a_first * s0 + a1] : (real_t)1;
+  for (int a0 = a_first; a0 < a_last; ++a0) {
+    const int idx = a0 * s0 + a1;
+#pragma unroll
+    for (int k = 0; k < 2 * STENCIL_RADIUS; ++k)
+      q[k] = q[k + 1];
+    const int ahead = a0 + STENCIL_RADIUS;
+    q[2 * STENCIL_RADIUS] =
+        (in_row && ahead < N0) ? u1[ahead * s0 + a1] : (real_t)0;
+    sm = sc;
+    sc = sp;
+    sp = in_row ? stiff[idx + s0] : (real_t)1; // row a0 + 1 is at most a ghost
+    const real_t old = inner ? u0[idx] : (real_t)0;
+    __syncthreads(); // the previous row's tile is consumed
+
+    su[cx] = q[STENCIL_RADIUS];
+    sk[cx] = sc;
+    for (int e = tx; e < STENCIL_RADIUS; e += STREAM_TX) {
+      const int xl = x0 - STENCIL_RADIUS + e, xr = x0 + STREAM_TX + e;
+      su[e] = xl >= 0 ? u1[a0 * s0 + xl] : (real_t)0;
+      su[STENCIL_RADIUS + STREAM_TX + e] =
+          xr < N1 ? u1[a0 * s0 + xr] : (real_t)0;
+    }
+    if (tx == 0) // the cell stiffness reaches one node either way
+      sk[cx - 1] = x0 > 0 ? stiff[idx - 1] : (real_t)1;
+    if (tx == STREAM_TX - 1)
+      sk[cx + 1] = a1 + 1 < N1 ? stiff[idx + 1] : (real_t)1;
+    __syncthreads();
+    if (!inner)
+      continue;
+
+    // axis 0 from the queue, in the order flux_divergence_axis takes its taps
+    const real_t uc = q[STENCIL_RADIUS];
+    const int r0 = CLOSURE(a0, N0);
+    const real_t gp = sc * sp / (sc + sp), gm = sc * sm / (sc + sm);
+    real_t Dp = OP_W(r0, 1) * (q[STENCIL_RADIUS + 1] - uc);
+    real_t Dm = OP_W(r0, 1) * (uc - q[STENCIL_RADIUS - 1]);
+#pragma unroll
+    for (int k = 2; k <= STENCIL_RADIUS; ++k)
+      if (k <= r0) {
+        Dp += OP_W(r0, k) * (q[STENCIL_RADIUS + k] - q[STENCIL_RADIUS - k + 1]);
+        Dm += OP_W(r0, k) * (q[STENCIL_RADIUS + k - 1] - q[STENCIL_RADIUS - k]);
+      }
+    const real_t laplacian =
+        f0 * (Dp * gp - Dm * gm) +
+        flux_divergence_axis(su + cx, sk + cx, 0, 1, uc, sc, f1, r1);
+
+    const real_t mi = derive_inertia ? 1.f / sc : minv[idx];
+#ifdef USE_DAMPING
+    const real_t beta = 0.5f * mi * damping[idx] * dt;
+    u2[idx] = (2.f * uc - old * (1.f - beta) + mi * laplacian) / (1.f + beta);
+#else
+    u2[idx] = -old + 2.f * uc + mi * laplacian;
+#endif
+  }
+}
+#else
 // ------------------------------------------------------------------------------------
 __global__ void
 fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
@@ -237,6 +324,7 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
   u2[idx] = -u0[idx] + 2.f * uc + mi * laplacian;
 #endif
 }
+#endif
 
 // ------------------------------------------------------------------------------------
 __global__ void homogeneous_neumann_kernel(real_t *__restrict__ u,

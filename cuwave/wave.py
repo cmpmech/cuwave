@@ -355,6 +355,12 @@ class Simulation:
 
         return fd_step
 
+    def define_adjoint_step(
+        self, kernels: cp.RawModule, sens_kernels: cp.RawModule, mat: dict
+    ) -> Callable:
+        """Closure stepping the adjoint field: `define_step`, wherever that is its own transpose."""
+        return self.define_step(kernels, mat)
+
 
 # ----------------------------------- kernel helpers ----------------------------------
 COMMON_PATH = Path(__file__).parent / "kernels" / "common.cuh"
