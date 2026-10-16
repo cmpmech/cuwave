@@ -44,6 +44,33 @@ offset of entry `l` of cell `c`, relative to the node gathering that cell
 **how?**
 $$\textrm{offset}=\sum_d\left(\textrm{bit}_d(c)-1+\textrm{bit}_d(l)\right)s_d$$
 
+## pml helpers
+The cell assembly has no per-axis derivative to stretch, so its layer takes the centre point of each cell: a strain memory $\psi_j$ per cell of $\partial_eu_j$ at the cell centre, and a force memory $\zeta_i$ per node of the axis-$e$ part of $\nabla\cdot\sigma_i$, gathered from the same centre stresses. The cell of a slab thread is the one on its wall side, so the low-corner index is $a$ on the low side and $a-1$ on the high one. All lined axes share one `aux` buffer and one `profile` buffer, located per axis by `layers`, because the force memory of one axis reads the stretched stress, which carries every axis' strain memory
+### PML_ARGS
+the uniform argument list of the five pml kernels, so one launch list serves them all
+**input args**
+`u1`: the field the pass reads, $u^{t-1}$ forwards and $\lambda^{t+1}$ in the adjoint; `u2`: the field it adds to, $u^t$ or $\lambda^t$; `aux`: the memories of every lined axis back to back, per axis `NDIM` rows of cell memories then `NDIM` of node memories, each `size` long; `minv`, `cell`: as `fd_kernel`; `cv`: the Voigt `C` at $\gamma=1$ times the cell volume, `NVOIGT` by `NVOIGT`; `f`: $\Delta t^2$; `cs`: component stride; `profile`: the `(4, NN[d])` rows of every lined axis back to back; `layers`: per axis `lo, hi`, the start of its memory in `aux` and of its profile in `profile`, `lo = hi = 0` for an unlined axis; `e`: the axis this launch runs on; `f0..f2`: $1/\Delta x_d$; `N0..N2`, `s0, s1`: geometry
+### Layer, layer_of, slab_at
+**aim**
+`Layer`: one axis' memory, profile, slab rows, plane and `size`, unpacked from `layers` by `layer_of`; `slab_at(X, cell, d, l, n, s)`: the slab thread of the node at `X`, or of the cell with low corner `X` (a high-side cell belonging to the node on its wall side), -1 off the slab
+### corner_weight, flat
+**aim**
+`corner_weight(m, d, F)`: the centre-point derivative weight along `d` at corner `m` of a cell, $\pm1/\left(2^{\textrm{ndim}-1}\Delta x_d\right)$ by bit $d$ of `m`; `flat(X, S)`: the flat index of `X`
+### cell_gradient, cell_stress, voigt_row
+**aim**
+`cell_gradient`: $G_{kj}=\partial_ku_j$ at the centre of the cell with low corner `X`, from its $2^\textrm{ndim}$ corners; `cell_stress`: $\gamma\,V\,C\,\textrm{sym}\left(G\right)$ in Voigt rows, the shear strains engineering; `voigt_row(i, k)`: the Voigt row of $\sigma_{ik}$
+### own_cell, around
+**aim**
+`own_cell`: the cell of this slab thread, false where the plane position has none; `around(s, A, NN, X, m)`: cell `s` of the $2^\textrm{ndim}$ around node `A`, its low corner `X` and the corner `m` the node is, false outside the domain
+### strain_memory, force_memory
+**aim**
+row $d$ of the stretched cell gradient: `strain_memory` reads the forward $\psi$ of axis $d$ at a cell, zero off its slab; `force_memory` forms the adjoint's, $\sum_m w_m\,a_m\,\eta_{\zeta,m}$ over the cell's corners, the derivative of the node memory through the node profile
+### memory_force
+**aim**
+add the force at corner `m` of the stress $\gamma VC\,\textrm{sym}\left(P_ep\right)$, the memory `p` placed in row `e` of an otherwise zero gradient
+### LAYERS, PML_OR_RETURN
+`LAYERS` unpacks one `Layer` per axis into `L[]`; `PML_OR_RETURN` binds the geometry, the layers and this thread's slab node of axis `e` through `SLAB_OR_RETURN(0)` ([cuda_scalar](cuda_scalar.md)), returns past the slab, and names the axis' profile `pe` and memory `me`
+
 ## kernels
 
 ### fd_kernel
@@ -64,6 +91,51 @@ $$u_i^{t}=-u_i^{t-2}+2u_i^{t-1}+\Delta t^2\,m^{-1}f_i$$
 $$\beta=\frac{d\,\Delta t}{2m}$$
 
 Note that `f1` and `f2` are accepted and never read: the tail `wave.axis_geometry` packs is per-axis, while the elastic factors live in the stencil table instead
+
+### pml_cell_kernel
+**parallelization**
+flat 1D launch over the slab of axis `e`, `PML_THREADS` per block, one cell per thread; every lined axis' launch runs before any `pml_force_kernel`
+**aim**
+advance the strain memory of axis `e` at the thread's cell
+**input args**
+see `PML_ARGS`
+**how?**
+$$\psi_j\leftarrow b_{a+\frac12}\psi_j+a_{a+\frac12}\,G_{ej}\left(u^{t-1}\right)$$
+### pml_force_kernel
+**parallelization**
+as `pml_cell_kernel`, one node per thread, after every `pml_cell_kernel`
+**aim**
+add the stress of the axis-`e` memory and the advanced force memory to $u^t$
+**input args**
+see `PML_ARGS`
+**internal args**
+`force`: the force of $\psi_e$ over the node's cells; `div`: the axis-$e$ part of the divergence of the stretched stress
+**how?**
+- the stretched gradient adds every lined axis' memory, $\tilde G=G+\sum_dP_d\psi_d$, and the centre stress of it feeds the divergence along `e`
+$$\zeta_i\leftarrow b_a\zeta_i-a_a\sum_cw_{m,e}\,\tilde\sigma_{ie},\qquad u_i^t\mathrel{+}=\Delta t^2m^{-1}\left(\textrm{force}_i+\zeta_i\right)$$
+### pml_adjoint_memory_kernel
+**parallelization**
+as `pml_force_kernel`, first in every adjoint step
+**aim**
+advance the adjoint force memory, $\eta_{\zeta,i}\leftarrow b_a\eta_{\zeta,i}+\lambda_i^{t+1}$
+### pml_adjoint_cell_kernel
+**parallelization**
+as `pml_cell_kernel`, after every `pml_adjoint_memory_kernel`
+**aim**
+advance the adjoint strain memory: the transpose of `pml_force_kernel`'s read of $u$ and $\psi$
+**how?**
+- the forward's stretched gradient with $\lambda$ for $u$ and every axis' `force_memory` for $\psi$
+$$\eta_{\psi,j}\leftarrow b_{a+\frac12}\eta_{\psi,j}-\gamma V\left[C\,\textrm{sym}\left(G\left(\lambda^{t+1}\right)+\sum_dP_d\,D_d\left(a\,\eta_{\zeta,d}\right)\right)\right]_{ej}$$
+### pml_adjoint_force_kernel
+**parallelization**
+as `pml_force_kernel`, last in every adjoint step
+**aim**
+add the transposed memory terms of axis `e` to $\lambda^t$
+**how?**
+$$\lambda_i^t\mathrel{+}=\Delta t^2m^{-1}\sum_c\left(w_{m,e}\,a_{c}\,\eta_{\psi,i}+\textrm{the force of }D_e\left(a\,\eta_\zeta\right)\right)$$
+- the forward pair read the cell memory through $D^\top$ and the node memory through the stress, so the adjoint pair swaps them; the update is otherwise the forward one
+
+The layer is centre-point where the interior is fully integrated, so it is a consistent stretching of the interior operator rather than its exact stretched twin; the hourglass mode stays controlled, since a centre gradient neither reads nor drives the checkerboard. `AnisotropicElasticWave` refuses a `C` with a backward wave along a lined axis, see [boundary](boundary.md)
 
 ### excitation_kernel
 From the shared prelude, so this file does not carry it; see [cuda_scalar](cuda_scalar.md). A vector source is `NDIM` entries of `lin_index`, one per component, at `d * cs + idx`, so the `atomicAdd` covers a source and a sensor landing on the same node and component

@@ -6,6 +6,11 @@ vector pipeline against the already-trusted one. The cell assembly is `-B^T C B`
 the operator must be exactly symmetric, which is what all three adjoint variants rest
 on. And full quadrature is what buys that symmetry without an hourglass mode, so the
 checkerboard must not be a null mode.
+
+A perfectly matched layer is stable only where every wave runs along its phase on the
+lined axis (Becache et al. 2003), so a strongly orthotropic `C` that satisfies it has to
+decay through the layer and a free surface crossing it, and one that violates it has to
+be refused on that axis alone.
 """
 
 import unittest
@@ -21,7 +26,7 @@ except Exception:
 
 if HAS_CUDA:
     from cuwave.anisotropic import AnisotropicElasticWave, cell_stencil, corner_bits
-    from cuwave.boundary import Clamped
+    from cuwave.boundary import Clamped, Pml, Traction
     from cuwave.elastic import voigt
     from cuwave.scalar import ScalarWave
     from cuwave.sensitivity import (
@@ -33,6 +38,7 @@ if HAS_CUDA:
     from cuwave.signals import ricker
     from cuwave.utils import Sensors, point_source
     from cuwave.wave import (
+        Source,
         compile_kernels,
         simulate,
         stable_dt,
@@ -40,6 +46,10 @@ if HAS_CUDA:
     )
 
 CP, CS, RHO = 2.0, 1.0, 1.3
+# orthotropic, five to one, yet every wave runs along its phase on both axes
+ORTHOTROPIC = [[4.0, 1.0, 0.0], [1.0, 20.0, 0.0], [0.0, 0.0, 2.0]]
+# a wave runs against its phase along axis 0 (Becache et al. 2003)
+BACKWARD = [[10.0, 2.5, 0.0], [2.5, 6.0, 0.0], [0.0, 0.0, 3.5]]
 THREADS = {1: (128,), 2: (8, 8), 3: (4, 4, 8)}
 
 
@@ -443,6 +453,54 @@ class ValidationTest(unittest.TestCase):
         uniform = cp.ones(sim.Nx_padded, dtype=sim.dtype)
         # stable_dt only knows the speed and the spacing, so it stays conservative
         self.assertGreater(stable_timestep(sim, uniform) / sim.dt, 1.0)
+
+
+@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
+class PmlTest(unittest.TestCase):
+    FREE_TOP = ((Clamped, Clamped), (Traction, Clamped))
+
+    def test_a_long_run_decays_through_an_orthotropic_layer_and_a_free_surface(self):
+        dx = (1.0 / 100,) * 2
+        speed = np.sqrt(20.0)
+        sim = AnisotropicElasticWave(
+            (110, 100),
+            dx,
+            30000,
+            0.55 * stable_dt(dx, speed, 2),
+            (4, 32),
+            density=1.0,
+            wavespeed_p=1.0,
+            wavespeed_s=0.6,
+            C=ORTHOTROPIC,
+            boundary=self.FREE_TOP,
+            pml=Pml(14, speed, frequency=2.0, faces=(0, 1, 3)),
+        )
+        t = np.arange(sim.N) * sim.dt
+        signal = cp.asarray(ricker(t, 1.0, 8.0)[:, None], dtype=sim.dtype)
+        source = Source(cp.array([[1], [40], [3]], dtype=cp.int32), signal)
+        rng = np.random.default_rng(1)
+        indicator = cp.asarray(0.5 + rng.random(sim.Nx_padded), dtype=sim.dtype)
+        sensors = cp.array([[0, 1], [50, 50], [50, 50]], dtype=cp.int32)
+        um = cp.abs(simulate(sim, source, indicator, sensors)[1])
+        windows = [float(w.max()) for w in cp.split(um, 8)]
+        self.assertLess(windows[-1], 1e-4 * windows[0])
+        self.assertLess(windows[-1], windows[-2])
+
+    def test_an_unshifted_layer_is_refused(self):
+        with self.assertRaises(ValueError):
+            _sim((40, 40), boundary=Clamped, pml=Pml(6, CP))
+
+    def test_a_traction_wall_behind_the_layer_is_refused(self):
+        with self.assertRaises(ValueError):
+            _sim((40, 40), pml=Pml(6, CP, frequency=2.0))
+        layer = Pml(6, CP, frequency=2.0, faces=(0, 1, 3))
+        _sim((40, 40), boundary=self.FREE_TOP, pml=layer)
+
+    def test_a_backward_wave_is_refused_only_along_its_axis(self):
+        layer = dict(boundary=Clamped, C=BACKWARD)
+        with self.assertRaises(ValueError):
+            _sim((40, 40), pml=Pml(6, CP, frequency=2.0), **layer)
+        _sim((40, 40), pml=Pml(6, CP, frequency=2.0, faces=(2, 3)), **layer)
 
 
 if __name__ == "__main__":

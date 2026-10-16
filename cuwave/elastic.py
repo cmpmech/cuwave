@@ -26,6 +26,7 @@ from .wave import (
     Simulation,
     apply_cell_weights,
     axis_geometry,
+    define_pair_pml,
     grid_block,
     pair_average,
     pair_average_adjoint,
@@ -80,6 +81,9 @@ class ElasticWave(Simulation):
     sensitivity_path = SENSITIVITY_PATH
     default_boundary = Traction
     gradient_names = ("mass", "stiff")
+    accepts_pml = True
+    pml_shifted = True
+    pml_walls = (Clamped,)  # a traction wall behind the layer holds a growing surface wave
 
     @property
     def ncomp(self) -> int:
@@ -129,6 +133,11 @@ class ElasticWave(Simulation):
     def reach(self) -> int:
         """The strain reach compounds with the divergence one: `2 radius - 1` nodes."""
         return 2 * self.radius - 1
+
+    @property
+    def pml_margin(self) -> int:
+        """Undamped layer nodes before the front: a stress the step corrects is read this far."""
+        return self.radius - 1
 
     @property
     def lame(self) -> float:
@@ -185,23 +194,60 @@ class ElasticWave(Simulation):
 
     def define_step(self, kernels: cp.RawModule, mat: dict) -> Callable:
         """Closure launching the stress kernel and then the update over (u0, u1, u2)."""
+        return self._define_pair(kernels, mat, adjoint=False)
+
+    def define_adjoint_step(
+        self, kernels: cp.RawModule, sens_kernels: cp.RawModule, mat: dict
+    ) -> Callable:
+        """Closure stepping the adjoint: the step itself, unless a pml breaks its symmetry."""
+        return self._define_pair(kernels, mat, adjoint=self.pml is not None)
+
+    def _define_pair(self, kernels: cp.RawModule, mat: dict, adjoint: bool) -> Callable:
+        """The stress and update launches, each followed by its pml terms if there are any."""
         stress_kernel = kernels.get_function("stress_kernel")
         fd_kernel = kernels.get_function("fd_kernel")
         grid, block = grid_block(self)
+        sigma, sargs, uargs = self.step_args(mat)
+        if self.pml is None:
+
+            def fd_step(u0, u1, u2):
+                sargs[0] = u1
+                stress_kernel(grid, block, sargs)
+                uargs[0], uargs[1], uargs[2] = u0, u1, u2
+                fd_kernel(grid, block, uargs)
+                return u2
+
+            return fd_step
+        cs = np.int32(self.comp_stride)
+        stress_pml, force_pml = define_pair_pml(
+            self,
+            kernels,
+            "stress",
+            sigma,
+            [*self.stress_material(mat), face_mask(self, Clamped), cs],
+            [mat["minv"], face_mask(self, Clamped), cs],
+            adjoint,
+        )
+
+        def pml_step(u0, u1, u2):
+            sargs[0] = u1
+            stress_kernel(grid, block, sargs)
+            stress_pml(u1)
+            uargs[0], uargs[1], uargs[2] = u0, u1, u2
+            fd_kernel(grid, block, uargs)
+            force_pml(u1, u2)
+            return u2
+
+        return pml_step
+
+    def step_args(self, mat: dict) -> tuple[cpt.NDArray, list, list]:
+        """A stress scratch and the argument lists of the stress and update kernels on it."""
         # the stress scratch outlives the closure, its ghost region never written
         sigma = cp.zeros((self.nvoigt, *self.Nx_padded), dtype=self.dtype)
         clamped = face_mask(self, Clamped)
-        material = [self.dtype(self.lame), self.dtype(self.shear)]
         inv_dx = [self.dtype(1.0 / d) for d in self.dx]
-        sargs = [None, sigma, mat["gnode"]]
-        if self.ndim > 1:
-            sargs.append(mat["gshear"])
-        sargs += [
-            *material,
-            clamped,
-            np.int32(self.comp_stride),
-            *axis_geometry(self, inv_dx),
-        ]
+        sargs = [None, sigma, *self.stress_material(mat), clamped]
+        sargs += [np.int32(self.comp_stride), *axis_geometry(self, inv_dx)]
         uargs = [None, None, None, sigma, mat["minv"]]
         if self.damping is not None:
             uargs += [mat["damping"], self.dtype(self.dt)]
@@ -210,15 +256,12 @@ class ElasticWave(Simulation):
             np.int32(self.comp_stride),
             *axis_geometry(self, self.step_factors()),
         ]
+        return sigma, sargs, uargs
 
-        def fd_step(u0, u1, u2):
-            sargs[0] = u1
-            stress_kernel(grid, block, sargs)
-            uargs[0], uargs[1], uargs[2] = u0, u1, u2
-            fd_kernel(grid, block, uargs)
-            return u2
-
-        return fd_step
+    def stress_material(self, mat: dict) -> list:
+        """The design on the stress points and the two Lame parameters, as the kernels take them."""
+        fields = [mat["gnode"], mat["gshear"]] if self.ndim > 1 else [mat["gnode"]]
+        return [*fields, self.dtype(self.lame), self.dtype(self.shear)]
 
     def excitation_weights(
         self, mat: dict, lin_index: cpt.NDArray[cp.int32]

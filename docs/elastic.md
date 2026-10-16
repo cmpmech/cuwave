@@ -55,7 +55,10 @@ The reconstruction strip of [sensitivity](sensitivity.md) follows `reach` $=2r-1
 | stencil radius | `radius` | half `space_order`, each derivative reaching twice it |
 | strip radius | `reach` | $2r-1$, the nodes one step reads past a point |
 | materials | `build_materials(indicator)` | the point inverse inertia per component, the design field on the node and shear stress points, and `damping` |
-| step | `define_step(kernels, mat)` | the two-launch closure: the stress kernel, then the update |
+| step | `define_step(kernels, mat)` | the two-launch closure: the stress kernel, then the update, each followed by its [pml](boundary.md) terms when `pml` is set |
+| adjoint step | `define_adjoint_step(kernels, sens_kernels, mat)` | the step itself, or with a pml its transpose, which pushes each memory back through the other pass |
+| pml margin | `pml_margin` | $r-1$, the undamped layer nodes before the front, since a corrected strain is read that far |
+| pml arguments | `step_args(mat)`, `stress_material(mat)` | the stress scratch and the argument lists the stress and update kernels, and their pml terms, share |
 | inertia | `inverse_inertia(indicator)` | nodal $1/\left(\gamma\rho_0W\right)$, what a [sponge](boundary.md) scales its damping by |
 | coefficients | `parametrization_jacobian(indicator)` | $\left(1,\,1\right)$, since $\gamma$ scales inertia and stiffness alike |
 | per-axis factors | `step_factors()` | $\Delta t^2/\Delta x_d$, the strain carrying the other $1/\Delta x$ |
@@ -81,6 +84,7 @@ with the Lamé parameters recovered as `lame` $\lambda=\rho_0\left(c_p^2-2c_s^2\
 | `Traction` | $\boldsymbol{\sigma}\cdot\mathbf{n}=0$, the default: the wall stress point condenses its axis out of the coupling | no kernel and no launch |
 | `Clamped` | $\mathbf{u}=0$, the tangential wall unknowns held by a zeroed inverse inertia, the normal strain folded antisymmetrically about the wall | no kernel and no launch |
 | `sponge` | the same damping field the pressure equation takes, shared by every component | as [boundary](boundary.md) |
+| `Pml` | a matched layer behind `Clamped` faces, `frequency` required, a free surface may cross it | a strain and a divergence memory per lined axis, two launches a step |
 
 A traction wall condenses each graded-out axis by the plane stress reduction $\lambda\to2\lambda\mu/\left(\lambda+2\mu\right)$, so the surface-tangential stiffness is the statically condensed one rather than merely the interior one with a row deleted. The wall-normal component carries no unknown on the wall itself, so a source or receiver coordinate placed **on** a traction surface lands on the unknown half a cell inside, which is the staggered convention for a surface force
 

@@ -60,6 +60,20 @@ A ramp is needed because the two ends of the map are useless on their own: at la
 
 Whether the ramp pays depends on the iteration budget: `examples/fwi/regularization/scalar2D_fwi_adam_projection.py` and `examples/fwi/regularization/scalar2D_fwi_lbfgs_projection.py` expose the choice as their `SCHEME` setting, so all four can be run against the same inversion
 
+#### SmoothedProjection
+`SmoothedProjection` is `Projection` with its interface averaged over a node, so that the ramp can run to $\beta=\infty$ without the gradient vanishing, following the subpixel-smoothed projection of [Hammond, Oskooi, Hammond, Chen, Ralph & Johnson 2025](https://arxiv.org/abs/2503.20189) as fdtdx implements it. Where the $\eta$ level set of the filtered design passes within the radius $R$ of a node, the node takes the fill fraction $F$ of a disc of that radius instead of its projected value
+$$s=\frac{\eta-x}{R\left|\nabla x\right|},\qquad F(s)=\tfrac{1}{2}-\tfrac{15}{16}s+\tfrac{5}{8}s^3-\tfrac{3}{16}s^5,\qquad\bar{x}=\left(1-F\right)\bar{x}\left(x-R\left|\nabla x\right|F\right)+F\,\bar{x}\left(x+R\left|\nabla x\right|F(-s)\right)$$
+with the smoothing radius `radius` $R$ in nodes, the projection $\bar{x}$ of the previous section on the right, and $\left|\nabla x\right|$ by central differences; away from the interface ($\left|s\right|\geq1$) it is `Projection` itself
+
+| member | signature | description |
+|---|---|---|
+| constructor | `SmoothedProjection(beta, eta=0.5, radius=0.55)` | stores sharpness `beta` (`math.inf` allowed), threshold `eta` and the smoothing radius |
+| projection | `__call__(x)` | returns the projected design, binary away from the interface at $\beta=\infty$ |
+| derivative | `grad(x, dy=1.0)` | returns the derivative contracted with `dy`: the local chain rule, then the transpose of the $\left|\nabla x\right|$ stencil, so a node also feeds its neighbours |
+| update | `set(**params)` | continuation of the sharpness, up to `set(beta=math.inf)` |
+
+At $\beta=\infty$ the design is binary but on one node's width of interface, which is where all of the gradient then flows, so the last stage of a continuation optimizes a design that `threshold` would leave unchanged. The input has to be smooth for the level set to be a curve, so it belongs after a `DensityFilter`, and the fill fraction is the 2D disc's, applied unchanged in 3D
+
 ### SIMP
 `SIMP` (solid isotropic material with penalization) raises the design to the power `p`, so that intermediate values buy less material property per unit of the volume budget and the optimizer is driven towards $0/1$, following [Bendsøe 1989](https://doi.org/10.1007/BF01650949) and [Bendsøe & Sigmund 1999](https://doi.org/10.1007/s004190050248)
 $$\gamma=x_\textrm{min}+\left(1-x_\textrm{min}\right)x^p,\qquad\frac{\partial\gamma}{\partial x}=\left(1-x_\textrm{min}\right)px^{p-1}$$

@@ -41,6 +41,8 @@ On top of [Simulation](wave.md) and mirroring [ElasticWave](elastic.md), with th
 | averaging | `cell_average(sim, field)` | the harmonic corner mean $\gamma_c$, stored at the cell's low corner |
 | inertia | `inverse_inertia(indicator)` | lumped $1/\left(\gamma\rho_0VW\right)$, the mass the interior-cell assembly implies |
 | weights | `cell_weights()` | the nodal cell weights $W$, halved once per wall the node sits on |
+| stiffness | `stiffness_matrix()` | the Voigt matrix at $\gamma=1$, `C` or the isotropic one, which the stencil and the pml read |
+| pml stability | `backward_axes(C, ndim, samples=4096)` | the axes along which some wave of `C` runs against its phase, sampled over directions, where a pml would grow |
 
 ## boundary conditions
 
@@ -49,6 +51,9 @@ On top of [Simulation](wave.md) and mirroring [ElasticWave](elastic.md), with th
 | `Traction` | $\boldsymbol{\sigma}\cdot\mathbf{n}=0$, the default and a genuine free surface | no kernel and no launch |
 | `Clamped` | $\mathbf{u}=0$, the wall nodes held by a zeroed inverse inertia | no kernel and no launch |
 | `sponge` | the same damping field the pressure equation takes | as [boundary](boundary.md) |
+| `Pml` | a matched layer behind `Clamped` faces, `frequency` required | a cell and a node memory per lined axis, two launches a step |
+
+The layer is stable only where every wave of `C` runs along its phase on the lined axis ([Bécache, Fauqueux & Joly 2003](https://doi.org/10.1016/S0021-9991(03)00184-0)), a property of the material that no shift or thickness changes. The constructor checks `backward_axes` against the lined axes and refuses the layer where it fails, so a strongly anisotropic `C` may still take a pml on the axes it permits and a `sponge` on the rest
 
 In 1D there is no coupling, so `AnisotropicElasticWave` reduces to the [scalar](scalar.md) equation with $c=\sqrt{\left(\lambda+2\mu\right)/\rho}$ and reproduces `ScalarWave` node for node
 

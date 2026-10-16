@@ -52,8 +52,9 @@ which is what `wave.stable_dt` returns at `space_order` 2, exactly. The speed to
 | `Dirichlet` | perfect electric conductor, $E_z=0$ | perfect magnetic conductor, $H_z=0$ |
 | `Neumann` | perfect magnetic conductor, the default | perfect electric conductor, the default |
 | `sponge` | a real conductivity $\sigma$, not an absorbing artifact | the magnetic dual of one |
+| `Pml` | a matched layer, the pressure one | the same |
 
-The damped update is $m\ddot{u}+d\dot{u}=\nabla\cdot\left(k\nabla u\right)$, and for `ElectricWave` that is Maxwell in a conducting medium with $d=\sigma$ exactly, so opening the domain costs no modelling fiction. What it is **not** is a perfectly matched layer: it reflects at oblique incidence, and it terminates a guided waveguide mode considerably worse than it terminates a plane wave. Size it against the guided mode, not the free-space wavelength
+The damped update is $m\ddot{u}+d\dot{u}=\nabla\cdot\left(k\nabla u\right)$, and for `ElectricWave` that is Maxwell in a conducting medium with $d=\sigma$ exactly, so opening the domain costs no modelling fiction. What it is **not** is a perfectly matched layer: it reflects at oblique incidence, and it terminates a guided waveguide mode considerably worse than it terminates a plane wave. Size it against the guided mode, not the free-space wavelength, or line the faces with a `Pml` ([boundary](boundary.md)), which terminates both
 
 `sponge` takes `beta`, the decay **per step**, so the physical conductivity it produces scales as $1/\Delta t$ and a layer tuned at one resolution detunes at another. Set it from the timestep instead, `beta` $=\alpha\Delta t$ with $\alpha$ the decay per wavelength travelled, which is what the [tpto](tpto.md) drivers do; around $4\Delta t$ over two wavelengths reflects some $-28$ dB
 
@@ -80,7 +81,7 @@ Eliminating $\mathbf{H}$ from the classical Yee update recovers exactly this ste
 | $E_x$ | $\left(i+\tfrac{1}{2},\,j,\,k\right)$ | the displacement $u_x$ |
 | $\left(\nabla\times\mathbf{E}\right)_z$, so $H_z$ | $\left(i+\tfrac{1}{2},\,j+\tfrac{1}{2},\,k\right)$ | the shear stress $\sigma_{xy}$ |
 
-So `MaxwellWave` is [ElasticWave](elastic.md) with the normal-stress block deleted, and it reuses that module's whole lattice layer: `component_offsets`, `wall_weights`, `point_average` and their adjoints, all promoted into [wave](wave.md). There are $\textrm{ndim}\left(\textrm{ndim}-1\right)/2$ curl components, one per axis pair, so one in 2D and three in 3D
+So `MaxwellWave` is [ElasticWave](elastic.md) with the normal-stress block deleted, and it reuses that module's whole lattice layer: `component_offsets`, `wall_weights`, the point and pair means and their adjoints, all promoted into [wave](wave.md). There are $\textrm{ndim}\left(\textrm{ndim}-1\right)/2$ curl components, one per axis pair, so one in 2D and three in 3D
 
 Every Maxwell difference is a **half-point** difference, since each term of $b_p=\partial_kE_l-\partial_lE_k$ differentiates a component along an axis it is not staggered on. The node-centred `rad_node` never appears, and with it go the zero-row closure, the plane-stress condensation and the clamped fold that the elastic normal strains need. At order 2 the curl is therefore full order everywhere including the wall-adjacent points
 
@@ -108,7 +109,9 @@ $w_p$ is computed inside the kernel rather than stored: it is identically 1 in 2
 | curl components | `npairs` | one per axis pair, 1 in 2D and 3 in 3D |
 | strip radius | `reach` | $2r-1$, the nodes one step reads past a point |
 | materials | `build_materials(indicator)` | the point inverse permittivity per component, the pair inverse permeability, and `damping` |
-| step | `define_step(kernels, mat)` | the two-launch closure: the curl kernel, then the update |
+| step | `define_step(kernels, mat)` | the two-launch closure: the curl kernel, then the update, each followed by its [pml](boundary.md) terms when `pml` is set |
+| adjoint step | `define_adjoint_step(kernels, sens_kernels, mat)` | the step itself, or with a pml its transpose, which pushes each memory back through the other pass |
+| pml margin | `pml_margin` | $r-1$, the undamped layer nodes before the front, since a corrected curl is read that far |
 | inertia | `inverse_inertia(indicator)` | nodal $1/\left(\varepsilon W\right)$, what a [sponge](boundary.md) scales its conductivity by |
 | per-axis factors | `step_factors()` | $\Delta t^2/\Delta x_d$, the curl carrying the other $1/\Delta x$ |
 | source scaling | `source_factor()` | $1$; the excitation weights divide by the volume the kernel inertia leaves out |
@@ -128,12 +131,27 @@ so the static component is driven by the **divergence of the source** and marche
 
 Two rules keep it quiet, and both cost nothing. Drive a current that does not vary along its own polarization axis, so its discrete divergence vanishes identically; and use `ricker` ([signals](signals.md)), whose integral and first moment both vanish, rather than `sineburst`, whose first moment does not. `examples/forward/maxwellND.py` does both
 
-The reverse march of `reconstruction_sensitivity` is stable on the null space in the same sense the [elastic](elastic.md) rigid-body modes are: perturbations grow linearly in the step count, not exponentially. The difference is that there are order-$N_\textrm{nodes}$ of them rather than a handful, so the aggregate drift is larger and worth watching. `info["drift"]` is the instrument, and the [tpto](tpto.md) drivers print it every iteration
+The reverse march of `reconstruction_sensitivity` is stable on the null space in the same sense the [elastic](elastic.md) rigid-body modes are: perturbations grow linearly in the step count, not exponentially. The difference is that there are order-$N_\textrm{nodes}$ of them rather than a handful, so the aggregate drift is larger and worth watching. `info["drift"]` is the instrument
 
 ### limits
 
-**Subpixel accuracy.** The permittivity is arithmetically averaged onto each component point, which is right for the field component **tangential** to a material interface and wrong for the normal one, where the harmonic mean is the correct effective medium ([Farjadpour et al. 2006](https://doi.org/10.1364/OL.31.002972)). The consequence is first-order convergence at a staircased interface whatever `space_order` says, which caps how closely a grey design and its thresholded twin can agree. The scalar reductions do not share this: $E_z$ and $H_z$ are always tangential
+**Subpixel accuracy.** The permittivity reaches each component point as the harmonic mean of the two nodes it sits between (`point_harmonic`), the series medium a component **normal** to a material interface sees ([Farjadpour et al. 2006](https://doi.org/10.1364/OL.31.002972)). A component tangential to an axis-aligned interface never straddles it, so both orientations keep second-order convergence there, where an arithmetic mean or fdtdx's staircase would be first order. An oblique or curved interface needs the full anisotropic smoothing tensor of that paper, which is not implemented, so it stays first order. The scalar reductions do not share this: $E_z$ and $H_z$ are always tangential
 
 No perfectly matched layer, and no dispersive materials; see the reduction limits above, which apply unchanged
 
 The kernels are documented in [forward CUDA](cuda_maxwell.md) and [backward CUDA](cuda_maxwell_sensitivity.md)
+
+## validation against fdtdx
+
+Eliminating $\mathbf{H}$ from the Yee leapfrog leaves exactly the curl-curl recursion both classes step, so an independent E/H code on the same grid, timestep and materials has to agree with them to round-off: [fdtdx](https://github.com/ymahlau/fdtdx) ([Mahlau, Schubert, Berg & Rosenhahn 2026](https://doi.org/10.21105/joss.08912)) is that code. `examples/validation/fdtdx_reference.py` runs it in a jax environment of its own, a point dipole in a conducting box at fdtdx's Courant number $0.99/\sqrt{3}$ in `float64`, and stores the probe traces in `tests/reference/`; `examples/validation/maxwell_fdtdx.py` and `FdtdxReferenceTest` rerun each case here and compare
+
+| case | class | agreement |
+|---|---|---|
+| 2D, $E_z$, vacuum and a dielectric block | `ElectricWave` | round-off, both codes placing $\varepsilon$ on the $E_z$ node |
+| 2D, $H_z$, vacuum | `MagneticWave` | round-off |
+| 2D, $H_z$, a dielectric block | `MagneticWave` | discretization level, closing under refinement: the cell stiffness here is the harmonic mean of two nodal $1/\varepsilon$, fdtdx's the voxel's own |
+| 3D, vacuum | `DielectricWave` | round-off |
+| 3D, a dielectric block | `DielectricWave` | discretization level, from the harmonic mean onto each component point; with fdtdx's staircase (the voxel below the point) substituted for it, round-off |
+
+The mapping a comparison needs is in the script: fdtdx cell $i$ is node $i+1$ here, so the ghost ring wraps its conductor faces; its soft source adds $-S\varepsilon^{-1}a(n\Delta t)$ to $E^{n+1}$, so $E$'s recursion is driven by the difference of that load and the $H_z$ recursion by its curl; and its $\mathbf{H}$ is already scaled by $\eta_0$, which with $c=1$ makes both fields directly comparable. What this pins is the operator, the conductor walls, the source calibration and the material placement; absorbing boundaries are left out, each code's CPML having its own profile
+

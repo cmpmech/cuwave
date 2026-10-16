@@ -23,9 +23,17 @@ import cupy.typing as cpt
 import numpy as np
 import numpy.typing as npt
 
-from .boundary import Clamped, Traction, faces_with
+from .boundary import Clamped, Traction, faces_with, pml_widths
 from .elastic import voigt
-from .wave import PAIRS, Simulation, apply_cell_weights, axis_geometry, grid_block
+from .wave import (
+    PAIRS,
+    PML_THREADS,
+    Simulation,
+    apply_cell_weights,
+    axis_geometry,
+    grid_block,
+    slab_grid,
+)
 
 KERNEL_PATH = Path(__file__).parent / "kernels" / "anisotropic.cu"
 SENSITIVITY_PATH = Path(__file__).parent / "kernels" / "anisotropic_sensitivity.cu"
@@ -96,6 +104,21 @@ def cell_stencil(
     return K
 
 
+def backward_axes(C: npt.NDArray, ndim: int, samples: int = 4096) -> list[int]:
+    """Axes along which a wave of the Voigt `C` runs against its phase, sampled over directions."""
+    row = np.zeros((ndim, ndim), dtype=int)
+    for r, (k, m) in enumerate(PAIRS[ndim]):
+        row[k, m] = row[m, k] = r
+    T = C[row[:, :, None, None], row[None, None]]
+    n = np.random.default_rng(0).standard_normal((samples, ndim))
+    n /= np.linalg.norm(n, axis=1, keepdims=True)
+    _, v = np.linalg.eigh(np.einsum("ikjl,nk,nl->nij", T, n, n))
+    # the group velocity of each mode, up to its positive 1 / (2 omega)
+    group = np.einsum("nip,imjl,nl,njp->npm", v, T + T.transpose(0, 3, 2, 1), n, v)
+    group /= np.linalg.norm(group, axis=2, keepdims=True)
+    return [d for d in range(ndim) if (n[:, None, d] * group[..., d]).min() < -1e-6]
+
+
 def cell_average(sim: Simulation, field: cpt.NDArray) -> cpt.NDArray:
     """Harmonic mean of `field` over the `2**ndim` corners of a cell, at its low corner.
 
@@ -137,6 +160,9 @@ class AnisotropicElasticWave(Simulation):
     sensitivity_path = SENSITIVITY_PATH
     default_boundary = Traction
     gradient_names = ("mass", "stiff", "cell")
+    accepts_pml = True
+    pml_shifted = True
+    pml_walls = (Clamped,)
 
     @property
     def ncomp(self) -> int:
@@ -172,6 +198,14 @@ class AnisotropicElasticWave(Simulation):
                 raise ValueError(f"C must be ({nvoigt}, {nvoigt}): {self.C.shape}")
             if not np.allclose(self.C, self.C.T):
                 raise ValueError("C must be symmetric")
+            widths = pml_widths(self) if self.pml else []
+            lined = [d for d, w in enumerate(widths) if sum(w)]
+            backward = [d for d in backward_axes(self.C, self.ndim) if d in lined]
+            if backward:
+                raise ValueError(
+                    f"C carries a wave against its phase along axes {backward}, which "
+                    f"a pml grows (Becache et al. 2003): use sponge"
+                )
 
     @property
     def lame(self) -> float:
@@ -183,14 +217,17 @@ class AnisotropicElasticWave(Simulation):
         """Second Lame parameter `rho0 * c_s**2`."""
         return self.density * self.wavespeed_s**2
 
+    def stiffness_matrix(self) -> npt.NDArray:
+        """The Voigt stiffness at `gamma = 1`: `C`, or the isotropic one."""
+        if self.C is not None:
+            return self.C
+        return voigt(self.ndim, self.lame, self.shear, self.plane)
+
     def stencil(self) -> cpt.NDArray:
         """Stencil table at `gamma = 1`: one cell's `-B^T C B`, flattened for the kernel."""
         if self._stencil is not None:
             return self._stencil
-        C = self.C
-        if C is None:
-            C = voigt(self.ndim, self.lame, self.shear, self.plane)
-        K = cell_stencil(self.ndim, self.dx, C)
+        K = cell_stencil(self.ndim, self.dx, self.stiffness_matrix())
         self._stencil = cp.asarray(K.ravel(), dtype=self.dtype)
         return self._stencil
 
@@ -244,6 +281,62 @@ class AnisotropicElasticWave(Simulation):
     def parametrization_jacobian(self, indicator: cpt.NDArray) -> tuple:
         """Gamma scales inertia and stiffness alike, so both derivatives are 1."""
         return 1.0, 1.0
+
+    def define_step(self, kernels: cp.RawModule, mat: dict) -> Callable:
+        """The cell step, followed by its pml terms if there are any."""
+        passes = ("pml_cell", "pml_force")
+        return self._define_pml(kernels, mat, passes)
+
+    def define_adjoint_step(
+        self, kernels: cp.RawModule, sens_kernels: cp.RawModule, mat: dict
+    ) -> Callable:
+        """The same step with the pml terms transposed, which breaks its symmetry."""
+        passes = ("pml_adjoint_memory", "pml_adjoint_cell", "pml_adjoint_force")
+        return self._define_pml(kernels, mat, passes)
+
+    def _define_pml(self, kernels: cp.RawModule, mat: dict, passes: tuple) -> Callable:
+        """The cell step, then each pass over every lined axis, all axes in one memory."""
+        fd_step = super().define_step(kernels, mat)
+        if self.pml is None:
+            return fd_step
+        slabs = self.pml_slabs()
+        sizes = [2 * self.ndim * (lo + hi) * plane for _, lo, hi, _, plane in slabs]
+        starts = np.cumsum([0, *sizes])
+        offsets = np.cumsum([0, *(slab[3].size for slab in slabs)])
+        # per axis: rows lo and hi, then where its memory and profile start
+        table = np.zeros((self.ndim, 4), dtype=np.int32)
+        for k, (d, lo, hi, _, _) in enumerate(slabs):
+            table[d] = lo, hi, starts[k], offsets[k]
+        cv = float(np.prod(self.dx)) * self.stiffness_matrix().ravel()
+        common = [
+            cp.zeros(int(starts[-1]), dtype=self.dtype),
+            mat["minv"],
+            mat["cell"],
+            cp.asarray(cv, dtype=self.dtype),
+            self.dtype(self.dt**2),
+            np.int32(self.comp_stride),
+            cp.concatenate([slab[3].ravel() for slab in slabs]),
+            cp.asarray(table.ravel()),
+        ]
+        geometry = axis_geometry(self, [self.dtype(1.0 / d) for d in self.dx])
+        launches = [
+            (
+                kernels.get_function(f"{name}_kernel"),
+                slab_grid(lo, hi, plane),
+                [None, None, *common, np.int32(d), *geometry],
+            )
+            for name in passes
+            for d, lo, hi, _, plane in slabs
+        ]
+
+        def pml_step(u0, u1, u2):
+            fd_step(u0, u1, u2)
+            for kernel, grid, args in launches:
+                args[0], args[1] = u1, u2
+                kernel(grid, (PML_THREADS,), args)
+            return u2
+
+        return pml_step
 
     def step_factors(self) -> list:
         """`dt**2`; the grid spacing already sits in the stencil table."""

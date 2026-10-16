@@ -15,7 +15,7 @@
 
 Two source blocks are **prepended to the text** rather than passed as `-D` flags: the stencil table, then `kernels/common.cuh`. `RawModule` caches on the code string, so a different `space_order` is a different module automatically, without the order having to appear in the options, and the prelude needs no include path
 
-The prelude is where the `real_t` typedef, the `OP_W` and `CLOSURE` accessors and the three transfer kernels below actually live, so every `.cu` in the repo carries only its own operator. [wave](wave.md) lists what it holds and what it deliberately does not
+The prelude is where the `real_t` typedef, the `OP_W` and `CLOSURE` accessors and the four transfer kernels below actually live, so every `.cu` in the repo carries only its own operator. [wave](wave.md) lists what it holds and what it deliberately does not
 
 `stencils.preamble(4)` for instance emits
 ```c
@@ -84,6 +84,40 @@ map a flat thread id `t` to the ghost node it owns and to the direction pointing
 `t`: flat thread index; `faces`: bitmask with bit $2d+\textrm{side}$ set when face (axis $d$, side) belongs to this launch, side 0 low and 1 high; `n`, `s`: from `BC_GEOM`
 **output args**
 `ghost`: flat index of the ghost node (by reference); `normal`: signed stride pointing inward, $+s_d$ on the low side and $-s_d$ on the high side (by reference); the return value is `false` for threads past the last node of the launch
+## pml helpers
+The slab geometry and the memory accessors live in `kernels/common.cuh`, shared by every equation's pml kernels, and are documented here once. A lined axis $d$ keeps its memory only on its slab: the `lo` rows behind the low face and the `hi` rows behind the high one, each row a full padded plane of the other axes
+### PML_PARAMS, PML_GEOM
+the `N0 [, N1, s0] [, N2, s1]` tail of the scalar pml kernels, unpacked into `n[]` and `s[]`: the per-axis factors are left out, since a pml kernel takes its one factor `f` separately
+### padded_extent, slab_plane
+**aim**
+`padded_extent(e, n, s)`: the padded extent of axis `e`, only the fastest axis being padded (to the stride above it); `slab_plane(d, n, s)`: the nodes of one slab row of axis `d`, the product of the padded extents of the other axes
+### slab_node
+**aim**
+decode slab thread `t` of axis `d` to an interior node, false for a ghost or padding node of the plane
+**input args**
+`t`: thread id; `d`: lined axis; `lo, hi`: slab rows behind the low and high face, either 0 for an unlined face; `n, s`: extents and strides
+**output args**
+`idx`: flat index of the node; `a`: its index along `d`, `1 + row` on the low side and `n[d] - 2 - (row - lo)` on the high side, so row 0 is always the wall node; `off`: its index within the plane; `w`: its cell weight $W$, halved once per wall the node sits on
+**how?**
+- on a slow axis the row is the slow index, `t / plane`, so a warp runs along the plane; on the fastest axis the rows go last, `t % rows`, so a warp still runs along the fast axis and its reads coalesce
+### slab_index
+**aim**
+the slab thread of row `a` beside the plane position `off`, or -1 where `a` lies outside the slab: the inverse of `slab_node`, so a kernel can read a neighbour's memory
+### Field, Memory
+**aim**
+`Field`: component `k` of a field `j` nodes along the lined axis from a node, `p[k * cs + idx + j * step]`; `Memory<Base>`: the same read through the profile, $a\left(\textrm{base}+\psi\right)$ with the memory row `row0 + k` of `aux`, and zero off the slab, which is what a transposed kernel gathers
+**internal args**
+`own_half`: whether component `e` sits on the half point of axis `e`, choosing the half-point or node profile per component, so one accessor serves both staggered passes
+### node_axes, PML_AXES, SLAB_OR_RETURN
+`node_axes` unpacks a flat index into its per-axis indices `A[]`; `PML_AXES` unpacks the vector equations' `AXIS_PARAMS` tail into `NN[]`, `S[]` and `F[]`; `SLAB_OR_RETURN(ext)` decodes this thread's slab node of axis `e` with each lined side grown `ext` rows inward (a transposed kernel reaches past the front), returns past the slab, and binds `idx, a, off, w, A, plane, size` and `t`, the node's own slab thread (-1 in the grown rows)
+### cell_differences
+**aim**
+the two cell differences $D^\pm$ of `flux_divergence_axis` at radius `r`, before the stiffness: what the pml memory filters
+**input args**
+`u1`: array of $u^n$; `idx`: index; `s`: stride along the axis; `uc`: $u^n_i$; `r`: radius, graded by `CLOSURE`
+**output args**
+`Dp, Dm`: the plus and minus cell differences (by reference)
+
 ## kernels
 ### fd_kernel
 **parallelization**
@@ -113,6 +147,22 @@ as `fd_kernel` without `cells, tiles`, plus `chunk`: the rows of axis 0 a block 
 - axis 0 from the registers, axis 1 by `flux_divergence_axis` on the tile, then the update of `fd_kernel`
 - every value is read from memory once per step and the stencil's reuse along axis 0 stays in registers, which is what the plain kernel leaves to L1. That pays for a wide stencil only: below order 6, on a grid too small to fill the device with chunks, and in 3D, L1 serves the per-thread kernel as well, and a mask keeps the per-thread kernel for its tile list, which the stream would not fit
 
+### pml_kernel
+**parallelization**
+flat 1D launch over the slab of axis `d`, `PML_THREADS` per block, one thread per slab node through `slab_node`; launched once per lined axis, after `fd_kernel` has written $u^{n+1}$
+**aim**
+add the memory terms of axis `d` to $u^{n+1}$, the stretched flux and the stretched divergence
+**input args**
+`u1`: array of $u^n$; `u2`: array of $u^{n+1}$, added to in place; `stiff`, `minv`, `derive_inertia`: as `fd_kernel`; `aux`: the memory of this axis, three rows of `size` $=(lo+hi)\cdot$`plane`, $\psi^+$, $\psi^-$ and $\zeta$; `profile`: the `(4, n[d])` rows $a, b$ at the nodes then $a, b$ at $a+\tfrac12$, from `pml_profiles`; `d`: lined axis; `lo, hi`: slab rows; `f`: the per-axis factor $f_d$ of `step_factors`; `PML_PARAMS`: extents and strides
+**internal args**
+`Dp, Dm`: cell differences; `gp, gm`: harmonic cell stiffnesses; `pp, pm`: the new flux memories of the plus and minus cell; `z`: the new divergence memory; `mi`: $1/m$
+**how?**
+- each cell difference carries its own memory, profiled at the cell midpoint, and the divergence of the stretched flux carries one at the node
+$$\psi^\pm\leftarrow b_{i\pm\frac12}\psi^\pm+a_{i\pm\frac12}D^\pm,\qquad\zeta\leftarrow b_i\zeta+a_i\,f_d\left(g^+\left(D^++\psi^+\right)-g^-\left(D^-+\psi^-\right)\right)$$
+$$u^{n+1}\mathrel{+}=\frac{1}{m}\left(f_d\left(g^+\psi^+-g^-\psi^-\right)+\zeta\right)$$
+- the minus cell of node $i$ is the plus cell of node $i-1$, so the flux memory is stored twice, once per node; that keeps every thread node-local and the launch free of atomics, at the price of one memory row
+- a node off the profile reads $a=0, b=1$, so the memories stay zero there and the slab may be wider than the layer
+
 ### homogeneous_neumann_kernel
 **parallelization**
 flat 1D launch, 256 threads per block, one thread per ghost node (the ghost ring is not a grid-shaped domain, so these kernels decode a linear thread id via `bc_ghost` instead of using the grid mapping of `fd_kernel`)
@@ -127,7 +177,7 @@ Same parallelization, input args and grouping as `homogeneous_neumann_kernel`, w
 - `u[ghost] = -u[ghost + 2 * normal]`: antisymmetry about the wall node, the pressure-release or free-surface condition, and reflection comes back with flipped sign
 - homogeneous in the exact sense: the wall node is never written by this kernel, but the odd mirror makes its own `fd_kernel` update self-annihilating ($D^+-D^-=-2u_1$ at radius 1), so from $u^0=u^1=0$ it stays at exactly $0$ for all $n$
 
-The three transfer kernels below live in `kernels/common.cuh` and not in `scalar.cu`, since every equation shares them byte for byte; a fourth there, `adjoint_excitation_kernel`, is documented with its caller in [cuda_scalar_sensitivity](cuda_scalar_sensitivity.md). They are documented here because the scalar case is the one with no component index to fold in, and the other `cuda_*` pages list only what differs
+The four transfer kernels below live in `kernels/common.cuh` and not in `scalar.cu`, since every equation shares them byte for byte; a fifth there, `adjoint_excitation_kernel`, is documented with its caller in [cuda_scalar_sensitivity](cuda_scalar_sensitivity.md). They are documented here because the scalar case is the one with no component index to fold in, and the other `cuda_*` pages list only what differs
 
 ### excitation_kernel
 **parallelization**
@@ -158,3 +208,14 @@ Same parallelization and input args as `get_signal_kernel` with the two arrays s
 **how?**
 - assignment rather than the `atomicAdd` of `excitation_kernel`, because it restores a recorded state instead of adding a contribution to one: the node ends at the stored value whatever it held before
 - the primitive the reverse march of `reconstruction_sensitivity` replays its boundary strip through, see [sensitivity](sensitivity.md)
+
+### dft_kernel
+Same parallelization as `get_signal_kernel`, one thread per transformed node
+**aim**
+add the field at the nodes, times row `t_index` of a phase table, into a running discrete Fourier transform
+**input args**
+`u`: array of $u$; `acc`: the $(\textrm{rows},\,\textrm{num})$ accumulator, accumulated into; `table`: the whole $(N,\,\textrm{rows})$ record of phase factors; `offset`: `t_index * rows`, the row start; `lin_index`: flat indices of the nodes; `num`: their count; `num_rows`: the columns of `table`, one accumulator row each
+**how?**
+- one load of $u$ per node, then a loop over the table columns, `acc[k * num + idx] += table[offset + k] * uc`, so several frequencies (and the real and imaginary parts, $\cos\omega t$ and $-\sin\omega t$) share the launch
+- no atomic, each thread owning its own column of `acc`, and the accumulator zeroed by the caller as every accumulating kernel's is
+- the table is a record indexed by row like the source signal, so the transform stays inside the captured graph; `spectral_sensitivity` is the caller, see [sensitivity](sensitivity.md)

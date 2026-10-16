@@ -5,8 +5,9 @@ setup can place one per face in `Simulation.boundary` long before the module is
 compiled. `define_boundary` turns the markers into the launch closures once
 `compile_kernels` has run, which is why `simulate` needs no separate preparation phase.
 
-`sponge` opens the domain from the other side: it dissipates in the material behind a
-face rather than acting on the ghost ring, so it needs no kernel and no marker of its own.
+`sponge` and `Pml` open the domain from the other side: they absorb in the material
+behind a face rather than acting on the ghost ring. The sponge is a damping field; the
+PML is declarative like a condition, its profiles built once the step is defined.
 """
 
 from __future__ import annotations
@@ -253,3 +254,110 @@ def sponge(
     return cp.ascontiguousarray(
         (2.0 * beta * taper**2 / (sim.dt * minv)).astype(sim.dtype)
     )
+
+
+@dataclass(frozen=True)
+class Pml:
+    """A convolutional perfectly matched layer behind `faces`, for `Simulation.pml`.
+
+    Every derivative along an axis carries a memory variable inside the `width` nodes
+    behind that axis' lined faces, its graded profile set by the target `reflection`
+    at the fastest `wavespeed` (Komatitsch & Martin 2007,
+    https://doi.org/10.1190/1.2757586).
+    """
+
+    width: int  # layer depth in nodes, the wall node included
+    wavespeed: float  # fastest wave speed in the layer, which sizes the damping
+    reflection: float = 1e-6  # target reflection at normal incidence
+    frequency: float = 0.0  # CFS shift pi * frequency through the layer, 0 for none
+    faces: tuple[int, ...] | None = None  # the `2 * axis + side` codes, None for all
+
+
+def validate_pml(sim: Simulation) -> None:
+    """Raise if `sim.pml` cannot be stepped: unsupported, combined, or too wide."""
+    layer = sim.pml
+    if not sim.accepts_pml:
+        raise NotImplementedError(f"{type(sim).__name__} has no pml; use sponge")
+    if sim.damping is not None or sim.masked:
+        raise ValueError("a pml takes neither a damping field nor a domain mask")
+    least = 2 + sim.pml_margin
+    if layer.width < least or layer.wavespeed <= 0.0 or not 0.0 < layer.reflection < 1:
+        raise ValueError(
+            f"a pml needs width >= {least}, a speed and 0 < reflection < 1: {layer}"
+        )
+    if sim.pml_shifted and layer.frequency <= 0.0:
+        raise ValueError(
+            f"{type(sim).__name__} keeps a static mode in an unshifted pml: set "
+            f"frequency, near the low end of the band"
+        )
+    # the transposed taps reach `reach` nodes past the layer, which must not meet
+    faces = _validate_layer(sim, layer.width + sim.reach, layer.faces)
+    if sim.pml_walls is not None:
+        for face in faces:
+            wall = sim.boundary[face // 2][face % 2]
+            if wall not in sim.pml_walls:
+                raise ValueError(
+                    f"face {face} ends the pml on {wall}, which traps a growing wave: "
+                    f"make it {' or '.join(map(repr, sim.pml_walls))}"
+                )
+
+
+def pml_widths(sim: Simulation) -> list[tuple[int, int]]:
+    """Per axis, the (low, high) layer depths in nodes, 0 for a face left unlined."""
+    faces = _canonical_faces(sim.ndim, sim.pml.faces)
+    return [
+        tuple(sim.pml.width if 2 * d + side in faces else 0 for side in (0, 1))
+        for d in range(sim.ndim)
+    ]
+
+
+def pml_profiles(sim: Simulation) -> list[cpt.NDArray | None]:
+    """Per lined axis, the (4, Nx[d]) recursion coefficients `a, b` at nodes and half points.
+
+    Row 0 and 1 are the node values, rows 2 and 3 those of the half point `a + 1/2`,
+    graded from 0 at the front to the wall and mirrored across it, so the ghost cell
+    sees what its mirror does. An axis with no lined face gets None.
+    """
+    layer = sim.pml
+    # the front node is undamped, and so are the margin nodes in front of it
+    L = layer.width - 1 - sim.pml_margin
+    profiles = []
+    for d, (lo, hi) in enumerate(pml_widths(sim)):
+        if not lo + hi:
+            profiles.append(None)
+            continue
+        n = sim.Nx[d]
+        damping = (
+            -3.0 * layer.wavespeed * np.log(layer.reflection) / (2.0 * L * sim.dx[d])
+        )
+        rows = []
+        for position in (np.arange(n) + shift for shift in (0.0, 0.5)):
+            distance = np.full(n, np.inf)
+            if lo:
+                distance = np.minimum(distance, np.abs(position - 1))
+            if hi:
+                distance = np.minimum(distance, np.abs(n - 2 - position))
+            depth = np.clip((L - distance) / L, 0.0, 1.0)
+            d0 = damping * depth**2
+            alpha = np.pi * layer.frequency
+            inside = depth > 0.0
+            b = np.where(inside, np.exp(-(d0 + alpha) * sim.dt), 1.0)
+            a = np.where(inside, d0 / np.maximum(d0 + alpha, 1e-300) * (b - 1.0), 0.0)
+            rows += [a, b]
+        profiles.append(cp.asarray(np.stack(rows), dtype=sim.dtype))
+    return profiles
+
+
+def pml_nodes(sim: Simulation) -> cpt.NDArray:
+    """Interior nodes inside the layer, where the step carries memory terms."""
+    inside = cp.zeros(sim.Nx_padded, dtype=bool)
+    if sim.pml is None:
+        return inside
+    for d, (lo, hi) in enumerate(pml_widths(sim)):
+        index = [slice(None)] * sim.ndim
+        for rows in (slice(1, 1 + lo), slice(sim.Nx[d] - 1 - hi, sim.Nx[d] - 1)):
+            index[d] = rows
+            inside[tuple(index)] = True
+    interior = cp.zeros_like(inside)
+    interior[tuple(slice(1, n - 1) for n in sim.Nx)] = True
+    return inside & interior

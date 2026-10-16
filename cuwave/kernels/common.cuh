@@ -55,6 +55,144 @@ __device__ __forceinline__ bool clamped_face(const int clamped, const int d,
   return (clamped >> (2 * d + side)) & 1;
 }
 
+// --------------------------------------- pml slabs
+#if NDIM == 1
+#define PML_PARAMS const int N0
+#define PML_GEOM const int n[1] = {N0}, s[1] = {1}
+#elif NDIM == 2
+#define PML_PARAMS const int N0, const int N1, const int s0
+#define PML_GEOM const int n[2] = {N0, N1}, s[2] = {s0, 1}
+#elif NDIM == 3
+#define PML_PARAMS                                                             \
+  const int N0, const int N1, const int s0, const int N2, const int s1
+#define PML_GEOM const int n[3] = {N0, N1, N2}, s[3] = {s0, s1, 1}
+#endif
+
+// padded extent of axis e: only the fastest is padded, to the stride above it
+__device__ __forceinline__ int padded_extent(const int e, const int *n,
+                                             const int *s) {
+#if NDIM == 1
+  return n[0];
+#else
+  return e < NDIM - 1 ? n[e] : s[NDIM - 2];
+#endif
+}
+
+// nodes per slab row of axis d: the padded extents of the other axes
+__device__ __forceinline__ int slab_plane(const int d, const int *n,
+                                          const int *s) {
+  int plane = 1;
+#pragma unroll
+  for (int e = 0; e < NDIM; ++e)
+    if (e != d)
+      plane *= padded_extent(e, n, s);
+  return plane;
+}
+
+// slab thread t of axis d, rows lo + hi off its walls, onto an interior node
+__device__ __forceinline__ bool slab_node(const int t, const int d,
+                                          const int lo, const int hi,
+                                          const int *n, const int *s, int &idx,
+                                          int &a, int &off, real_t &w) {
+  const int plane = slab_plane(d, n, s), rows = lo + hi;
+  // the fast axis keeps its threads consecutive, so the slab rows go last there
+  const int row = d < NDIM - 1 ? t / plane : t % rows;
+  off = d < NDIM - 1 ? t % plane : t / rows;
+  if (row >= rows || off >= plane)
+    return false;
+  a = row < lo ? 1 + row : n[d] - 2 - (row - lo);
+  idx = a * s[d];
+  w = (a == 1 || a == n[d] - 2) ? (real_t)0.5 : (real_t)1; // cell weight
+  int rest = off;
+#pragma unroll
+  for (int e = NDIM - 1; e >= 0; --e)
+    if (e != d) {
+      const int p = padded_extent(e, n, s), ae = rest % p;
+      rest /= p;
+      if (ae < 1 || ae > n[e] - 2)
+        return false;
+      idx += ae * s[e];
+      w *= (ae == 1 || ae == n[e] - 2) ? (real_t)0.5 : (real_t)1;
+    }
+  return true;
+}
+
+// the slab thread of row a beside `off`, or -1 where a lies outside the slab
+__device__ __forceinline__ int slab_index(const int a, const int off,
+                                          const int d, const int lo,
+                                          const int hi, const int *n,
+                                          const int plane) {
+  const int row = (a >= 1 && a - 1 < lo)                 ? a - 1
+                  : (a <= n[d] - 2 && n[d] - 2 - a < hi) ? lo + n[d] - 2 - a
+                                                         : -1;
+  if (row < 0)
+    return -1;
+  return d < NDIM - 1 ? row * plane + off : off * (lo + hi) + row;
+}
+
+// ------------------------------- pml memory accessors
+// component k of a field j nodes along the axis from a node
+struct Field {
+  const real_t *__restrict__ p;
+  int idx, cs, step;
+  __device__ real_t operator()(const int k, const int j) const {
+    return p[k * cs + idx + j * step];
+  }
+};
+
+// a field plus its memory row, through the profile: what the transposes read
+template <class Base> struct Memory {
+  Base base;
+  const real_t *__restrict__ aux, *__restrict__ profile;
+  const int *NN;
+  int size, row0, a, off, e, lo, hi, plane;
+  bool own_half; // whether component e sits on the half point of axis e
+  __device__ real_t operator()(const int k, const int j) const {
+    const int at = a + j, i = slab_index(at, off, e, lo, hi, NN, plane);
+    if (i < 0)
+      return (real_t)0; // the profile vanishes off the slab
+    const bool half = (k == e) == own_half;
+    const real_t coef = profile[(half ? 2 * NN[e] : 0) + at];
+    return coef * (base(k, j) + aux[(row0 + k) * size + i]);
+  }
+};
+
+// a slab node's axes off its flat index, the padded strides S
+__device__ __forceinline__ void node_axes(const int idx, const int *S, int *A) {
+  int rest = idx;
+#pragma unroll
+  for (int d = 0; d < NDIM; ++d) {
+    A[d] = rest / S[d];
+    rest -= A[d] * S[d];
+  }
+}
+
+#if NDIM == 1
+#define PML_AXES                                                               \
+  const int NN[1] = {N0}, S[1] = {1};                                          \
+  const real_t F[1] = {f0}
+#elif NDIM == 2
+#define PML_AXES                                                               \
+  const int NN[2] = {N0, N1}, S[2] = {s0, 1};                                  \
+  const real_t F[2] = {f0, f1}
+#elif NDIM == 3
+#define PML_AXES                                                               \
+  const int NN[3] = {N0, N1, N2}, S[3] = {s0, s1, 1};                          \
+  const real_t F[3] = {f0, f1, f2}
+#endif
+
+// the slab node of this thread, rows lo + hi plus ext past the front, or return
+#define SLAB_OR_RETURN(ext)                                                    \
+  int idx, a, off, A[NDIM];                                                    \
+  real_t w;                                                                    \
+  if (!slab_node(blockIdx.x * blockDim.x + threadIdx.x, e,                     \
+                 lo ? lo + (ext) : 0, hi ? hi + (ext) : 0, NN, S, idx, a, off, \
+                 w))                                                           \
+    return;                                                                    \
+  node_axes(idx, S, A);                                                        \
+  const int plane = slab_plane(e, NN, S), size = (lo + hi) * plane;            \
+  const int t = slab_index(a, off, e, lo, hi, NN, plane)
+
 // ---------------------------------- transfer kernels
 extern "C" {
 
@@ -105,6 +243,21 @@ __global__ void set_signal_kernel(real_t *__restrict__ u,
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < num_sensors) {
     u[lin_index[idx]] = um[offset + idx];
+  }
+}
+
+// ------------------------------------------------------------------------------------
+__global__ void dft_kernel(const real_t *__restrict__ u,
+                           real_t *__restrict__ acc,
+                           const real_t *__restrict__ table, const int offset,
+                           const int *__restrict__ lin_index, const int num,
+                           const int num_rows) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < num) {
+    const real_t uc = u[lin_index[idx]];
+    for (int k = 0; k < num_rows; ++k) {
+      acc[k * num + idx] += table[offset + k] * uc; // cos, -sin per frequency
+    }
   }
 }
 

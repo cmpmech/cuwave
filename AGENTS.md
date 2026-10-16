@@ -91,7 +91,7 @@ which sizes the reconstruction strip.
 
 `maxwell.MaxwellWave` is the Yee lattice as `-C^T nu C`, which is the staggered elastic
 layout with the normal-stress block deleted, so it shares that whole geometry layer:
-`wall_weights`, `point_average`, `pair_average` and their adjoints are
+`wall_weights`, `point_average`, `point_harmonic`, `pair_average` and their adjoints are
 free functions in `wave.py`, not methods, precisely because two equations need them. It is
 2D/3D only and its kernel-less walls are `Conductor`/`Magnetic`. Its class switch
 `magnetic` (the `derive_inertia` idiom) adds `-DUSE_MAGNETIC` and the pair-point curl
@@ -124,7 +124,7 @@ and the cell onto one stays open with the zero at the cell *midpoint* (radius co
 are *prepended* so CuPy's module cache keys on them without a flag: the stencil table from
 `stencils.preamble(space_order)`, then `kernels/common.cuh`. That prelude holds what every
 `.cu` repeated (the `real_t` typedef, the `OP_W`/`SG_W` accessors, `rad_node`/`rad_half`,
-`PAIR_ROW`, and the three transfer kernels); the `AXIS_*` macro blocks stay per file, since
+`PAIR_ROW`, and the four transfer kernels); the `AXIS_*` macro blocks stay per file, since
 the anisotropic adjoint's signature genuinely differs. Any new flag is added to both the
 `.cu` header block and `Simulation.compile_flags`.
 
@@ -148,22 +148,46 @@ plain loop bitwise.
 `Simulation.boundary` can carry a per-face layout long before compilation; `define_boundary`
 groups faces by condition into a bitmask so the default stays one launch.
 
+**`Simulation.pml`** is a convolutional PML (`boundary.Pml`) for every equation, the
+absorber to reach for over `sponge`. Memory lives on per-axis slabs only (`slab_node` /
+`slab_index` / `SLAB_OR_RETURN` in `common.cuh`) and is added by `pml_*` kernels launched
+after each pass of the step; the adjoint steps their transpose (`pml_adjoint_*`), so with a
+pml no equation's adjoint is `define_step` any more. A stretched stress or curl carries every
+lined axis' memory (the shared scratch for the staggered schemes, one buffer plus a
+`layers` table for the anisotropic one), which is what holds the corners. It excludes
+`damping` and a `domain` mask; the material gradient is zeroed on `pml_nodes` (`frozen`).
+
 ### Adjoint sensitivities (`sensitivity.py` + `kernels/<equation>_sensitivity.cu`)
 
-Three variants, identical signature and return, differing only in how the forward field is
-made available to the backward pass:
+Four variants, identical signature and return (the spectral one adds `frequencies` and an
+optional `region`), differing only in how the forward field is made available to the
+backward pass:
 
 | | memory | `sim.damping` | gradient |
 |---|---|---|---|
 | `sensitivity` | stores all `N + 2` fields | supported | exact transpose of the discretization |
 | `reconstruction_sensitivity` | 7 grids and `N + 2` copies of the strip | supported, and what the strip pays for | the same transpose, wherever the strip shields it |
 | `superposition_sensitivity` | 5 grids, independent of `N` | rejected (`require_lossless`) | consistent, not exact; `scale` (k) trades a k² bias against round-off |
+| `spectral_sensitivity` | 8 grids, independent of `N`, plus a running DFT on `region` | supported | exact once both runs decay; spectral costs only (`intensity`) |
 
 Both reconstructing variants rebuild the forward field rather than storing it, which is why
 `superposition_sensitivity` needs a **lossless operator** and rejects `damping` outright.
 Each reports its own health: `info["drift"]` and `info["strip"]` for the strip variant,
 `info["cancellation"]` for the superposition one, which past `CANCELLATION_LIMIT` means the
 gradient is mostly round-off and the caller must raise `scale`. See `docs/sensitivity.md`.
+A pml counts as irreversible: `superposition_sensitivity` refuses it, `reconstruction_nodes`
+puts it behind the strip (dilated in every direction, diagonals included), and
+`spectral_sensitivity` restarts the adjoint memories per frequency.
+`reconstruction_sensitivity(..., strip_dtype=)` stores the strip as float32 or bfloat16
+(a `uint16` record that `Window(dtype=)` widens on staging), trading exactness for memory.
+
+`spectral_sensitivity` (adapted from fdtdx and the Meep adjoint) needs no history at all: the
+cost's derivative is fitted by sinusoids at `frequencies` (raises if it is not spectral), the
+adjoint is a **causal** run driven by a pulse with the same DTFT at each frequency, and the
+gradient is `gradient_step` on the complex DFTs (`define_dft`, triplet `z^-2, z^-1, 1`). It
+is exact only once both runs have decayed: a constant tail is continued in closed form
+(`settled`), and `info["decay"]` (warn past `DECAY_LIMIT`) is the oscillating rest. The DFT
+must cover ghost nodes too, since the stiffness gradient reads them at the walls.
 
 `sensitivity` and `reconstruction_sensitivity` are exact at any order. Above order 2 the
 pressure operator is not its own transpose (graded wall rows, wide flux under a varying
@@ -212,7 +236,9 @@ measurement → optimization → evaluation → postprocessing, separated by 87-
 `examples/forward/scalarND.py` is the minimal driver and `examples/fwi/scalar2D_fwi_adam.py`
 the full one; copy their shape. `examples/tpto/` holds the photonic inverse-design
 driver (a metalens), which is `examples/tato/`'s shape with `intensity` in place of
-`energy` and a sponge plus `reconstruction_sensitivity`.
+`energy` and a sponge plus `spectral_sensitivity` on the design region.
+`examples/validation/` cross-checks the Maxwell classes against fdtdx: one script runs in a
+separate jax venv and writes `tests/reference/*.npz`, which `FdtdxReferenceTest` replays.
 
 ### Docs (`docs/`)
 
@@ -222,6 +248,11 @@ page and its `Home.md` line is one edit. The `.cu` files have no docstrings by d
 the `docs/cuda_*.md` pages are the only ones that document arguments.
 
 ## Traps
+
+- **A pml on a vector equation needs `frequency` > 0** (the CFS shift): unshifted, a static
+  mode grows (elastic) or never decays (Maxwell). Elastic lined faces must be `Clamped`
+  (a traction wall behind the layer grows a surface wave), and `AnisotropicElasticWave`
+  refuses a `C` with a backward wave along a lined axis (`backward_axes`, Becache 2003).
 
 - **dtype is unchecked all the way to the kernel.** `cp.RawModule` takes raw pointers, so a
   float64 `Source.signal` in a float32 sim is read as garbage and only NaNs a few hundred

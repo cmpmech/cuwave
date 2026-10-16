@@ -16,6 +16,10 @@ A condition is a declarative marker naming a kernel and nothing more, so a setup
 | bitmask | `face_mask(sim, condition)` | the same faces packed as the `int32` the kernels take |
 | layout | `pad_for_sponge(Nx, dx, thickness, faces=None)` | grows a region of interest by a layer of physical `thickness` behind the named faces, returning the extent to build the simulation on, the layer width in nodes, and where the region of interest ends up |
 | dissipating absorber | `sponge(sim, indicator, width, beta, faces=None)` | a damping field ramping to `beta` over the `width` nodes behind the named faces and zero elsewhere, for a driver to set as `Simulation.damping` |
+| matched absorber | `Pml(width, wavespeed, reflection=1e-6, frequency=0.0, faces=None)` | frozen description of a perfectly matched layer `width` nodes deep behind the named faces, for a driver to set as `Simulation.pml` |
+| layer depths | `pml_widths(sim)` | per axis, the (low, high) depth of the layer in nodes, 0 on a face left unlined |
+| recursion coefficients | `pml_profiles(sim)` | per lined axis, the coefficients $a, b$ at the nodes and at the half points, `None` for an axis with no lined face |
+| layer mask | `pml_nodes(sim)` | the interior nodes inside the layer, where the step carries memory terms and the gradient is frozen |
 | normalization | `canonical_boundary(boundary, ndim)` | expands the shorthands (`None`, one condition, one per axis) into the `((low, high),) * ndim` form `Simulation` stores |
 | dispatch | `define_boundary(sim, kernels)` | groups the faces by condition and returns `bc_step(u)`, which runs one launch per **distinct** condition |
 
@@ -25,7 +29,7 @@ Grouping by condition rather than by face is what keeps the common case cheap: a
 
 A kernel-less marker names a wall the discretization already produces: `Traction` and `Magnetic` are the natural condition of the interior assembly, and `Clamped` and `Conductor` are a zeroed inertia on the wall unknowns. They cost no launch, which is why `define_boundary` skips a condition whose `kernel` is `None`, and they are separate objects from their mechanical twins so that a simulation prints the vocabulary of its own physics
 
-Only two ghost-mirroring *conditions* are implemented. A true absorbing or radiating condition would need state on the boundary layer rather than a ghost mirror, so it does not fit the marker-plus-kernel shape and is left out rather than approximated: `sponge` opens the domain in the material instead, dissipating the outgoing wave behind a face that stays reflecting, which is why it is a field builder and not a `BoundaryCondition`
+Only two ghost-mirroring *conditions* are implemented. A true absorbing or radiating condition would need state on the boundary layer rather than a ghost mirror, so it does not fit the marker-plus-kernel shape and is left out rather than approximated: `sponge` opens the domain in the material instead, dissipating the outgoing wave behind a face that stays reflecting, which is why it is a field builder and not a `BoundaryCondition`. The `Pml` carries that state, and for the same reason is a `Simulation` field of its own rather than a condition
 
 ## sponge
 
@@ -46,3 +50,29 @@ The price is losslessness: a damped operator cannot be run backwards, so of the 
 The layer is grid the simulation carries and the application does not own, which is arithmetic every driver would otherwise repeat. `pad_for_sponge` does it once: it converts a physical thickness into nodes off the finest axis, grows only the axes whose faces are named, and hands back the width `sponge` wants along with the part that is easy to get wrong: the physical origin the region of interest has moved to, and the index tuple that selects it back out of the grown grid for a design mask or a figure. A transducer coordinate that misses that shift lands inside the boundary layer
 
 `examples/forward/scalar2D_sponge.py` is the demonstration: it lines the two faces of axis 0 and leaves axis 1 reflecting, so one figure carries the absorbed faces beside the reflecting ones. `examples/fwi/scalar2D_fwi_adam_sponge.py` is the same boundary under an inversion, where the layer also has to be frozen out of the design
+
+## pml
+
+**A perfectly matched layer** absorbs by stretching the coordinate normal to a lined face into the complex plane, so the outgoing wave decays inside the layer without reflecting off its front. In the convolutional form of [Roden & Gedney 2000](https://doi.org/10.1002/1098-2760(20001205)27:5%3C334::AID-MOP14%3E3.0.CO;2-A), every derivative along the lined axis $d$ carries a memory $\psi$ inside the layer
+$$\tilde\partial_d f=\partial_d f+\psi,\qquad\psi^n=b\,\psi^{n-1}+a\,\partial_d f,\qquad b=e^{-(\sigma+\alpha)\Delta t},\qquad a=\frac{\sigma}{\sigma+\alpha}\left(b-1\right)$$
+$$\sigma=\sigma_0\,w^2,\qquad\sigma_0=-\frac{3c\ln R}{2L\,\Delta x_d}$$
+with the layer `width`, the `wavespeed` $c$ the profile is matched to, the target `reflection` $R$ and the frequency shift $\alpha=\pi$ `frequency`. The taper $w$ rises from 0 at the front to 1 at the wall over $L$ nodes and is mirrored across it, so the ghost reads what its mirror does. Outside the layer $a=0$ and $b=1$, so the memory is stored on the slabs alone and its cost is a few grids' worth of slab, not of domain
+
+The memory sits wherever the scheme already takes a derivative, so each equation lines its own pair of passes, and a stretched stress or curl carries the memory of every lined axis, which is what holds the corners together:
+
+| equation | memory on | `frequency` | wall behind the layer |
+|---|---|---|---|
+| `PressureWave` and its subclasses | the cell flux and its divergence, per axis | optional | any |
+| `ElasticWave` | the strain and the stress divergence | required | `Clamped` |
+| `AnisotropicElasticWave` | the cell-centre strain and the stress divergence | required | `Clamped` |
+| `MaxwellWave` | the curl and its transpose | required | any |
+
+`frequency` is the complex frequency shift. The vector equations keep a static mode alive in an unshifted layer, growing for elasticity and stationary for Maxwell, so they refuse `frequency` $=0$. The shift also makes the layer transparent well below it, since there the stretching vanishes and the wave returns off the wall behind it, so set it near the **low end of the band** the source carries rather than at its centre
+
+A `Traction` wall behind an elastic layer holds a surface wave that grows, so a lined elastic face must be `Clamped`. A free surface crossing the layer (an unlined `Traction` face meeting a lined one) is stable and is the seismic default. An anisotropic `C` is the one case no shift repairs: where some wave runs against its own phase along a lined axis, the layer amplifies it ([Bécache, Fauqueux & Joly 2003](https://doi.org/10.1016/S0021-9991(03)00184-0)). `AnisotropicElasticWave` checks the slowness surface of `C` against that condition per lined axis and refuses the layer there, leaving `sponge` as the absorber for such a material
+
+Against a sponge the layer trades memory and launches for grid: it reaches in a fraction of a wavelength what a sponge needs several for, and being matched at every angle it also terminates a guide run on through it. `width` must be at least `2 + pml_margin` nodes (the staggered schemes add $r-1$, since a corrected derivative is read that far) and leave the region in between free. `reflection` is what the continuous layer would return, so it sets the profile's strength rather than the discrete result
+
+The layer is design-frozen: the material gradient of `sensitivity`, `reconstruction_sensitivity` and `spectral_sensitivity` is zeroed on `pml_nodes`, since the memory terms carry their own material dependence that no gradient kernel differentiates. Sources and sensors may sit inside it, and `source_sensitivity` stays exact there. The layer is not reversible, so `superposition_sensitivity` refuses it as it refuses damping, while `reconstruction_sensitivity` treats it as one more lossy region its strip shields. A `Pml` excludes both `Simulation.damping` and a `domain` mask
+
+`pad_for_sponge` lays out the grid for either absorber. `examples/tpto/metalens2D_optimization.py` runs on a half-wavelength layer

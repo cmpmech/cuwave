@@ -1,26 +1,31 @@
-"""Adjoint sensitivities in three variants, same arguments and same return.
+"""Adjoint sensitivities in four variants, same arguments and same return.
 
 `sensitivity` stores the forward field (N + 2 grids) and is the exact transpose of
 the discretisation. `reconstruction_sensitivity` rebuilds that field by a reverse
 march instead, storing only the strip a damping layer makes irreversible, and stays
 exact wherever the strip shields it. `superposition_sensitivity` reconstructs it in
 three slots with no strip at all, trading exactness and a `scale` the caller has to
-set for a footprint independent of N. All three share the cell weights and the
-adjoint excitation below; docs/sensitivity.md carries the derivations.
+set for a footprint independent of N. `spectral_sensitivity` keeps only the DFT a
+spectral cost reads, exact once its runs decay. All four share the cell weights and
+the gradient kernels below; docs/sensitivity.md carries the derivations.
 
 `source_sensitivity` shares those arguments but differentiates with respect to
 the source signal rather than the material, which needs no forward field at all.
 """
 
+import math
 import warnings
 from collections.abc import Callable
 
 import cupy as cp
 import cupy.typing as cpt
 import cupyx.scipy.ndimage as ndi
+import numpy as np
+import numpy.typing as npt
 
-from .boundary import define_boundary
+from .boundary import define_boundary, pml_nodes
 from .wave import (
+    BFLOAT16,
     Simulation,
     Source,
     Window,
@@ -28,6 +33,7 @@ from .wave import (
     define_adjoint_excitation,
     define_excitation,
     define_get_signal,
+    define_dft,
     define_set_signal,
     flatten_indices,
     grid_rows,
@@ -39,6 +45,19 @@ ADJOINT_DELAY = 1  # lines the adjoint up with the reconstructed forward triplet
 
 # cancellation past which B(w, w) - B(u, u) has eaten too much of the mantissa to trust
 CANCELLATION_LIMIT = {"float32": 1e5, "float64": 1e12}
+
+# what `strip_dtype` stores the strip as, per (strip_dtype, precision)
+STRIP_DTYPES = {
+    ("float32", "float64"): np.dtype(np.float32),
+    ("bfloat16", "float32"): BFLOAT16,
+    ("bfloat16", "float64"): BFLOAT16,
+}
+
+# share of the spectrum the last period still adds, past which the run stopped short
+DECAY_LIMIT = 1e-2
+# dcost/dtraces off the sinusoids at `frequencies` by more than this is not spectral
+FIT_LIMIT = {"float32": 1e-4, "float64": 1e-10}
+PULSE_PERIODS = 1.0  # spread of the adjoint pulse envelope, in periods
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -104,8 +123,8 @@ def require_full_domain(sim: Simulation) -> None:
 
 
 def require_lossless(sim: Simulation) -> None:
-    """Raise if `sim.damping` is set: reconstructing by time reversal needs losslessness."""
-    if sim.damping is not None:
+    """Raise if `sim.damping` or `sim.pml` is set: time reversal needs losslessness."""
+    if sim.damping is not None or sim.pml is not None:
         raise NotImplementedError(
             "superposition_sensitivity rebuilds the forward field by running it "
             "backwards, which only a lossless operator allows; use sensitivity"
@@ -117,7 +136,8 @@ def reconstruction_nodes(
 ) -> tuple[cpt.NDArray[cp.int32], cpt.NDArray[cp.bool_]]:
     """Nodes a reverse march has to replay, and where its gradient stays exact.
 
-    Which nodes those are is decided by `sim.damping`, so the caller states neither.
+    Which nodes those are is decided by `sim.damping` and `sim.pml`, so the caller
+    states neither.
 
     Returns:
         (strip, valid): the (ndim, num) grid indices to record and replay each step,
@@ -128,12 +148,28 @@ def reconstruction_nodes(
     radius = sim.reach
     interior = cp.zeros(sim.Nx_padded, dtype=cp.bool_)
     interior[tuple(slice(1, n - 1) for n in sim.Nx)] = True
-    if sim.damping is None:
+    if sim.damping is None and sim.pml is None:
         return cp.zeros((sim.node_rows, 0), dtype=cp.int32), interior
-    lossless = interior & ~(sim.damping > 0)
-    reach = ndi.binary_dilation(lossless, iterations=radius, brute_force=True)
+    lossless = interior & ~pml_nodes(sim)
+    if sim.damping is not None:
+        lossless &= ~(sim.damping > 0)
+    # the full square, as a shear or cross term reads the diagonal neighbours
+    square = ndi.generate_binary_structure(sim.ndim, sim.ndim)
+    reach = ndi.binary_dilation(
+        lossless, structure=square, iterations=radius, brute_force=True
+    )
     strip = cp.stack(cp.nonzero(interior & ~lossless & reach)).astype(cp.int32)
     return with_components(sim, strip), lossless
+
+
+def frozen(sim: Simulation, grads: dict[str, cpt.NDArray]) -> dict[str, cpt.NDArray]:
+    """`grads` zeroed in a pml layer, whose memory terms the gradient kernels leave out."""
+    if sim.pml is not None:
+        layer = pml_nodes(sim)
+        # assigned, not multiplied, so a NaN inside cannot survive as 0 * NaN
+        for field in grads.values():
+            field[..., layer] = 0.0
+    return grads
 
 
 def with_components(
@@ -179,6 +215,94 @@ def adjoint_signal(
     return cp.ascontiguousarray(sim.dtype(scale) * signal, dtype=sim.dtype)
 
 
+def phase_table(sim: Simulation, frequencies: npt.NDArray[np.float64]) -> npt.NDArray:
+    """(N, 2F) host table of `cos(omega t)` and `-sin(omega t)`, interleaved per frequency."""
+    # the phase reaches 1e5 radians over a long run, so it is built in double
+    t = np.arange(sim.N, dtype=np.float64) * sim.dt
+    phase = 2.0 * np.pi * t[:, None] * frequencies[None, :]
+    table = np.empty((sim.N, 2 * len(frequencies)))
+    table[:, 0::2] = np.cos(phase)
+    table[:, 1::2] = -np.sin(phase)
+    return table
+
+
+def spectral_load(
+    sim: Simulation, dphi: cpt.NDArray, table: npt.NDArray
+) -> tuple[npt.NDArray, float]:
+    """Fit `dphi` by the sinusoids of `table`: the complex load each frequency drives.
+
+    Returns:
+        (load, fit), the (F, num_sensors) `alpha + i beta` with
+        `dphi = sum alpha cos + beta sin`, and the relative residual of that fit.
+    """
+    basis = np.empty_like(table)
+    basis[:, 0::2], basis[:, 1::2] = table[:, 0::2], -table[:, 1::2]
+    target = cp.asnumpy(dphi).astype(np.float64)
+    coef = np.linalg.lstsq(basis, target, rcond=None)[0]
+    norm = float(np.linalg.norm(target))
+    fit = float(np.linalg.norm(target - basis @ coef)) / norm if norm > 0.0 else 0.0
+    return coef[0::2] + 1j * coef[1::2], fit
+
+
+def spectral_pulse(
+    sim: Simulation, frequency: float, load: npt.NDArray
+) -> npt.NDArray[np.float64]:
+    """(N, num) decaying pulses whose DTFT at `frequency` is `load`, one per column."""
+    sigma = PULSE_PERIODS / frequency
+    t = np.arange(sim.N, dtype=np.float64) * sim.dt
+    if 8.0 * sigma > t[-1]:
+        raise ValueError(
+            f"the adjoint pulse spans {8.0 * sigma:.3g}, longer than the run {t[-1]:.3g}"
+        )
+    envelope = np.exp(-0.5 * ((t - 4.0 * sigma) / sigma) ** 2)
+    omega = 2.0 * np.pi * frequency
+    carriers = envelope * np.stack((np.cos(omega * t), np.sin(omega * t)))
+    # each carrier's DTFT at omega, so the pair spans any complex load
+    spectra = carriers @ np.exp(-1j * omega * t)
+    system = np.array([spectra.real, spectra.imag])
+    amplitudes = np.linalg.solve(system, np.stack((load.real, load.imag)))
+    return carriers.T @ amplitudes
+
+
+def settled(
+    sim: Simulation, spectrum: cpt.NDArray, last: cpt.NDArray, frequency: float
+) -> cpt.NDArray:
+    """DFT `spectrum` continued past step N as the constant `last` the run settled to.
+
+    A closed domain keeps the static field a source's net impulse leaves, which never
+    decays, so its geometric tail is summed in closed form rather than cut off.
+    """
+    z = np.exp(-2j * np.pi * frequency * sim.dt)
+    return spectrum + last * (z**sim.N / (1.0 - z))
+
+
+def spectra(
+    sim: Simulation, acc: cpt.NDArray, last: cpt.NDArray, frequency: float, steps: int
+) -> tuple[cpt.NDArray, float]:
+    """One frequency's settled DFT, and the share of it the run's last `steps` added.
+
+    Args:
+        sim: the simulation the run stepped.
+        acc: (4, num) accumulator: the DFT over every step (real, imaginary), then
+            over the last `steps` alone.
+        last: (num,) the field the run ended on.
+        frequency: the frequency the accumulator was built at.
+        steps: how many trailing steps the second pair covers.
+
+    Returns:
+        (spectrum, share), the complex (num,) DFT continued past N by `settled`, and
+        |tail| / |spectrum| with the constant it settles to taken out of the tail,
+        which is what cutting the run at N leaves out, to leading order.
+    """
+    whole = acc[0].astype(cp.complex128) + 1j * acc[1]
+    tail = acc[2].astype(cp.complex128) + 1j * acc[3]
+    z = np.exp(-2j * np.pi * frequency * sim.dt)
+    tail = tail - last * complex(np.sum(z ** np.arange(sim.N - steps, sim.N)))
+    norm = float(cp.linalg.norm(whole))
+    share = float(cp.linalg.norm(tail)) / norm if norm > 0.0 else 0.0
+    return settled(sim, whole, last, frequency), share
+
+
 # ---------------------------------- adjoint solvers ----------------------------------
 def sensitivity(
     sim: Simulation,
@@ -200,12 +324,13 @@ def sensitivity(
             `sim.parametrization_jacobian()`.
 
     A `sim.damping` field is stepped by the same kernel in both passes, since marching
-    the adjoint backwards is what transposes the damped recursion.
+    the adjoint backwards is what transposes the damped recursion. A `sim.pml` is
+    stepped by its exact transpose, and its layer is taken as frozen material.
 
     Returns:
         (cost, {"mass": ..., "stiff": ...}, traces, info), the gradients fields over
-        the padded grid, `traces` the (N, num_sensors) record the cost was read from,
-        and `info` empty; this variant has nothing to report.
+        the padded grid, zeroed in a pml layer, `traces` the (N, num_sensors) record
+        the cost was read from, and `info` empty; this variant has nothing to report.
     """
     require_interior(sim, sensors, "sensor")
     require_interior(sim, source.position, "source")
@@ -252,7 +377,7 @@ def sensitivity(
             bc_step(p)
 
         march(sim.N, backward, [Window(signal), Window(V[::-1])])
-        return cost, sim.finalize_gradients(grads, sens_kernels), um, {}
+        return cost, frozen(sim, sim.finalize_gradients(grads, sens_kernels)), um, {}
 
     adjoint_step = sim.define_adjoint_step(kernels, sens_kernels, mat)
     gradient_step = sim.define_gradient(sens_kernels, mat, grads)
@@ -268,7 +393,7 @@ def sensitivity(
 
     march(sim.N, backward, [Window(signal), Window(V[::-1], halo=2)])
 
-    return cost, sim.finalize_gradients(grads, sens_kernels), um, {}
+    return cost, frozen(sim, sim.finalize_gradients(grads, sens_kernels)), um, {}
 
 
 def reconstruction_sensitivity(
@@ -277,6 +402,7 @@ def reconstruction_sensitivity(
     indicator: cpt.NDArray,
     sensors: cpt.NDArray[cp.int32],
     objective: Callable,
+    strip_dtype: str | None = None,
 ) -> tuple[float, dict[str, cpt.NDArray], cpt.NDArray, dict]:
     """Cost and its gradients as `sensitivity`, storing a boundary strip and not the field.
 
@@ -295,6 +421,10 @@ def reconstruction_sensitivity(
         indicator: the design field the materials are built from.
         sensors: (ndim, num_sensors) interior grid indices.
         objective: takes the (N, num_sensors) record, returns (cost, dcost/dtraces).
+        strip_dtype: store the strip narrower than `sim`, halving the memory that
+            grows with N at the price of the exact transpose: "float32" under a float64
+            sim, or "bfloat16" under either. None keeps it exact. As fdtdx stores its
+            boundary record (Mahlau et al. 2026, https://doi.org/10.21105/joss.08912).
 
     Returns:
         (cost, {"mass": ..., "stiff": ...}, traces, info) as `sensitivity`, the
@@ -307,6 +437,12 @@ def reconstruction_sensitivity(
     strip, valid = reconstruction_nodes(sim)
     require_reconstructable(sim, valid)
     num_strip = strip.shape[1]
+    stored = STRIP_DTYPES.get((strip_dtype, sim.precision), sim.dtype)
+    if strip_dtype is not None and stored == sim.dtype:
+        raise ValueError(
+            f"strip_dtype {strip_dtype!r} is not narrower than {sim.precision}: "
+            f"use 'bfloat16', or 'float32' under float64"
+        )
 
     mat = sim.build_materials(indicator)
     kernels = compile_kernels(sim)
@@ -326,10 +462,10 @@ def reconstruction_sensitivity(
     U = cp.zeros((3, *sim.field_shape), dtype=sim.dtype)
     um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
     # two leading zero rows, so row t + 2 is u^t and the initial states need no branch
-    strip_store = cp.zeros((sim.N + 2, num_strip), dtype=sim.dtype)
+    strip_store = cp.zeros((sim.N + 2, num_strip), dtype=stored)
     windows = [Window(source.signal), Window(um, store=True)]
     if num_strip:
-        windows.append(Window(strip_store[2:], store=True))
+        windows.append(Window(strip_store[2:], store=True, dtype=sim.dtype))
 
 # ------------------------------------ forward pass -----------------------------------
     def forward(t, signal, um, strip=None):
@@ -377,7 +513,7 @@ def reconstruction_sensitivity(
     # row m of each is row n - 1 forwards, contiguous since the kernels index by row
     windows = [Window(signal), Window(source.signal[sim.N - 2 :: -1].copy())]
     if num_strip:
-        windows.append(Window(strip_store[sim.N - 2 :: -1].copy()))
+        windows.append(Window(strip_store[sim.N - 2 :: -1].copy(), dtype=sim.dtype))
     march(sim.N - 1, backward, windows)
     adjoint(sim.N - 1, signal)
     a = triplet(sim.N - 1)[0]
@@ -531,6 +667,162 @@ def superposition_sensitivity(
         field *= norm
     info = {"scale": scale, "cancellation": cancellation}
     return cost, accs, um, info
+
+
+def spectral_sensitivity(
+    sim: Simulation,
+    source: Source,
+    indicator: cpt.NDArray,
+    sensors: cpt.NDArray[cp.int32],
+    objective: Callable,
+    frequencies: npt.ArrayLike,
+    region: cpt.NDArray[cp.bool_] | None = None,
+) -> tuple[float, dict[str, cpt.NDArray], cpt.NDArray, dict]:
+    """Cost and its gradients as `sensitivity`, for a cost read off the record's spectrum.
+
+    A cost that sees the traces only through their DFT at `frequencies` (`intensity`)
+    has a gradient pairing the forward and adjoint fields at those frequencies alone,
+    so both passes run forwards in time and keep a running DFT instead of a history.
+    The adjoint is driven by a decaying pulse carrying the same spectral load, which a
+    damped operator allows, so this is the variant for an open domain whose cost is
+    spectral. It is exact once both runs have decayed; `info["decay"]` measures how far
+    they have. Adapted from fdtdx (Mahlau et al. 2026,
+    https://doi.org/10.21105/joss.08912) and the Meep adjoint (Hammond et al. 2022,
+    https://doi.org/10.1364/OE.442074); docs/sensitivity.md derives it.
+
+    Args:
+        sim: the simulation both passes step, damped or lossless.
+        source: the shot to differentiate, its position interior nodes only.
+        indicator: the design field the materials are built from.
+        sensors: (ndim, num_sensors) interior grid indices.
+        objective: takes the (N, num_sensors) record, returns (cost, dcost/dtraces),
+            the derivative a sum of sinusoids at `frequencies`.
+        frequencies: the frequencies the cost reads, one adjoint run each.
+        region: nodal mask of where the gradient is wanted, or None for everywhere.
+            The DFT is only kept around it, which on a small design region makes it
+            nearly free.
+
+    Returns:
+        (cost, {"mass": ..., "stiff": ...}, traces, info) as `sensitivity`, the
+        gradients zeroed outside `region`, and `info` carrying the `decay` both runs
+        left and the `fit` residual of the spectral load.
+    """
+    require_interior(sim, sensors, "sensor")
+    require_interior(sim, source.position, "source")
+    require_full_domain(sim)
+    frequencies = np.atleast_1d(np.asarray(frequencies, dtype=np.float64))
+
+    logical = cp.zeros(sim.Nx_padded, dtype=cp.bool_)
+    logical[tuple(slice(0, n) for n in sim.Nx)] = True
+    if region is None:
+        region = logical
+    # the gradient at a node reads its neighbours, ghosts included, so the DFT does too
+    square = ndi.generate_binary_structure(sim.ndim, sim.ndim)
+    kept = ndi.binary_dilation(
+        region, structure=square, iterations=sim.reach + 1, brute_force=True
+    )
+    nodes = cp.stack(cp.nonzero(kept & logical)).astype(cp.int32)
+    nodes = with_components(sim, nodes)
+    lin_index = flatten_indices(sim, nodes)
+
+    mat = sim.build_materials(indicator)
+    kernels = compile_kernels(sim)
+    sens_kernels = compile_kernels(sim, sim.sensitivity_path)
+
+    fd_step = sim.define_step(kernels, mat)
+    bc_step = define_boundary(sim, kernels)
+    excitation_step = define_excitation(sim, source.position, kernels, mat)
+    adjoint_excitation = define_excitation(sim, sensors, kernels, mat)
+    get_signal = define_get_signal(sim, sensors, kernels)
+    grads = sim.gradient_fields(mat)
+    gradient_step = sim.define_gradient(sens_kernels, mat, grads)
+
+    host_table = phase_table(sim, frequencies)
+    period = math.ceil(1.0 / (float(frequencies.min()) * sim.dt))
+    # the same factors again over the last period alone, for how far the run settled
+    tail = host_table.copy()
+    tail[: sim.N - period] = 0.0
+    table = cp.asarray(np.concatenate((host_table, tail), axis=1), dtype=sim.dtype)
+    F = len(frequencies)
+    u_hat = cp.zeros((4 * F, nodes.shape[1]), dtype=sim.dtype)
+    forward_dft = define_dft(sim, nodes, kernels, u_hat)
+    U = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
+    um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
+
+# ------------------------------------ forward pass -----------------------------------
+    def forward(t, signal, um, table):
+        u = fd_step(U[t % 2], U[1 - t % 2], U[t % 2])
+        excitation_step(u, signal, t)
+        bc_step(u)
+        get_signal(u, um, t)
+        forward_dft(u, table, t)
+
+    windows = [Window(source.signal), Window(um, store=True), Window(table)]
+    march(sim.N, forward, windows)
+    u_last = U[(sim.N - 1) % 2].ravel()[lin_index].astype(cp.float64)
+
+    cost, dphi = objective(um)
+
+# --------------------------------- adjoint excitation --------------------------------
+    load, fit = spectral_load(sim, dphi, host_table)
+    if fit > FIT_LIMIT[sim.precision]:
+        raise ValueError(
+            f"dcost/dtraces is off the sinusoids at {frequencies} by {fit:.1e}: "
+            f"the cost is not spectral there, use sensitivity"
+        )
+    weights = cp.asnumpy(sim.adjoint_weights(sensors)).astype(np.float64)
+
+# ----------------------------------- backward pass -----------------------------------
+    # each frequency drives a causal run, whose DFT is the adjoint at that frequency
+    lam_hat = cp.zeros((4, nodes.shape[1]), dtype=sim.dtype)
+    adjoint_dft = define_dft(sim, nodes, kernels, lam_hat)
+    fields = cp.zeros((4, *sim.field_shape), dtype=sim.dtype)
+    decay = 0.0
+
+    def adjoint(t, signal, table):
+        p = adjoint_step(U[t % 2], U[1 - t % 2], U[t % 2])
+        adjoint_excitation(p, signal, t)
+        bc_step(p)
+        adjoint_dft(p, table, t)
+
+    for f, frequency in enumerate(frequencies):
+        signal = spectral_pulse(sim, frequency, load[f]) / weights
+        signal = cp.ascontiguousarray(cp.asarray(signal, dtype=sim.dtype))
+        U[:] = 0.0
+        lam_hat[:] = 0.0
+        # defined per run, so a pml's memory starts from rest each time
+        adjoint_step = sim.define_adjoint_step(kernels, sens_kernels, mat)
+        columns = [2 * f, 2 * f + 1, 2 * F + 2 * f, 2 * F + 2 * f + 1]
+        march(sim.N, adjoint, [Window(signal), Window(table[:, columns].copy())])
+        lam_last = U[(sim.N - 1) % 2].ravel()[lin_index].astype(cp.float64)
+
+        spectrum, share = spectra(sim, u_hat[columns], u_last, frequency, period)
+        adjoint_hat, adjoint_share = spectra(sim, lam_hat, lam_last, frequency, period)
+        decay = max(decay, share, adjoint_share)
+        # lambda^t pairs with (u^(t - 2), u^(t - 1), u^t), so the triplet is z^-2, z^-1, 1
+        shift = np.exp(-2j * np.pi * frequency * sim.dt)
+        triplet = (spectrum * shift**2, spectrum * shift, spectrum)
+        # Re(a b) = Re a Re b - Im a Im b, the two halves of the bilinear form
+        for part, sign in ((cp.real, 1.0), (cp.imag, -1.0)):
+            for k, value in enumerate((*triplet, sign * adjoint_hat)):
+                fields[k].ravel()[lin_index] = part(value)
+            gradient_step(*fields)
+
+    grads = frozen(sim, sim.finalize_gradients(grads, sens_kernels))
+    # assigned, not multiplied, so a NaN outside cannot survive as 0 * NaN
+    outside = ~region
+    for field in grads.values():
+        field[..., outside] = 0.0
+    if decay > DECAY_LIMIT:
+        warnings.warn(
+            f"the last period still adds more than {DECAY_LIMIT:.0e} of the spectrum: "
+            f"the gradient misses the tail the run cut off (info['decay'] says how "
+            f"much). Lengthen the run or damp the faces.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    info = {"decay": decay, "fit": fit}
+    return cost, grads, um, info
 
 
 def source_sensitivity(

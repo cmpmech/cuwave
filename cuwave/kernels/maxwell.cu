@@ -70,6 +70,78 @@ __device__ __forceinline__ real_t pair_weight(const int k, const int l,
   return w;
 }
 
+// ------------------------------------- pml helpers
+// the curl row of the pair (c, e), counted from the first pair
+__device__ __forceinline__ int curl_row(const int c, const int e) {
+  return PAIR_ROW(min(c, e), max(c, e)) - NDIM;
+}
+
+// curl (c, e) j nodes along axis e from a node, what component c diverges
+struct Curl {
+  const real_t *__restrict__ p;
+  int idx, cs, step, e;
+  __device__ real_t operator()(const int c, const int j) const {
+    return p[curl_row(c, e) * cs + idx + j * step];
+  }
+};
+
+// the signed d E_k / d x_e at the pair point (k, e), as curl_component takes it
+template <class F>
+__device__ __forceinline__ real_t curl_term(const F &u, const int k,
+                                            const int e, const int *A,
+                                            const int *NN, const real_t fe) {
+  if (k == e || A[k] > NN[k] - 3 || A[e] > NN[e] - 3)
+    return (real_t)0; // no pair point there
+  const int r = rad_half(A[e], NN[e]);
+  real_t acc = (real_t)0;
+#pragma unroll
+  for (int j = 1; j <= STENCIL_RADIUS; ++j)
+    if (j <= r)
+      acc += SG_W(r, j) * (u(k, j) - u(k, -(j - 1)));
+  return (k < e ? -fe : fe) * acc; // the first term of the pair is negated
+}
+
+// the axis-e part of the force on component c, as fd_kernel takes it
+template <class F>
+__device__ __forceinline__ real_t divergence_term(const F &h, const int c,
+                                                  const int e, const int *A,
+                                                  const int *NN,
+                                                  const real_t fe) {
+  real_t acc = (real_t)0;
+#pragma unroll
+  for (int j = 1; j <= STENCIL_RADIUS; ++j) {
+    const int ap = A[e] + j - 1;
+    const int rp = (ap <= NN[e] - 3) ? rad_half(ap, NN[e]) : 0;
+    if (j <= rp)
+      acc += SG_W(rp, j) * h(c, j - 1);
+    const int am = A[e] - j, rm = (am >= 1) ? rad_half(am, NN[e]) : 0;
+    if (j <= rm)
+      acc -= SG_W(rm, j) * h(c, -j);
+  }
+  return (e < c ? fe : -fe) * acc;
+}
+
+// nu times the curl terms t of axis e, added onto the pair points
+__device__ __forceinline__ void add_curl(real_t *__restrict__ h,
+#ifdef USE_MAGNETIC
+                                         const real_t *__restrict__ nu_pair,
+#endif
+                                         const real_t nu, const int idx,
+                                         const int cs, const int e,
+                                         const real_t *t, const int *A,
+                                         const int *NN) {
+#pragma unroll
+  for (int k = 0; k < NDIM; ++k)
+    if (k != e && A[k] <= NN[k] - 3 && A[e] <= NN[e] - 3) {
+      const int p = curl_row(k, e);
+#ifdef USE_MAGNETIC
+      h[p * cs + idx] += nu_pair[p * cs + idx] * t[k];
+#else
+      h[p * cs + idx] += nu * pair_weight(min(k, e), max(k, e), A, NN) * t[k];
+#endif
+    }
+}
+
 // -------------------------------------- kernels
 extern "C" {
 
@@ -148,6 +220,147 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
 #else
     u2[n] = -u0[n] + 2.f * u1[n] + mi * force;
 #endif
+  }
+}
+
+// ------------------------------------------------------------------------------------
+__global__ void pml_curl_kernel(const real_t *__restrict__ u1,
+                                real_t *__restrict__ h,
+#ifdef USE_MAGNETIC
+                                const real_t *__restrict__ nu_pair,
+#endif
+                                const real_t nu, const int cs,
+                                real_t *__restrict__ aux,
+                                const real_t *__restrict__ profile, const int e,
+                                const int lo, const int hi, AXIS_PARAMS) {
+  PML_AXES;
+  SLAB_OR_RETURN(0);
+  const Field u = {u1, idx, cs, S[e]};
+  real_t psi[NDIM];
+#pragma unroll
+  for (int k = 0; k < NDIM; ++k) {
+    const int at = 2 * NN[e] + a; // every pair point sits half a node up e
+    psi[k] = profile[NN[e] + at] * aux[k * size + t] +
+             profile[at] * curl_term(u, k, e, A, NN, F[e]);
+    aux[k * size + t] = psi[k];
+  }
+  add_curl(h,
+#ifdef USE_MAGNETIC
+           nu_pair,
+#endif
+           nu, idx, cs, e, psi, A, NN);
+}
+
+// ------------------------------------------------------------------------------------
+__global__ void
+pml_force_kernel(const real_t *__restrict__ u1, real_t *__restrict__ u2,
+                 const real_t *__restrict__ h, const real_t *__restrict__ minv,
+                 const int cs, real_t *__restrict__ aux,
+                 const real_t *__restrict__ profile, const int e, const int lo,
+                 const int hi, AXIS_PARAMS) {
+  // u1 unread: the adjoint's signature, so one launch list serves both
+  PML_AXES;
+  SLAB_OR_RETURN(0);
+  const Curl curl = {h, idx, cs, S[e], e};
+#pragma unroll
+  for (int c = 0; c < NDIM; ++c) {
+    if (c == e || A[c] > NN[c] - 3)
+      continue; // no axis-e curl on its own component, no unknown on a ghost
+    real_t *z = aux + (NDIM + c) * size + t; // E_c sits on the node along e
+    *z = profile[NN[e] + a] * *z +
+         profile[a] * divergence_term(curl, c, e, A, NN, F[e]);
+    u2[c * cs + idx] += minv[c * cs + idx] * *z;
+  }
+}
+
+// ------------------------------------------------------------------------------------
+__global__ void pml_adjoint_curl_kernel(const real_t *__restrict__ l1,
+                                        real_t *__restrict__ h,
+#ifdef USE_MAGNETIC
+                                        const real_t *__restrict__ nu_pair,
+#endif
+                                        const real_t nu, const int cs,
+                                        const real_t *__restrict__ aux,
+                                        const real_t *__restrict__ profile,
+                                        const int e, const int lo, const int hi,
+                                        AXIS_PARAMS) {
+  PML_AXES;
+  SLAB_OR_RETURN(STENCIL_RADIUS);
+  // the force memory pushed back through the curl: the force's transpose
+  const Memory<Field> m = {{l1, idx, cs, S[e]},
+                           aux,
+                           profile,
+                           NN,
+                           size,
+                           NDIM,
+                           a,
+                           off,
+                           e,
+                           lo,
+                           hi,
+                           plane,
+                           true};
+  real_t q[NDIM];
+#pragma unroll
+  for (int k = 0; k < NDIM; ++k)
+    q[k] = curl_term(m, k, e, A, NN, F[e]);
+  add_curl(h,
+#ifdef USE_MAGNETIC
+           nu_pair,
+#endif
+           nu, idx, cs, e, q, A, NN);
+}
+
+// ------------------------------------------------------------------------------------
+__global__ void pml_adjoint_force_kernel(
+    const real_t *__restrict__ l1, real_t *__restrict__ l2,
+    const real_t *__restrict__ h, const real_t *__restrict__ minv, const int cs,
+    real_t *__restrict__ aux, const real_t *__restrict__ profile, const int e,
+    const int lo, const int hi, AXIS_PARAMS) {
+  PML_AXES;
+  SLAB_OR_RETURN(STENCIL_RADIUS);
+  // the curl memory pushed back through the force: the curl's transpose
+  const Memory<Curl> m = {{h, idx, cs, S[e], e},
+                          aux,
+                          profile,
+                          NN,
+                          size,
+                          0,
+                          a,
+                          off,
+                          e,
+                          lo,
+                          hi,
+                          plane,
+                          false};
+#pragma unroll
+  for (int c = 0; c < NDIM; ++c) {
+    if (c == e || A[c] > NN[c] - 3)
+      continue;
+    const int n = c * cs + idx;
+    l2[n] += minv[n] * divergence_term(m, c, e, A, NN, F[e]);
+    if (t >= 0) { // the force memory, read by the curl pass before
+      real_t *z = aux + (NDIM + c) * size + t;
+      *z = profile[NN[e] + a] * (*z + l1[n]);
+    }
+  }
+}
+
+// ------------------------------------------------------------------------------------
+__global__ void pml_adjoint_memory_kernel(const real_t *__restrict__ h,
+                                          const int cs,
+                                          real_t *__restrict__ aux,
+                                          const real_t *__restrict__ profile,
+                                          const int e, const int lo,
+                                          const int hi, AXIS_PARAMS) {
+  PML_AXES;
+  SLAB_OR_RETURN(0);
+#pragma unroll
+  for (int k = 0; k < NDIM; ++k) {
+    if (k == e)
+      continue;
+    real_t *m = aux + k * size + t;
+    *m = profile[3 * NN[e] + a] * (*m + h[curl_row(k, e) * cs + idx]);
   }
 }
 

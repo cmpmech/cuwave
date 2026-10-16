@@ -4,11 +4,11 @@
 
 An optimization is set up as follows:
 1. define the forward problem with [maxwell](maxwell.md), `ElectricWave` or `MagneticWave` depending on the polarization, its indicator $\gamma$ interpolating between air and silicon
-2. open the domain with `pad_for_sponge` and `sponge` ([boundary](boundary.md)), which for Maxwell is a real conductivity rather than an absorbing fiction
+2. open the domain with `pad_for_sponge` and a `Pml` ([boundary](boundary.md)), or a `sponge`, which for Maxwell is a real conductivity rather than an absorbing fiction
 3. mark the design region with `box` and the ports with `nodes` ([geometry](geometry.md))
 4. build the objective with `intensity` ([utils](utils.md)), one broadband `ricker` run scoring every design wavelength at once
 5. map the design variables through a `DensityFilter` and a `Projection` ([regularization](regularization.md))
-6. iterate `response_gradient` with `reconstruction_sensitivity` and one `Adam` step, sharpening the projection on a continuation schedule
+6. iterate `response_gradient` with `spectral_sensitivity` on the design region and one `Adam` step, sharpening the projection on a continuation schedule
 7. snap the final design to 0/1 with `threshold` and re-simulate it to report what it achieves
 
 ## the figure of merit
@@ -37,6 +37,6 @@ The tutorial reaches a discrete design a second way, by adding an imaginary part
 
 ## what the layer costs
 
-The sponge is a lossy layer and not a perfectly matched one. Around $-28$ dB of amplitude reflection is what two wavelengths of it buy at a well-tuned `beta`, and that is against a plane wave: a **guided mode running into the layer** is terminated considerably worse, so a waveguide device wants three wavelengths of layer and its guides run on through it rather than stopping at the boundary. This is the largest single obstacle to matching the tutorial's transmittances, larger than anything about the discretization, and a perfectly matched layer is the fix rather than a thicker sponge
+The driver lines every face with a half-wavelength `Pml`. A sponge is a lossy layer and not a perfectly matched one: two wavelengths of it at a well-tuned `beta` still return a few percent of a plane wave, and a **guided mode running into it** is terminated considerably worse, which is the largest single obstacle to matching the tutorial's transmittances. The matched layer leaves less behind at a quarter of that thickness and terminates a guide as well as a plane wave, as long as the guide runs on through it rather than stopping at the boundary, and the thinner layer is grid the run no longer carries
 
-Because the layer is lossy, the domain is not reversible and `superposition_sensitivity` refuses it, so the driver uses `reconstruction_sensitivity` ([sensitivity](sensitivity.md)) and print the `drift` its reverse march reports. A full history would be several gigabytes at these step counts, where the strip is tens of megabytes
+Because the layer absorbs, the domain is not reversible and `superposition_sensitivity` refuses it. The cost is spectral, though, so the driver uses `spectral_sensitivity` ([sensitivity](sensitivity.md)), which keeps the DFT of both runs over the design region instead of any history and prints the `decay` that says how far they settled; `reconstruction_sensitivity` is the drop-in alternative for a cost that is not spectral, at the price of a reverse march and a strip. The run is longer than the transform alone needs, since a resonant lens rings past its pulse and the warning past `DECAY_LIMIT` is the cue to lengthen it

@@ -10,10 +10,20 @@ together. And the design enters `ElectricWave` through the inertia but `Magnetic
 through the stiffness, so only the first keeps its gradient in the interior above
 `space_order` 2 (the wide wall closure spoils it only next to a wall): the wide-stencil
 gradient is pinned for one, away from the walls, and deliberately not for the other.
+
+Independently of all of that, fdtdx (Mahlau et al. 2026, an E/H Yee leapfrog) is rerun
+here from its stored probe traces: eliminating H from Yee's scheme gives exactly this
+curl-curl recursion, so wherever both codes place the permittivity alike the traces
+agree at round-off, and where they do not (the 3D component mean, the TE cell mean)
+the gap is pinned to the placement alone. `spectral_sensitivity` is pinned to the stored
+gradient on a damped domain, where both of its runs decay.
 """
 
 import math
 import unittest
+from dataclasses import replace
+from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -25,7 +35,14 @@ except Exception:
     HAS_CUDA = False
 
 if HAS_CUDA:
-    from cuwave.boundary import Conductor, Magnetic, Traction
+    from cuwave.boundary import (
+        Conductor,
+        Dirichlet,
+        Magnetic,
+        Neumann,
+        Pml,
+        Traction,
+    )
     from cuwave.geometry import box
     from cuwave.maxwell import (
         DielectricWave,
@@ -37,18 +54,22 @@ if HAS_CUDA:
     from cuwave.sensitivity import (
         reconstruction_sensitivity,
         sensitivity,
+        spectral_sensitivity,
         superposition_sensitivity,
     )
     from cuwave.signals import ricker
     from cuwave.stencils import staggered_weights
     from cuwave.utils import Sensors, intensity, point_source, response_gradient
     from cuwave.wave import (
+        Source,
         compile_kernels,
+        flatten_indices,
         grid_coords,
         simulate,
         stable_dt,
     )
 
+REFERENCE = Path(__file__).parent / "reference"
 INDEX = 3.48
 EPS1, EPS2, MU = 1.0, INDEX**2, 1.0
 THREADS = {1: (128,), 2: (8, 8)}
@@ -444,6 +465,28 @@ class VectorMaxwellTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _vector((16, 16), boundary=Traction)
 
+    def test_a_long_run_decays_behind_either_wall(self):
+        for wall in (Conductor, Magnetic):
+            with self.subTest(wall=wall):
+                sim = _vector((60, 60), N=16000, space_order=4, boundary=wall)
+                sim = replace(sim, pml=Pml(12, 1.0, frequency=1.0, faces=(0, 1, 3)))
+                t = np.arange(sim.N) * sim.dt
+                # a second difference has both moments zero, so no charge is left behind
+                pulse = np.diff(np.exp(-((t - 1.0) * 6.0) ** 2), 2, prepend=0, append=0)
+                signal = cp.asarray(pulse[:, None] / sim.dt**2, dtype=sim.dtype)
+                source = Source(cp.array([[1], [30], [30]], dtype=cp.int32), signal)
+                rng = np.random.default_rng(1)
+                indicator = cp.asarray(rng.random(sim.Nx_padded), dtype=sim.dtype)
+                sensors = cp.array([[0, 1], [30, 14], [14, 30]], dtype=cp.int32)
+                um = cp.abs(simulate(sim, source, indicator, sensors)[1])
+                windows = [float(w.max()) for w in cp.split(um, 8)]
+                self.assertLess(windows[-1], 1e-4 * windows[0])
+                self.assertLess(windows[-1], windows[-2])
+
+    def test_an_unshifted_layer_is_refused(self):
+        with self.assertRaises(ValueError):
+            _vector((40, 40), pml=Pml(6, 1.0))
+
 
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class VectorGradientTest(unittest.TestCase):
@@ -459,9 +502,9 @@ class VectorGradientTest(unittest.TestCase):
         indicator = cp.asarray(rng.random(sim.Nx_padded), dtype=sim.dtype)
         return source, receivers, objective, indicator
 
-    def _check(self, Nx, space_order, adjoint=None, cls=None, tolerance=1e-4):
+    def _check(self, Nx, space_order, adjoint=None, cls=None, tolerance=1e-4, **kw):
         adjoint = sensitivity if adjoint is None else adjoint
-        sim = _vector(Nx, space_order=space_order, cls=cls)
+        sim = _vector(Nx, space_order=space_order, cls=cls, **kw)
         source, receivers, objective, indicator = self._problem(sim)
         rng = np.random.default_rng(7)
 
@@ -494,6 +537,11 @@ class VectorGradientTest(unittest.TestCase):
         self._check((26, 28), 2, cls=MagnetodielectricWave)
         self._check((16, 18, 20), 2, cls=MagnetodielectricWave)
 
+    def test_a_designed_permeability_matches_finite_differences_through_a_pml(self):
+        layer = Pml(4, 1.0 / math.sqrt(EPS1 * MU), frequency=1.0)
+        self._check((26, 28), 2, cls=MagnetodielectricWave, pml=layer)
+        self._check((16, 18, 20), 2, cls=MagnetodielectricWave, pml=layer)
+
     def test_superposition_agrees_in_direction(self):
         sim = _vector((24, 26), N=60)
         source, receivers, objective, indicator = self._problem(sim)
@@ -509,6 +557,119 @@ class VectorGradientTest(unittest.TestCase):
             float(cp.linalg.norm(total)) * float(cp.linalg.norm(truth))
         )
         self.assertGreater(cosine, 0.98)
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class SpectralTest(unittest.TestCase):
+    frequencies = (6.0, 10.0)
+
+    def _check(self, sim, beta=0.02):
+        rng = np.random.default_rng(3)
+        t = np.arange(sim.N) * sim.dt
+        indicator = cp.asarray(rng.random(sim.Nx_padded), dtype=sim.dtype)
+        minv = sim.inverse_inertia(indicator)
+        sim = replace(sim, damping=(2.0 * beta / sim.dt / minv).astype(sim.dtype))
+        direction = None if sim.ncomp == 1 else [0.0, 1.0] + [0.0] * (sim.ndim - 2)
+        source = point_source(sim, [[0.35] * sim.ndim], ricker(t, 1.0, 8.0), direction)
+        receivers = Sensors(sim, [[0.6] * sim.ndim], direction)
+        objective = receivers.objective(intensity(sim, self.frequencies))
+        args = (sim, source, indicator, receivers.nodes, objective)
+        _, reference, _, _ = sensitivity(*args)
+        _, grads, _, info = spectral_sensitivity(*args, self.frequencies)
+        d_mass, d_stiff = sim.parametrization_jacobian(indicator)
+        truth = d_mass * reference["mass"] + d_stiff * reference["stiff"]
+        found = d_mass * grads["mass"] + d_stiff * grads["stiff"]
+        rel = float(cp.linalg.norm(found - truth) / cp.linalg.norm(truth))
+        self.assertLess(info["decay"], 1e-5)
+        self.assertLess(rel, 1e-5, f"difference {rel:.3e}")
+
+    def test_the_reductions_match_the_stored_gradient(self):
+        for cls in (ElectricWave, MagneticWave):
+            for order in (2, 4):
+                with self.subTest(cls=cls.__name__, order=order):
+                    self._check(_sim(cls, (28, 30), N=1400, space_order=order))
+
+    def test_the_vector_field_matches_the_stored_gradient(self):
+        for Nx, cls in (
+            ((26, 28), None),
+            ((16, 18, 20), None),
+            ((26, 28), MagnetodielectricWave),
+        ):
+            with self.subTest(grid=Nx, cls=cls):
+                self._check(_vector(Nx, N=1400, cls=cls))
+
+
+def _fdtdx(name):
+    """Rerun fdtdx reference `name` here: (our probe traces, fdtdx's), same grid and dt."""
+    ref = np.load(REFERENCE / f"fdtdx_{name}.npz")
+    shape = tuple(int(n) for n in ref["shape"])
+    ndim, S = len(shape), float(ref["courant"])
+    cls, wall, row = {
+        "tm2D": (ElectricWave, Dirichlet, []),
+        "te2D": (MagneticWave, Neumann, []),
+        "vector3D": (DielectricWave, Conductor, [2]),
+    }[name.split("_")[0]]
+    # fdtdx cell i is node i + 1, so the ghost ring wraps the conductor faces
+    sim = cls(
+        tuple(n + 2 for n in shape),
+        (1.0,) * ndim,
+        len(ref["amplitude"]),
+        S,
+        (8, 32) if ndim == 2 else (2, 8, 32),
+        precision="float64",
+        permittivity1=1.0,
+        permittivity2=float(ref["permittivity"]),
+        boundary=((wall, wall),) * ndim,
+    )
+    indicator = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
+    if ref["block_low"].size:
+        low, size = ref["block_low"] + 1, ref["block_size"]
+        indicator[tuple(slice(lo, lo + n) for lo, n in zip(low, size))] = 1.0
+    q = -S * ref["amplitude"]
+    source = np.array(ref["source"]) + 1
+    if cls is MagneticWave:
+        below = source - np.eye(ndim, dtype=int)[1]
+        nodes, loads = [source, below], [-S * q, S * q]
+    else:
+        nodes, loads = [source], [np.diff(q, prepend=0.0)]
+    position = cp.asarray(
+        [row * len(nodes)] * len(row) + np.array(nodes).T.tolist(), dtype=cp.int32
+    )
+    mat = sim.build_materials(indicator)
+    weight = cp.asnumpy(sim.excitation_weights(mat, flatten_indices(sim, position)))
+    signal = cp.asarray(np.stack(loads, axis=1) / weight, dtype=sim.dtype)
+    probes = ref["probes"].T + 1
+    probes = cp.asarray(
+        [row * probes.shape[1]] * len(row) + probes.tolist(), dtype=cp.int32
+    )
+    traces = simulate(sim, Source(position, signal), indicator, sensors=probes)[1]
+    return cp.asnumpy(traces), ref["traces"]
+
+
+def _gap(name):
+    ours, theirs = _fdtdx(name)
+    return float(np.linalg.norm(ours - theirs) / np.linalg.norm(theirs))
+
+
+@unittest.skipUnless(
+    HAS_CUDA and REFERENCE.is_dir(), "needs a CUDA device and tests/reference"
+)
+class FdtdxReferenceTest(unittest.TestCase):
+    def test_a_shared_placement_reproduces_fdtdx_at_round_off(self):
+        for name in ("tm2D_vacuum", "tm2D_block", "te2D_vacuum", "vector3D_vacuum"):
+            with self.subTest(case=name):
+                self.assertLess(_gap(name), 1e-12)
+
+    def test_a_staircased_permittivity_closes_the_3D_gap(self):
+        # fdtdx gives a component the voxel below it, which is no averaging at all
+        self.assertLess(_gap("vector3D_block"), 1e-3)
+        with mock.patch("cuwave.maxwell.point_harmonic", lambda sim, field, c: field):
+            self.assertLess(_gap("vector3D_block"), 1e-12)
+
+    def test_the_te_placement_gap_closes_under_refinement(self):
+        coarse, fine = _gap("te2D_block"), _gap("te2D_block_fine")
+        self.assertLess(coarse, 5e-3)
+        self.assertLess(fine, 0.5 * coarse)
 
 
 if __name__ == "__main__":

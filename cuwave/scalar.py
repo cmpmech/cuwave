@@ -19,12 +19,14 @@ import numpy as np
 
 from .boundary import Dirichlet, Neumann, face_mask
 from .wave import (
+    PML_THREADS,
     Simulation,
     apply_cell_weights,
     axis_geometry,
     grid_block,
     mirror_ghosts,
     sensor_cell_weights,
+    slab_grid,
 )
 
 KERNEL_PATH = Path(__file__).parent / "kernels" / "scalar.cu"
@@ -55,6 +57,7 @@ class PressureWave(Simulation):
 
     derive_inertia = False  # set where m == k (rho scaling): minv derived from stiff
     accepts_domain = True
+    accepts_pml = True
 
     @property
     def streams(self) -> bool:
@@ -76,9 +79,23 @@ class PressureWave(Simulation):
         return flags + ("-DUSE_STREAM", f"-DSTREAM_TX={self.threads[-1]}")
 
     def define_step(self, kernels: cp.RawModule, mat: dict) -> Callable:
-        """Closure launching the step, streamed along axis 0 unless a mask tiles it."""
-        if not self.streams:
-            return super().define_step(kernels, mat)
+        """Closure launching the step, streamed along axis 0 unless a mask tiles it, then the pml."""
+        if self.streams:
+            step = self.define_streamed_step(kernels, mat)
+        else:
+            step = super().define_step(kernels, mat)
+        if self.pml is None:
+            return step
+        pml_step = self.define_pml(kernels, mat)
+
+        def fd_step(u0, u1, u2):
+            step(u0, u1, u2)
+            return pml_step(u1, u2)
+
+        return fd_step
+
+    def define_streamed_step(self, kernels: cp.RawModule, mat: dict) -> Callable:
+        """Closure launching the step streamed along axis 0, a block marching rows of it."""
         fd_kernel = kernels.get_function("fd_kernel")
         # a block marches CHUNK_ROWS of axis 0 under its tile of axis 1
         block = (self.threads[-1],)
@@ -110,7 +127,70 @@ class PressureWave(Simulation):
             adjoint_kernel(grid, block, args)
             return l2
 
-        return adjoint_step
+        if self.pml is None:
+            return adjoint_step
+        pml_step = self.define_adjoint_pml(sens_kernels, mat)
+
+        def pml_adjoint_step(l0, l1, l2):
+            adjoint_step(l0, l1, l2)
+            return pml_step(l1, l2)
+
+        return pml_adjoint_step
+
+    def define_pml(self, kernels: cp.RawModule, mat: dict) -> Callable:
+        """Closure adding the pml memory terms of `u1` into `u2`, one launch per lined axis."""
+        pml_kernel = kernels.get_function("pml_kernel")
+        factors = self.step_factors()
+        launches = []
+        for d, lo, hi, profile, plane in self.pml_slabs():
+            # the three memory variables per slab node: plus cell, minus cell, divergence
+            aux = cp.zeros((3, (lo + hi) * plane), dtype=self.dtype)
+            args = [None, None, *self.step_kernel_args(mat), aux, profile]
+            args += [np.int32(d), np.int32(lo), np.int32(hi), factors[d]]
+            launches.append((slab_grid(lo, hi, plane), args + axis_geometry(self)))
+
+        def pml_step(u1, u2):
+            for grid, args in launches:
+                args[0], args[1] = u1, u2
+                pml_kernel(grid, (PML_THREADS,), args)
+            return u2
+
+        return pml_step
+
+    def define_adjoint_pml(
+        self, kernels: cp.RawModule, mat: dict, grads: dict | None = None
+    ) -> Callable:
+        """Closure adding the transposed pml terms into `l2` from `l1`, and to `grads` if fused."""
+        aux_kernel = kernels.get_function("pml_aux_kernel")
+        adjoint_kernel = kernels.get_function("pml_adjoint_kernel")
+        R = self.space_order // 2
+        factors = self.step_factors()
+        fused = grads is not None
+        launches = []
+        for d, lo, hi, profile, plane in self.pml_slabs():
+            eta = cp.zeros((3, (lo + hi) * plane), dtype=self.dtype)
+            slab = [np.int32(d), np.int32(lo), np.int32(hi), factors[d]]
+            aux_args = [None, mat["stiff"], eta, profile, *slab, *axis_geometry(self)]
+            args = [None, grads["mass"] if fused else None, None]
+            args += [self.dtype(self.adjoint_mass_factor()), np.int32(fused)]
+            args += [*self.step_kernel_args(mat), eta, profile, *slab]
+            args += [face_mask(self, Dirichlet), *axis_geometry(self)]
+            # the transposed taps land up to R nodes past the layer front
+            grids = (slab_grid(lo, hi, plane), slab_grid(lo, hi, plane, R))
+            launches.append((grids, aux_args, args))
+
+        def adjoint_pml_step(l1, l2, u1=None):
+            for (aux_grid, grid), aux_args, args in launches:
+                aux_args[0] = l1
+                aux_kernel(aux_grid, (PML_THREADS,), aux_args)
+                # unfused, the mass slots are never read, so l2 stands in for them
+                args[0], args[2] = l2, l2 if u1 is None else u1
+                if not fused:
+                    args[1] = l2
+                adjoint_kernel(grid, (PML_THREADS,), args)
+            return l2
+
+        return adjoint_pml_step
 
     def build_materials(self, indicator: cpt.NDArray) -> dict:
         """Turn `indicator` into the kernel's material dict, `damping` included."""
@@ -189,7 +269,15 @@ class PressureWave(Simulation):
             adjoint_gradient_kernel(grid, block, args)
             return l0
 
-        return adjoint_gradient_step
+        if self.pml is None:
+            return adjoint_gradient_step
+        pml_step = self.define_adjoint_pml(kernels, mat, grads)
+
+        def pml_adjoint_gradient_step(l0, l1, u1):
+            adjoint_gradient_step(l0, l1, u1)
+            return pml_step(l1, l0, u1)
+
+        return pml_adjoint_gradient_step
 
     def define_superposed(
         self, kernels: cp.RawModule, mat: dict, accs: dict, sign: float

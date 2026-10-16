@@ -5,7 +5,14 @@ point, so the operator must converge at its full order while the cost stays flat
 radius. The operator is `-B^T C B` with matching taps in both kernels, so it must be
 exactly symmetric at every order and boundary mix, which is what all adjoint variants
 rest on. And the staggering shifts every component off the nodes, so sources, sensors
-and the reconstruction strip must all honour the half-node offsets.
+and the reconstruction strip must all honour the half-node offsets. The shear terms
+couple diagonal neighbours, so the strip of a layer lining both axes needs its corners.
+
+`PmlTest` pins the two conditions the elastic pml is only stable under, both refused
+when broken: the CFS shift, without which the cross terms grow a static mode, and a
+clamped wall behind the layer, since a traction wall there holds a growing surface wave.
+Held to both, a long run through a heterogeneous model with a free surface crossing the
+layer has to decay rather than grow.
 """
 
 import unittest
@@ -21,7 +28,7 @@ except Exception:
     HAS_CUDA = False
 
 if HAS_CUDA:
-    from cuwave.boundary import Clamped, Traction, pad_for_sponge, sponge
+    from cuwave.boundary import Clamped, Pml, Traction, pad_for_sponge, sponge
     from cuwave.elastic import ElasticWave
     from cuwave.scalar import ScalarWave
     from cuwave.sensitivity import (
@@ -391,11 +398,11 @@ class VariantTest(unittest.TestCase):
 
     def test_the_sponge_is_reconstructed_exactly_where_it_is_lossless(self):
         # the strip must honour reach = 2r - 1: the strain and divergence taps compound
-        for order in (2, 4):
-            with self.subTest(order=order):
+        for order, faces in ((2, (0, 1)), (4, (0, 1)), (2, None), (4, None)):
+            with self.subTest(order=order, faces=faces):
                 res = 26
                 dx = (1.0 / (res - 3),) * 2
-                Nx, width, _, _ = pad_for_sponge((res, res), dx, 0.15, faces=(0, 1))
+                Nx, width, _, _ = pad_for_sponge((res, res), dx, 0.15, faces=faces)
                 sim = _sim(Nx, N=70, space_order=order)
                 sim = replace(
                     sim,
@@ -404,7 +411,7 @@ class VariantTest(unittest.TestCase):
                         cp.ones(sim.Nx_padded, dtype=sim.dtype),
                         width,
                         0.08,
-                        faces=(0, 1),
+                        faces=faces,
                     ),
                 )
                 args, cost, reference = self._reference(sim)
@@ -435,6 +442,46 @@ class VariantTest(unittest.TestCase):
 
 # ------------------------------- transducers and validation --------------------------
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class PmlTest(unittest.TestCase):
+    FREE_TOP = ((Clamped, Clamped), (Traction, Clamped))
+
+    def test_a_long_run_decays_with_a_free_surface_crossing_the_layer(self):
+        dx = (1.0 / 100,) * 2
+        sim = ElasticWave(
+            (110, 100),
+            dx,
+            16000,
+            0.9 * stable_dt(dx, 1.0, 2),
+            (4, 32),
+            density=1.0,
+            wavespeed_p=1.0,
+            wavespeed_s=0.6,
+            boundary=self.FREE_TOP,
+            pml=Pml(14, 1.0, frequency=8.0, faces=(0, 1, 3)),
+        )
+        t = np.arange(sim.N) * sim.dt
+        signal = cp.asarray(ricker(t, 1.0, 8.0)[:, None], dtype=sim.dtype)
+        source = Source(cp.array([[1], [40], [50]], dtype=cp.int32), signal)
+        rng = np.random.default_rng(1)
+        indicator = cp.asarray(0.5 + rng.random(sim.Nx_padded), dtype=sim.dtype)
+        sensors = cp.array([[0, 1], [50, 50], [50, 50]], dtype=cp.int32)
+        um = cp.abs(simulate(sim, source, indicator, sensors)[1])
+        windows = [float(w.max()) for w in cp.split(um, 8)]
+        self.assertLess(windows[-1], 1e-3 * windows[0])
+        self.assertLess(windows[-1], windows[-2])
+
+    def test_an_unshifted_layer_is_refused(self):
+        with self.assertRaises(ValueError):
+            _sim((40, 40), boundary=Clamped, pml=Pml(6, CP))
+
+    def test_a_traction_wall_behind_the_layer_is_refused(self):
+        with self.assertRaises(ValueError):
+            _sim((40, 40), pml=Pml(6, CP, frequency=2.0))
+        layer = Pml(6, CP, frequency=2.0, faces=(0, 1, 3))
+        _sim((40, 40), boundary=self.FREE_TOP, pml=layer)
+
+
+@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class TransducerTest(unittest.TestCase):
     def test_a_directed_receiver_scatters_as_it_gathers(self):
         sim = _sim((26, 26), N=20)

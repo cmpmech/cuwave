@@ -6,7 +6,11 @@ test takes a step count that leaves a partial tail chunk and compares against
 `CHUNK` patched past `N`, which forces the plain loop. The windows covered are the
 three kinds: a plain input and output (`simulate`), an output with a loaded halo
 (the `sensitivity` history), and reversed contiguous inputs (the strip replay of
-`reconstruction_sensitivity`, with the damping that gives it a strip).
+`reconstruction_sensitivity`, with the damping that gives it a strip). A strip stored
+as bfloat16 is staged on the plain loop as well, so the two still agree bit for bit. A
+pml carries memory the closures own rather than the windows, so it is checked through
+every pass too, forward, fused adjoint and strip, for the pressure and the three vector
+equations alike.
 
 `DomainTest` pins what makes skipping tiles safe: the graded cells never read a node
 outside the domain, so which tiles run, and what material lies outside, change nothing
@@ -21,6 +25,7 @@ a mirrored, negated source to round-off.
 """
 
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 import numpy as np
@@ -34,8 +39,10 @@ except Exception:  # cupy missing or no GPU
 
 if HAS_CUDA:
     from cuwave import wave
-    from cuwave.boundary import sponge
+    from cuwave.anisotropic import AnisotropicElasticWave
+    from cuwave.boundary import Clamped, Pml, sponge
     from cuwave.elastic import ElasticWave
+    from cuwave.maxwell import DielectricWave
     from cuwave.scalar import ScalarWave
     from cuwave.sensitivity import (
         l2_misfit,
@@ -88,6 +95,13 @@ def _every_tile(sim, cells):
     return ORIGINAL_TILES(sim, cp.full_like(cells, 1)) | (1 << 30)
 
 
+def _arrays(result):
+    """Every device array a run returns, its gradient dict unpacked."""
+    for item in result:
+        values = item.values() if isinstance(item, dict) else (item,)
+        yield from (v for v in values if isinstance(v, cp.ndarray))
+
+
 def _plain(run):
     with mock.patch("cuwave.wave.CHUNK", 10**6):
         return run()
@@ -123,6 +137,68 @@ class MarchTest(unittest.TestCase):
         self.assertGreater(replayed[3]["strip"], 0)
         for name in replayed[1]:
             np.testing.assert_array_equal(replayed[1][name].get(), plain[1][name].get())
+
+    def test_a_narrowed_strip_replays_the_plain_loop(self):
+        # the plain loop stages a converting window too, so both round the same way
+        sim, source, indicator, sensors = _setup(damped=True)
+        objective = l2_misfit(cp.zeros((sim.N, 3), sim.dtype))
+
+        def run():
+            return reconstruction_sensitivity(
+                sim, source, indicator, sensors, objective, strip_dtype="bfloat16"
+            )
+
+        replayed, plain = run(), _plain(run)
+        for name in replayed[1]:
+            np.testing.assert_array_equal(replayed[1][name].get(), plain[1][name].get())
+
+    def test_a_pml_replays_the_plain_loop(self):
+        sim, source, indicator, sensors = _setup()
+        sim = replace(sim, pml=Pml(6, 1.0))
+        objective = l2_misfit(cp.zeros((sim.N, 3), sim.dtype))
+        for run in (simulate, sensitivity, reconstruction_sensitivity):
+            with self.subTest(run=run.__name__):
+                args = (sim, source, indicator, sensors)
+                if run is not simulate:
+                    args += (objective,)
+                replayed, plain = run(*args), _plain(lambda: run(*args))
+                for a, b in zip(_arrays(replayed), _arrays(plain)):
+                    np.testing.assert_array_equal(a.get(), b.get())
+
+    def test_a_vector_pml_replays_the_plain_loop(self):
+        dx = tuple(1.0 / (n - 3) for n in NX)
+        N = 2 * CHUNK + 7
+        common = dict(precision="float32", pml=Pml(6, 1.0, frequency=2.0))
+        elastic = dict(density=1.0, wavespeed_p=1.0, wavespeed_s=0.6, boundary=Clamped)
+        dt = 0.5 * stable_dt(dx, 1.0, 4)
+        sims = (
+            ElasticWave(NX, dx, N, dt, (4, 32), space_order=4, **elastic, **common),
+            AnisotropicElasticWave(NX, dx, N, dt, (4, 32), **elastic, **common),
+            DielectricWave(
+                NX, dx, N, dt, (4, 32), permittivity1=1.0, permittivity2=4.0, **common
+            ),
+        )
+        signal = np.sin(0.3 * np.arange(N))[:, None]
+        sensors = cp.array([[0, 1, 0], [10, 10, 12], [8, 9, 30]], cp.int32)
+        for sim in sims:
+            source = Source(
+                cp.array([[1], [20], [24]], cp.int32), cp.asarray(signal, sim.dtype)
+            )
+            indicator = 1.0 + 0.2 * cp.random.RandomState(0).rand(*sim.Nx_padded)
+            args = (sim, source, indicator.astype(sim.dtype), sensors)
+            objective = l2_misfit(cp.zeros((N, 3), sim.dtype))
+            for run in (simulate, sensitivity, reconstruction_sensitivity):
+                with self.subTest(sim=type(sim).__name__, run=run.__name__):
+                    full = args if run is simulate else (*args, objective)
+                    replayed, plain = run(*full), _plain(lambda: run(*full))
+                    for a, b in zip(_arrays(replayed), _arrays(plain)):
+                        np.testing.assert_array_equal(a.get(), b.get())
+
+    def test_bfloat16_keeps_eight_bits_of_mantissa(self):
+        x = cp.asarray(np.random.default_rng(0).normal(size=4096), dtype=cp.float32)
+        back = wave.widen(wave.narrow(x, wave.BFLOAT16), cp.float32)
+        rel = float(cp.max(cp.abs(back - x) / cp.abs(x)))
+        self.assertLessEqual(rel, 2.0**-8)
 
 
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")

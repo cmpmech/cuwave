@@ -243,6 +243,39 @@ graded_gradient(const real_t *__restrict__ u1, const real_t *__restrict__ l1,
   return jc == 1 ? 2 * g : g; // over the wall's half cell
 }
 
+// ----------------------------- pml transposed helpers
+// d(Dp)/d(u at row q off the node) for a node of radius r
+__device__ __forceinline__ real_t plus_tap(const int q, const int r) {
+  if (q >= 1)
+    return q <= r ? OP_W(r, q) : (real_t)0;
+  return 1 - q <= r ? -OP_W(r, 1 - q) : (real_t)0;
+}
+
+// d(Dm)/d(u at row q off the node) for a node of radius r
+__device__ __forceinline__ real_t minus_tap(const int q, const int r) {
+  if (q >= 0)
+    return q + 1 <= r ? OP_W(r, q + 1) : (real_t)0;
+  return -q <= r ? -OP_W(r, -q) : (real_t)0;
+}
+
+// the memory of layer row ai (slab thread i) read back off the row q from it
+__device__ __forceinline__ real_t pml_tap(const real_t *__restrict__ aux,
+                                          const real_t *__restrict__ stiff,
+                                          const real_t *__restrict__ profile,
+                                          const real_t f, const int N,
+                                          const int o, const int size,
+                                          const int i, const int iidx,
+                                          const int ai, const int q) {
+  const real_t *an = profile, *ah = profile + 2 * N;
+  const real_t sc = stiff[iidx], sp = stiff[iidx + o], sm = stiff[iidx - o];
+  const real_t gp = sc * sp / (sc + sp), gm = sc * sm / (sc + sm); // harmonic
+  const real_t ez = an[ai] * f * aux[2 * size + i];
+  const real_t cp = ah[ai] * aux[i] + gp * (1 + ah[ai]) * ez;
+  const real_t cm = ah[ai - 1] * aux[size + i] - gm * (1 + ah[ai - 1]) * ez;
+  const int r = CLOSURE(ai, N);
+  return cp * plus_tap(q, r) + cm * minus_tap(q, r);
+}
+
 // byte-identical to scalar.cu: each file is its own compilation unit
 __device__ __forceinline__ real_t flux_divergence_axis(
     const real_t *__restrict__ u1, const real_t *__restrict__ stiff,
@@ -460,6 +493,83 @@ __global__ void adjoint_gradient_kernel(
   // dJ/dmass by parts in time: u against the second difference of lambda
   g_mass[idx] = gm - mf * uc * (ln - 2.f * lc + lo);
   g_stiff[idx] = gs - mf * g;
+}
+
+// ------------------------------------------------------------------------------------
+__global__ void pml_aux_kernel(const real_t *__restrict__ l1,
+                               const real_t *__restrict__ stiff,
+                               real_t *__restrict__ aux,
+                               const real_t *__restrict__ profile, const int d,
+                               const int lo, const int hi, const real_t f,
+                               PML_PARAMS) {
+  PML_GEOM;
+  const int t = blockIdx.x * blockDim.x + threadIdx.x;
+  int idx, a, off;
+  real_t w;
+  if (!slab_node(t, d, lo, hi, n, s, idx, a, off, w))
+    return;
+  const int N = n[d], o = s[d], size = (lo + hi) * slab_plane(d, n, s);
+  const real_t *an = profile, *bn = profile + N, *bh = profile + 3 * N;
+
+  const real_t sc = stiff[idx], sp = stiff[idx + o], sm = stiff[idx - o];
+  const real_t gp = sc * sp / (sc + sp), gm = sc * sm / (sc + sm); // harmonic
+  const real_t q =
+      w * l1[idx]; // lambda / m, the stepped field being that over W
+  const real_t ez = aux[2 * size + t];
+  aux[t] = bh[a] * (aux[t] + an[a] * f * gp * ez) + f * gp * q;
+  aux[size + t] =
+      bh[a - 1] * (aux[size + t] - an[a] * f * gm * ez) - f * gm * q;
+  aux[2 * size + t] = bn[a] * ez + q;
+}
+
+// ------------------------------------------------------------------------------------
+__global__ void pml_adjoint_kernel(
+    real_t *__restrict__ l2, real_t *__restrict__ g_mass,
+    const real_t *__restrict__ u1, const real_t mf, const int with_mass,
+    const real_t *__restrict__ stiff, const real_t *__restrict__ minv,
+    const int derive_inertia, const real_t *__restrict__ aux,
+    const real_t *__restrict__ profile, const int d, const int lo, const int hi,
+    const real_t f, const int dirichlet, PML_PARAMS) {
+  PML_GEOM;
+  // every node the layer's taps reach, up to STENCIL_RADIUS past its front
+  const int elo = lo ? lo + STENCIL_RADIUS : 0;
+  const int ehi = hi ? hi + STENCIL_RADIUS : 0;
+  int idx, a, off;
+  real_t w;
+  if (!slab_node(blockIdx.x * blockDim.x + threadIdx.x, d, elo, ehi, n, s, idx,
+                 a, off, w))
+    return;
+  const int N = n[d], o = s[d], plane = slab_plane(d, n, s);
+  const int size = (lo + hi) * plane;
+
+  real_t sum = 0;
+#pragma unroll
+  for (int m = -STENCIL_RADIUS; m <= STENCIL_RADIUS; ++m) {
+    const int i = slab_index(a + m, off, d, lo, hi, n, plane);
+    if (i >= 0)
+      sum += pml_tap(aux, stiff, profile, f, N, o, size, i, idx + m * o, a + m,
+                     -m);
+  }
+  if (a == 2 || a == N - 3) {
+    // the ghost read folded onto its mirror, odd on a Dirichlet face
+    const int high = a == N - 3, ghost = high ? N - 1 : 0;
+    real_t fold = 0;
+#pragma unroll
+    for (int k = 1; k <= STENCIL_RADIUS; ++k) {
+      const int ai = high ? N - 1 - k : k;
+      const int i = slab_index(ai, off, d, lo, hi, n, plane);
+      if (i >= 0)
+        fold += pml_tap(aux, stiff, profile, f, N, o, size, i,
+                        idx + (ai - a) * o, ai, ghost - ai);
+    }
+    sum += (dirichlet >> (2 * d + high)) & 1 ? -fold : fold;
+  }
+
+  const real_t mi = derive_inertia ? 1.f / stiff[idx] : minv[idx];
+  const real_t delta = mi * sum / w;
+  l2[idx] += delta;
+  if (with_mass) // the fused step read lambda^n before this share of it
+    g_mass[idx] -= mf * u1[idx] * delta;
 }
 
 // ------------------------------------------------------------------------------------

@@ -27,11 +27,12 @@ from .wave import (
     Simulation,
     apply_cell_weights,
     axis_geometry,
+    define_pair_pml,
     grid_block,
     pair_average,
     pair_average_adjoint,
-    point_average,
-    point_average_adjoint,
+    point_harmonic,
+    point_harmonic_adjoint,
     wall_weights,
 )
 
@@ -154,6 +155,8 @@ class MaxwellWave(Simulation):
     sensitivity_path = SENSITIVITY_PATH
     default_boundary = Conductor
     gradient_names = ("mass", "stiff")
+    accepts_pml = True
+    pml_shifted = True
 
     magnetic = False  # set where the permeability carries the design too
 
@@ -188,6 +191,11 @@ class MaxwellWave(Simulation):
         """The curl reach compounds with the transposed one: `2 radius - 1` nodes."""
         return 2 * self.radius - 1
 
+    @property
+    def pml_margin(self) -> int:
+        """Undamped layer nodes before the front: a curl the step corrects is read this far."""
+        return self.radius - 1
+
     def __post_init__(self) -> None:
         """Validate the dimension and the faces, on top of `Simulation.__post_init__`."""
         super().__post_init__()
@@ -216,7 +224,7 @@ class MaxwellWave(Simulation):
         permittivity = cp.ascontiguousarray(permittivity, dtype=self.dtype)
         minv = cp.zeros((self.ncomp, *self.Nx_padded), dtype=self.dtype)
         for c in range(self.ncomp):
-            mass = wall_weights(self, (c,)) * point_average(self, permittivity, c)
+            mass = wall_weights(self, (c,)) * point_harmonic(self, permittivity, c)
             minv[c] = 1.0 / cp.maximum(mass, cp.finfo(self.dtype).tiny)
         # a conductor holds the tangential field, which is what a zeroed inertia does
         for face in faces_with(self, Conductor):
@@ -239,33 +247,54 @@ class MaxwellWave(Simulation):
 
     def define_step(self, kernels: cp.RawModule, mat: dict) -> Callable:
         """Closure launching the curl kernel and then the update over (u0, u1, u2)."""
+        return self._define_pair(kernels, mat, adjoint=False)
+
+    def define_adjoint_step(
+        self, kernels: cp.RawModule, sens_kernels: cp.RawModule, mat: dict
+    ) -> Callable:
+        """Closure stepping the adjoint: the step itself, unless a pml breaks its symmetry."""
+        return self._define_pair(kernels, mat, adjoint=self.pml is not None)
+
+    def _define_pair(self, kernels: cp.RawModule, mat: dict, adjoint: bool) -> Callable:
+        """The curl and update launches, each followed by its pml terms if there are any."""
         curl_kernel = kernels.get_function("curl_kernel")
         fd_kernel = kernels.get_function("fd_kernel")
         grid, block = grid_block(self)
         # the curl scratch outlives the closure, its invalid pair points never written
         h = cp.zeros((self.npairs, *self.Nx_padded), dtype=self.dtype)
         inv_dx = [self.dtype(1.0 / d) for d in self.dx]
-        cargs = [None, h]
-        if self.magnetic:
-            cargs.append(mat["nu_pair"])
-        cargs += [
-            self.dtype(1.0 / self.permeability),
-            np.int32(self.comp_stride),
-            *axis_geometry(self, inv_dx),
-        ]
+        cs = np.int32(self.comp_stride)
+        material = [mat["nu_pair"]] if self.magnetic else []
+        material += [self.dtype(1.0 / self.permeability), cs]
+        cargs = [None, h, *material, *axis_geometry(self, inv_dx)]
         uargs = [None, None, None, h, mat["minv"]]
         if self.damping is not None:
             uargs += [mat["damping"], self.dtype(self.dt)]
-        uargs += [np.int32(self.comp_stride), *axis_geometry(self, self.step_factors())]
+        uargs += [cs, *axis_geometry(self, self.step_factors())]
+        if self.pml is None:
 
-        def fd_step(u0, u1, u2):
+            def fd_step(u0, u1, u2):
+                cargs[0] = u1
+                curl_kernel(grid, block, cargs)
+                uargs[0], uargs[1], uargs[2] = u0, u1, u2
+                fd_kernel(grid, block, uargs)
+                return u2
+
+            return fd_step
+        curl_pml, force_pml = define_pair_pml(
+            self, kernels, "curl", h, material, [mat["minv"], cs], adjoint
+        )
+
+        def pml_step(u0, u1, u2):
             cargs[0] = u1
             curl_kernel(grid, block, cargs)
+            curl_pml(u1)
             uargs[0], uargs[1], uargs[2] = u0, u1, u2
             fd_kernel(grid, block, uargs)
+            force_pml(u1, u2)
             return u2
 
-        return fd_step
+        return pml_step
 
     def excitation_weights(
         self, mat: dict, lin_index: cpt.NDArray[cp.int32]
@@ -296,12 +325,13 @@ class MaxwellWave(Simulation):
 
     def gradient_fields(self, mat: dict) -> dict[str, cpt.NDArray]:
         """Accumulators on the component points, and on the pair points where `mu` is designed."""
+        # the harmonic means have a design dependent chain rule, so keep the fields
         grads = {
             "mass": cp.zeros((self.ncomp, *self.Nx_padded), dtype=self.dtype),
+            "eps": mat["eps"],
         }
         if self.magnetic:
             grads["nu"] = cp.zeros((self.npairs, *self.Nx_padded), dtype=self.dtype)
-            # the harmonic mean has a design dependent chain rule, so keep the field
             grads["design"] = mat["nu"]
         return grads
 
@@ -310,7 +340,7 @@ class MaxwellWave(Simulation):
         g_mass = cp.zeros(self.Nx_padded, dtype=self.dtype)
         for c in range(self.ncomp):
             density = grads["mass"][c] * wall_weights(self, (c,))
-            g_mass += point_average_adjoint(self, density, c)
+            g_mass += point_harmonic_adjoint(self, density, grads["eps"], c)
         # a non-magnetic medium has no stiffness design dependence: zeros say so
         g_stiff = cp.zeros(self.Nx_padded, dtype=self.dtype)
         if self.magnetic:

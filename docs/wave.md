@@ -82,6 +82,7 @@ def fd_step(u0, u1, u2):
 | `define_excitation`  | `wave.py`        | `excitation_kernel` | `excitation_step(u, signal, t_index)`            |
 | `define_get_signal`  | `wave.py`        | `get_signal_kernel` | `get_signal_step(u, um, t_index)`                |
 | `define_set_signal`  | `wave.py`        | `set_signal_kernel` | `set_signal_step(u, um, t_index)`                |
+| `define_dft`         | `wave.py`        | `dft_kernel`        | `dft_step(u, table, t_index)`                    |
 | `define_gradient`    | `sensitivity.py` | `gradient_kernel`   | `gradient_step(g_mass, g_stiff, u0, u1, u2, l1)` |
 | `sim.define_adjoint_step` | `scalar.py` | `adjoint_kernel` | `adjoint_step(l0, l1, l2)` |
 | `define_adjoint_gradient` | `scalar.py` | `adjoint_gradient_kernel` | `adjoint_gradient_step(l0, l1, u1)` |
@@ -109,6 +110,10 @@ The mirror image of the excitation, one thread per sensor, writing row `t_index`
 The inverse of `define_get_signal`, one thread per node, writing the field back from row `t_index` of a record
 
 Only the reverse march of the [sensitivity](sensitivity.md) analysis needs it, to replay a recorded boundary strip, which is why it assigns where the excitation adds
+### define_dft
+The running twin of `define_get_signal`, one thread per node: it adds the field at `position`, times row `t_index` of an $(N,\,\textrm{rows})$ phase table, into an accumulator the caller zeroes, so a discrete Fourier transform builds up during the run and stays inside the captured graph
+
+`spectral_sensitivity` keeps one over the design region in place of a history, its table carrying $\cos\omega t$ and $-\sin\omega t$ per frequency
 ### define_boundary
 see [boundary](boundary.md)
 ## march
@@ -117,12 +122,15 @@ see [boundary](boundary.md)
 | member | signature | description |
 |---|---|---|
 | time loop | `march(N, step, windows=())` | runs the `N` steps, replaying the captured chunk where the staging fits and looping plainly where it does not |
-| record | `Window(record, halo=0, load=True, store=False)` | a record `step` touches at rows `t .. t + halo`: an input loads those rows per chunk, an output stores them back, and one that does both (the `sensitivity` history) loads only its `halo` |
+| record | `Window(record, halo=0, load=True, store=False, dtype=None)` | a record `step` touches at rows `t .. t + halo`: an input loads those rows per chunk, an output stores them back, and one that does both (the `sensitivity` history) loads only its `halo`. A `dtype` other than the record's is what the kernels read, the record being stored narrower |
+| storage | `narrow(values, dtype)`, `widen(values, dtype)` | the conversions a narrowed window stages through, with `BFLOAT16`, a `uint16` record holding the upper half of each `float32`, rounded to nearest even |
 | chunk | `CHUNK = 24` | steps per graph, a multiple of every slot rotation period (2 for a pair, 3 for a triplet) |
 
 A graph holds fixed pointers and fixed scalars, so a captured step cannot move along a record. The windows therefore stage each record through a buffer of `CHUNK + halo` rows, copied in before and out after each replay, and `step` addresses that buffer at row `k` where the plain loop addresses the record at row `t`. That fixes what a `step` may do: launch kernels only, pick its slots by `t` modulo a divisor of `CHUNK` (never by rebinding a variable, which a replay would not repeat), and touch each record only through its window. A record the kernels index by row offset has to be contiguous, so a backward pass that reads one in reverse hands over a reversed copy, while the history, whose rows go to the kernels as separate pointers, can be a reversed view
 
 The price is the staging copy, which is free while the buffers sit in L2 and is otherwise a pass over every buffered field. `march` therefore replays only while the staging fits in the device's L2 and falls back to the plain loop past that, which is also where a kernel outlasts its launch and the graph would save nothing
+
+A narrowed window is staged either way, since the kernels cannot read its record: past L2 its chunks are converted and stepped plainly. cupy has no bfloat16 type, so `BFLOAT16` is carried as raw bits, which keeps the `float32` exponent range a `float16` record would underflow on nondimensional amplitudes; the narrowed strip of `reconstruction_sensitivity` is what uses it
 ### define_gradient
 see [sensitivity](sensitivity.md)
 
@@ -136,8 +144,8 @@ here and both [elastic](elastic.md) and [maxwell](maxwell.md) call it
 |---|---|---|
 | voigt order | `PAIRS` | the $\left(k,l\right)$ pairs per dimension, the shear or curl rows being `PAIRS[ndim][ndim:]` |
 | weights | `wall_weights(sim, axes)` | the cell weights $W$ of a point family staggered along `axes` (`(c,)` for component `c`, the pair for a pair point), halved on the walls of the other axes |
-| averages | `point_average(sim, field, c)`, `pair_average(sim, field, axes)` | the arithmetic two-node mean at a component point and the harmonic four-node mean at a pair point |
-| average adjoints | `point_average_adjoint(sim, density, c)`, `pair_average_adjoint(sim, density, field, axes)` | their transposes, which is how a point density is chained back onto the nodal design field |
+| averages | `point_average(sim, field, c)`, `point_harmonic(sim, field, c)`, `pair_average(sim, field, axes)` | the arithmetic and the harmonic two-node mean at a component point (an elastic density, a permittivity) and the harmonic four-node mean at a pair point |
+| average adjoints | `point_average_adjoint(sim, density, c)`, `point_harmonic_adjoint(sim, density, field, c)`, `pair_average_adjoint(sim, density, field, axes)` | their transposes, which is how a point density is chained back onto the nodal design field |
 
 They are free functions taking `sim` rather than a shared base class: what the two
 equations hold in common is the lattice, and their material models, `build_materials` and

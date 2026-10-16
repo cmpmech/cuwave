@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cupy as cp
@@ -19,8 +19,17 @@ import cupy.typing as cpt
 import numpy as np
 import numpy.typing as npt
 
-from .boundary import canonical_boundary, define_boundary
+from .boundary import (
+    Pml,
+    canonical_boundary,
+    define_boundary,
+    pml_profiles,
+    pml_widths,
+    validate_pml,
+)
 from .stencils import preamble, weights
+
+PML_THREADS = 256  # threads per block of a pml slab launch
 
 # Voigt row order per dimension as (k, l) strain pairs; the shear rows are PAIRS[d][d:]
 PAIRS = {
@@ -61,6 +70,8 @@ def stable_timestep(
         this far below `stable_dt`, which is the signal to drop `space_order` rather
         than to shrink `dt`.
     """
+    # the interior operator alone: a pml's memory would make the iteration nonlinear
+    sim = replace(sim, pml=None)
     mat = sim.build_materials(indicator)
     step = sim.define_step(compile_kernels(sim), mat)
     shifts = sim.component_offsets
@@ -211,6 +222,26 @@ def point_average_adjoint(sim: Simulation, density: cpt.NDArray, c: int) -> cpt.
     return out
 
 
+def point_harmonic(sim: Simulation, field: cpt.NDArray, c: int) -> cpt.NDArray:
+    """Harmonic mean of `field` over the two nodes component `c` sits between.
+
+    The material a component crossing an interface sees in series, so it is second
+    order where `point_average` is first (Farjadpour et al. 2006,
+    https://doi.org/10.1364/OL.31.002972).
+    """
+    mean = point_average(sim, 1.0 / cp.maximum(field, cp.finfo(sim.dtype).tiny), c)
+    return cp.where(mean > 0.0, 1.0 / cp.maximum(mean, cp.finfo(sim.dtype).tiny), 0.0)
+
+
+def point_harmonic_adjoint(
+    sim: Simulation, density: cpt.NDArray, field: cpt.NDArray, c: int
+) -> cpt.NDArray:
+    """Transpose of `point_harmonic`: d(harmonic mean)/d(node) is `(mean / node)**2 / 2`."""
+    safe = cp.maximum(field, cp.finfo(sim.dtype).tiny)
+    mean = point_harmonic(sim, field, c)
+    return point_average_adjoint(sim, density * mean * mean, c) / (safe * safe)
+
+
 def pair_average(
     sim: Simulation, field: cpt.NDArray, axes: tuple[int, int]
 ) -> cpt.NDArray:
@@ -269,8 +300,12 @@ class Simulation:
     damping: cpt.NDArray | None = None  # nodal field d, None for a lossless operator
     domain: cpt.NDArray | None = None  # nodal mask of the physical domain, None for all
     dirichlet: cpt.NDArray | None = None  # nodal mask held at zero, its cells left open
+    pml: Pml | None = None  # perfectly matched layer behind the faces, None for none
 
     accepts_domain = False  # whether the step kernel honours -DUSE_DOMAIN
+    accepts_pml = False  # whether the step and its adjoint carry the pml memory terms
+    pml_shifted = False  # whether a pml needs the CFS shift, cross terms coupling it
+    pml_walls = None  # the conditions a lined face may carry, None for any
     fuses_adjoint = False  # whether the gradients ride in the adjoint step kernels
 
     @property
@@ -305,6 +340,11 @@ class Simulation:
         """Nodes one step reads past a point, which a reconstruction strip must cover."""
         return self.space_order // 2
 
+    @property
+    def pml_margin(self) -> int:
+        """Undamped layer nodes before the front, where the step reads what a pml corrects."""
+        return 0
+
     def __post_init__(self) -> None:
         """Derive `ndim`, padded shape, strides, dtype, and canonical `boundary`."""
         self.ndim = len(self.Nx)
@@ -331,6 +371,18 @@ class Simulation:
                 f"{self.ncomp} x {self.comp_stride} nodes overflow the int32 flat "
                 f"index; coarsen the grid"
             )
+        if self.pml is not None:
+            validate_pml(self)
+
+    def pml_slabs(self) -> list[tuple]:
+        """(d, lo, hi, profile, plane) per lined axis, `plane` the nodes of one slab row."""
+        total = int(np.prod(self.Nx_padded))
+        widths, profiles = pml_widths(self), pml_profiles(self)
+        return [
+            (d, lo, hi, profile, total // self.Nx_padded[d])
+            for d, ((lo, hi), profile) in enumerate(zip(widths, profiles))
+            if profile is not None
+        ]
 
     def adjoint_mass_factor(self) -> float:
         """Scale of the inertia gradient density: `1 / dt**2`, the residual's own."""
@@ -486,6 +538,74 @@ def domain_tiles(
     return tiles
 
 
+def slab_grid(lo: int, hi: int, plane: int, reach: int = 0) -> tuple[int]:
+    """1D grid over a slab of `lo + hi` rows, each lined side grown `reach` rows inward."""
+    rows = (lo + reach if lo else 0) + (hi + reach if hi else 0)
+    return (-(-rows * plane // PML_THREADS),)
+
+
+def define_pair_pml(
+    sim: Simulation,
+    kernels: cp.RawModule,
+    first: str,
+    scratch: cpt.NDArray,
+    first_args: list,
+    update_args: list,
+    adjoint: bool,
+) -> tuple[Callable, Callable]:
+    """Closures adding each lined axis' pml terms to a two-pass step, after each pass.
+
+    Forwards, every derivative of either pass carries its memory. The adjoint pushes
+    each memory back through the other pass, so its launches reach `radius` rows past
+    the slab, and a third settles the first pass' memory once the update has read it.
+
+    Args:
+        sim: a staggered simulation, its first pass writing `scratch` from the field.
+        kernels: the compiled module holding the `pml_<first>`, `pml_force` and
+            `pml_adjoint_*` kernels.
+        first: the name of the first pass, "stress" or "curl".
+        scratch: the stress or curl the first pass writes and the update reads.
+        first_args: the material arguments the first pml kernel takes after `scratch`.
+        update_args: those the force kernel takes after `scratch`.
+        adjoint: whether to push the memory back, the transpose of the forward terms.
+
+    Returns:
+        (first_step(u1), update_step(u1, u2)), to launch after the matching pass.
+    """
+    prefix = "pml_adjoint_" if adjoint else "pml_"
+    first_kernel = kernels.get_function(f"{prefix}{first}_kernel")
+    force_kernel = kernels.get_function(f"{prefix}force_kernel")
+    memory_kernel = kernels.get_function("pml_adjoint_memory_kernel")
+    cs = np.int32(sim.comp_stride)
+    inv_dx = axis_geometry(sim, [sim.dtype(1.0 / d) for d in sim.dx])
+    factors = axis_geometry(sim, sim.step_factors())
+    reach = sim.space_order // 2 if adjoint else 0
+    firsts, forces, memories = [], [], []
+    for d, lo, hi, profile, plane in sim.pml_slabs():
+        # the first pass' memory per component, then the update's per component
+        aux = cp.zeros((2 * sim.ndim, (lo + hi) * plane), dtype=sim.dtype)
+        slab = [aux, profile, np.int32(d), np.int32(lo), np.int32(hi)]
+        grid = slab_grid(lo, hi, plane, reach)
+        firsts.append((grid, [None, scratch, *first_args, *slab, *inv_dx]))
+        forces.append((grid, [None, None, scratch, *update_args, *slab, *factors]))
+        if adjoint:
+            memories.append((slab_grid(lo, hi, plane), [scratch, cs, *slab, *factors]))
+
+    def first_step(u1):
+        for grid, args in firsts:
+            args[0] = u1
+            first_kernel(grid, (PML_THREADS,), args)
+
+    def update_step(u1, u2):
+        for grid, args in forces:
+            args[0], args[1] = u1, u2
+            force_kernel(grid, (PML_THREADS,), args)
+        for grid, args in memories:
+            memory_kernel(grid, (PML_THREADS,), args)
+
+    return first_step, update_step
+
+
 def axis_geometry(sim: Simulation, factors: list | None = None) -> list:
     """Interleave `factors` with axis extents and strides, in the layout the kernels expect."""
     # kernel args after the material arrays: f0, N0, [f1, N1, s0], [f2, N2, s1]
@@ -500,22 +620,50 @@ def axis_geometry(sim: Simulation, factors: list | None = None) -> list:
 CHUNK = 24  # steps per captured graph, a multiple of every rotation period (2, 3)
 
 
+# a record of this dtype holds bfloat16: the high half of each float32
+BFLOAT16 = np.dtype(np.uint16)
+
+
+def narrow(values: cpt.NDArray, dtype: npt.DTypeLike) -> cpt.NDArray:
+    """`values` stored as `dtype`, rounded to the nearest even bfloat16 for `BFLOAT16`."""
+    if np.dtype(dtype) != BFLOAT16:
+        return values.astype(dtype, copy=False)
+    bits = values.astype(cp.float32).view(cp.uint32)
+    return ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16).astype(cp.uint16)
+
+
+def widen(values: cpt.NDArray, dtype: npt.DTypeLike) -> cpt.NDArray:
+    """Inverse of `narrow`: a stored record read back as `dtype`."""
+    if values.dtype != BFLOAT16:
+        return values.astype(dtype, copy=False)
+    return (values.astype(cp.uint32) << 16).view(cp.float32).astype(dtype)
+
+
 @dataclass
 class Window:
     """A record `march` stages for a graph: `step` reads or writes it at row t + offset.
 
     An input loads the `halo` rows past each chunk as well; a store window writes its
     rows `halo ..` back and, if it also loads, loads only the `halo` rows it starts from.
+    A record stored narrower than the kernels read it names their `dtype`, and the
+    staging converts it both ways (`narrow`, `widen`).
     """
 
     record: cpt.NDArray
     halo: int = 0
     load: bool = True
     store: bool = False
+    dtype: npt.DTypeLike | None = None
 
     def __post_init__(self) -> None:
         """An output only stores, so `store=True` alone clears `load`."""
         self.load = self.load and (not self.store or self.halo > 0)
+        self.dtype = np.dtype(self.record.dtype if self.dtype is None else self.dtype)
+
+    @property
+    def converts(self) -> bool:
+        """Whether the record is stored in another dtype than the kernels read."""
+        return self.dtype != self.record.dtype
 
 
 def march(N: int, step: Callable, windows: list[Window] = ()) -> None:
@@ -526,43 +674,46 @@ def march(N: int, step: Callable, windows: list[Window] = ()) -> None:
     rotate its slots by t modulo a divisor of `CHUNK`, and touch each window's record
     at rows t .. t + halo. A graph addresses fixed memory, so the windows are staged
     through buffers of `CHUNK + halo` rows, and only while they fit in L2 (there the
-    staging copy is free); past that the kernels outweigh the launch anyway.
+    staging copy is free); past that the kernels outweigh the launch anyway, and only
+    a converting window is still staged.
 
     Args:
         N: the number of steps.
         step: launches step t, taking the windows' records in order.
         windows: the records `step` reads or writes per step, each a `Window`.
     """
-    shapes = [(CHUNK + w.halo, *w.record.shape[1:]) for w in windows]
-    nbytes = sum(int(np.prod(s)) * w.record.itemsize for s, w in zip(shapes, windows))
-    if N < 2 * CHUNK or nbytes > cp.cuda.Device().attributes["L2CacheSize"]:
+    chunk = min(CHUNK, N)
+    shapes = [(chunk + w.halo, *w.record.shape[1:]) for w in windows]
+    nbytes = sum(int(np.prod(s)) * w.dtype.itemsize for s, w in zip(shapes, windows))
+    graphed = N >= 2 * CHUNK and nbytes <= cp.cuda.Device().attributes["L2CacheSize"]
+    if not graphed and not any(w.converts for w in windows):
         for t in range(N):
             step(t, *(w.record for w in windows))
         return
 
-    staging = [cp.empty(s, dtype=w.record.dtype) for s, w in zip(shapes, windows)]
-    capture = cp.cuda.Stream()
-    with capture:
-        capture.begin_capture()
-        for k in range(CHUNK):
-            step(k, *staging)
-        graph = capture.end_capture()
-    for start in range(0, N, CHUNK):
-        count = min(CHUNK, N - start)
+    staging = [cp.empty(s, dtype=w.dtype) for s, w in zip(shapes, windows)]
+    if graphed:
+        capture = cp.cuda.Stream()
+        with capture:
+            capture.begin_capture()
+            for k in range(CHUNK):
+                step(k, *staging)
+            graph = capture.end_capture()
+    for start in range(0, N, chunk):
+        count = min(chunk, N - start)
         for w, buf in zip(windows, staging):
             if w.load:
                 rows = w.halo if w.store else count + w.halo
-                buf[:rows] = w.record[start : start + rows]
-        if count == CHUNK:
+                buf[:rows] = widen(w.record[start : start + rows], w.dtype)
+        if graphed and count == CHUNK:
             graph.launch()
         else:
             for k in range(count):
                 step(k, *staging)
         for w, buf in zip(windows, staging):
             if w.store:
-                w.record[start + w.halo : start + w.halo + count] = buf[
-                    w.halo : w.halo + count
-                ]
+                rows = slice(start + w.halo, start + w.halo + count)
+                w.record[rows] = narrow(buf[w.halo : w.halo + count], w.record.dtype)
 
 
 # -------------------------------- simulation functions -------------------------------
@@ -644,6 +795,41 @@ def define_set_signal(
 ) -> Callable:
     """Closure writing `u` at `sensors` back from row `t_index`, restoring rather than adding."""
     return _define_transfer(sim, "set_signal_kernel", sensors, kernels)
+
+
+def define_dft(
+    sim: Simulation,
+    position: cpt.NDArray[cp.int32],
+    kernels: cp.RawModule,
+    acc: cpt.NDArray,
+) -> Callable:
+    """Closure adding `u` at `position`, times row `t_index` of a phase table, into `acc`.
+
+    Args:
+        sim: the simulation whose field is transformed.
+        position: (node_rows, num) grid indices to transform at.
+        kernels: the compiled forward module.
+        acc: (rows, num) accumulator the caller zeroes, one row per table column.
+
+    Returns:
+        `dft_step(u, table, t_index)`, `table` an (N, rows) record of the phase
+        factors, so a running DFT stays inside a captured graph.
+    """
+    kernel = kernels.get_function("dft_kernel")
+    threads = 256
+    num = position.shape[1]
+    rows = acc.shape[0]
+    blocks = ((num + threads - 1) // threads,)
+    args = [None, acc, None, np.int32(0), flatten_indices(sim, position)]
+    args += [np.int32(num), np.int32(rows)]
+
+    def dft_step(u, table, t_index):
+        args[0], args[2] = u, table
+        args[3] = np.int32(t_index * rows)
+        kernel(blocks, (threads,), args)
+        return u
+
+    return dft_step
 
 
 def simulate(

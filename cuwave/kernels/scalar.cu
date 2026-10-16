@@ -27,6 +27,22 @@ __device__ __forceinline__ real_t flux_divergence_axis(
   return factor * (Dp * gp - Dm * gm); // outer grad (incl. inner grad)
 }
 
+// ------------------------------------- pml helpers
+// the two cell differences of flux_divergence_axis, before the stiffness
+__device__ __forceinline__ void cell_differences(const real_t *__restrict__ u1,
+                                                 const int idx, const int s,
+                                                 const real_t uc, const int r,
+                                                 real_t &Dp, real_t &Dm) {
+  Dp = OP_W(r, 1) * (u1[idx + s] - uc);
+  Dm = OP_W(r, 1) * (uc - u1[idx - s]);
+#pragma unroll
+  for (int k = 2; k <= STENCIL_RADIUS; ++k)
+    if (k <= r) {
+      Dp += OP_W(r, k) * (u1[idx + k * s] - u1[idx - (k - 1) * s]);
+      Dm += OP_W(r, k) * (u1[idx + (k - 1) * s] - u1[idx - k * s]);
+    }
+}
+
 // ----------------------------------- domain helpers
 #ifdef USE_DOMAIN
 #define DIRICHLET 7 // the radius code of a cell open onto a node held at zero
@@ -325,6 +341,40 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
 #endif
 }
 #endif
+
+// ------------------------------------------------------------------------------------
+__global__ void
+pml_kernel(const real_t *__restrict__ u1, real_t *__restrict__ u2,
+           const real_t *__restrict__ stiff, const real_t *__restrict__ minv,
+           const int derive_inertia, real_t *__restrict__ aux,
+           const real_t *__restrict__ profile, const int d, const int lo,
+           const int hi, const real_t f, PML_PARAMS) {
+  PML_GEOM;
+  const int t = blockIdx.x * blockDim.x + threadIdx.x;
+  int idx, a, off;
+  real_t w;
+  if (!slab_node(t, d, lo, hi, n, s, idx, a, off, w))
+    return;
+  const int N = n[d], o = s[d], size = (lo + hi) * slab_plane(d, n, s);
+  const real_t *an = profile, *bn = profile + N;             // at the nodes
+  const real_t *ah = profile + 2 * N, *bh = profile + 3 * N; // at a + 1/2
+
+  const real_t uc = u1[idx], sc = stiff[idx];
+  real_t Dp, Dm;
+  cell_differences(u1, idx, o, uc, CLOSURE(a, N), Dp, Dm);
+  const real_t sp = stiff[idx + o], sm = stiff[idx - o];
+  const real_t gp = sc * sp / (sc + sp), gm = sc * sm / (sc + sm); // harmonic
+
+  const real_t pp = bh[a] * aux[t] + ah[a] * Dp;                // plus cell
+  const real_t pm = bh[a - 1] * aux[size + t] + ah[a - 1] * Dm; // minus cell
+  const real_t z = bn[a] * aux[2 * size + t] +
+                   an[a] * f * (gp * (Dp + pp) - gm * (Dm + pm)); // divergence
+  aux[t] = pp;
+  aux[size + t] = pm;
+  aux[2 * size + t] = z;
+  const real_t mi = derive_inertia ? 1.f / sc : minv[idx];
+  u2[idx] += mi * (f * (gp * pp - gm * pm) + z);
+}
 
 // ------------------------------------------------------------------------------------
 __global__ void homogeneous_neumann_kernel(real_t *__restrict__ u,

@@ -25,6 +25,12 @@ with the `origin` puts a transducer inside the layer without anything raising.
 `SpongeTest` pins `sponge`, which is not a wall at all: it damps the nodes behind one,
 so it can be held to an amplitude. The echo it leaves is a small fraction of the bare
 wall's, against a reference whose own walls are out of reach within the record.
+
+`PmlTest` holds the perfectly matched layer to the same reference, at the sponge's own
+width, and to a tenth of its echo at least: the margin it exists for. Its layer has to
+coincide with the complement of `pad_for_sponge`'s region, since that region is where
+the material gradients stay exact, and its profiles have to vanish at the front and
+mirror across the wall, which is what keeps a Dirichlet wall node at rest.
 """
 
 import unittest
@@ -43,9 +49,12 @@ if HAS_CUDA:
     from cuwave.boundary import (
         Dirichlet,
         Neumann,
+        Pml,
         canonical_boundary,
         define_boundary,
         pad_for_sponge,
+        pml_nodes,
+        pml_profiles,
         sponge,
     )
     from cuwave.scalar import ScalarWave
@@ -279,8 +288,9 @@ class PadTest(unittest.TestCase):
                 pad_for_sponge(self.NX, self.DX, thickness)
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
-class SpongeTest(unittest.TestCase):
+class _Echo:
+    """The far-wall echo setup both absorbers are held to."""
+
     # 2D. FINE shortens the wavelength, so several of them fit on an affordable grid
     NX, SOURCE, SENSOR, NSTEPS = 100, 50, 20, 600
     PAD = 170  # far enough that the reference hears no wall of its own
@@ -288,6 +298,22 @@ class SpongeTest(unittest.TestCase):
     WAVELENGTH = round(1.0 / FINE / DX)
     BETA = 0.1
 
+    def _trace(self, pad, width):
+        sim = _sim((self.NX + 2 * pad,) * 2, None, self.NSTEPS, precision="float32")
+        indicator = cp.ones(sim.Nx_padded, dtype=sim.dtype)
+        if width:
+            sim = replace(sim, damping=sponge(sim, indicator, width, self.BETA))
+        return _run(
+            sim,
+            (self.SOURCE + pad,) * 2,
+            [(self.SENSOR + pad, self.SOURCE + pad)],
+            indicator=indicator,
+            frequency=self.FINE,
+        )[:, 0]
+
+
+@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
+class SpongeTest(_Echo, unittest.TestCase):
     def _field(self, width, beta=None, **kwargs):
         sim = _sim((40, 40), None, 1)
         base = cp.ones(sim.Nx_padded, dtype=sim.dtype)
@@ -322,19 +348,6 @@ class SpongeTest(unittest.TestCase):
             with self.subTest(width=width), self.assertRaises(ValueError):
                 self._field(width)
 
-    def _trace(self, pad, width):
-        sim = _sim((self.NX + 2 * pad,) * 2, None, self.NSTEPS, precision="float32")
-        indicator = cp.ones(sim.Nx_padded, dtype=sim.dtype)
-        if width:
-            sim = replace(sim, damping=sponge(sim, indicator, width, self.BETA))
-        return _run(
-            sim,
-            (self.SOURCE + pad,) * 2,
-            [(self.SENSOR + pad, self.SOURCE + pad)],
-            indicator=indicator,
-            frequency=self.FINE,
-        )[:, 0]
-
     def test_the_sponge_swallows_the_wall_echo(self):
         reference = self._trace(self.PAD, 0)
         scale = float(np.linalg.norm(reference))
@@ -349,6 +362,64 @@ class SpongeTest(unittest.TestCase):
         # the wall echo dominates its own trace, so the comparison is not vacuous
         self.assertGreater(wall, 1.0, "no echo reached the sensor")
         self.assertLess(damped, wall / 20.0)
+
+
+
+@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
+class PmlTest(_Echo, unittest.TestCase):
+    def _layer(self, pad, layer):
+        sim = _sim((self.NX + 2 * pad,) * 2, None, self.NSTEPS, precision="float32")
+        sim = replace(sim, pml=layer)
+        return _run(
+            sim,
+            (self.SOURCE + pad,) * 2,
+            [(self.SENSOR + pad, self.SOURCE + pad)],
+            frequency=self.FINE,
+        )[:, 0]
+
+    def test_the_pml_swallows_a_tenth_of_what_the_sponge_leaves(self):
+        width = 2 * self.WAVELENGTH
+        reference = self._trace(self.PAD, 0)
+        scale = float(np.linalg.norm(reference))
+        damped = float(np.linalg.norm(self._trace(width, width) - reference)) / scale
+        layer = Pml(width, WAVESPEED)
+        matched = float(np.linalg.norm(self._layer(width, layer) - reference)) / scale
+        print(f"  residual: sponge {damped:.4f}, pml {matched:.6f}")
+        self.assertLess(matched, damped / 10.0)
+
+    def test_the_layer_is_what_the_padded_region_leaves(self):
+        dx = (DX, DX)
+        Nx, width, _, region = pad_for_sponge((40, 30), dx, 5 * DX, faces=(0, 3))
+        sim = replace(_sim(Nx, None, 1), pml=Pml(width, WAVESPEED, faces=(0, 3)))
+        interior = cp.zeros(sim.Nx_padded, dtype=bool)
+        interior[tuple(slice(1, n - 1) for n in sim.Nx)] = True
+        outside = interior.copy()
+        outside[region] = False
+        np.testing.assert_array_equal(pml_nodes(sim).get(), outside.get())
+
+    def test_the_profiles_vanish_at_the_front_and_mirror_across_the_wall(self):
+        sim = replace(_sim((40, 40), None, 1), pml=Pml(6, WAVESPEED))
+        an, bn, ah, bh = pml_profiles(sim)[0].get()
+        # the front node 6 and every node past it are undamped
+        self.assertTrue(np.all(an[6:34] == 0.0) and np.all(bn[6:34] == 1.0))
+        self.assertTrue(np.all(an[1:6] < 0.0))
+        # the ghost cell 1/2 sees what its mirror 3/2 does, at both walls
+        self.assertEqual(ah[0], ah[1])
+        self.assertEqual(ah[37], ah[38])
+        self.assertTrue(np.all(ah[6:33] == 0.0))
+
+    def test_the_bounds_are_checked(self):
+        sim = _sim((40, 40), None, 1)
+        field = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
+        for kwargs in (
+            {"pml": Pml(1, WAVESPEED)},
+            {"pml": Pml(19, WAVESPEED)},
+            {"pml": Pml(6, WAVESPEED, faces=(4,))},
+            {"pml": Pml(6, WAVESPEED, reflection=1.0)},
+            {"pml": Pml(6, WAVESPEED), "damping": field},
+        ):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                replace(sim, **kwargs)
 
 
 if __name__ == "__main__":

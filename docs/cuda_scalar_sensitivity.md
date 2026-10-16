@@ -104,6 +104,20 @@ one axis of the stiffness gradient bracket $G_a$ at a near-wall node, scaled as 
 - $G_a$ with the ghost cell's radius-1 term at $a=2$ and $N-3$, divided by the wall row's half weight. It needs no face bits: the stiffness ghost is the even mirror on every face
 ### flux_divergence_axis
 byte-identical to the one in [cuda_scalar](cuda_scalar.md), since each `.cu` is its own compilation unit; `superposed_kernel` steps with it
+## pml helpers
+The forward memory terms of `pml_kernel` in [cuda_scalar](cuda_scalar.md) are a linear recursion local to the slab, so their transpose is mechanical: the adjoint memories $\eta^\pm,\eta_\zeta$ run backwards with the same $b$, and what the forward kernel read off $u^n$ through $D^\pm$ the adjoint scatters back onto $\lambda$ as a gather over the taps
+### plus_tap, minus_tap
+**aim**
+$\partial D^+/\partial u_{a+q}$ and $\partial D^-/\partial u_{a+q}$ for a node of radius `r`: the weight a cell difference gives the node `q` rows off, zero past its taps
+### pml_tap
+**aim**
+what the memories of slab thread `i`, on layer row `ai`, give back to the node `q` rows off it
+**input args**
+`aux`: the adjoint memories $\eta^+,\eta^-,\eta_\zeta$, three rows of `size`; `stiff`: array of $k$; `profile`, `f`, `N`: as `pml_kernel`; `o`: stride along the axis; `i`: the slab thread; `iidx`: its flat index; `ai`: its row; `q`: the row offset to the reading node
+**internal args**
+`gp, gm`: harmonic cell stiffnesses of row `ai`; `ez`: $a_i f_d\eta_\zeta$; `cp, cm`: the coefficients on $D^+$ and $D^-$
+**how?**
+$$c^\pm=a_{i\pm\frac12}\eta^\pm\pm g^\pm\left(1+a_{i\pm\frac12}\right)a_if_d\eta_\zeta,\qquad\textrm{tap}=c^+\,\partial_qD^++c^-\,\partial_qD^-$$
 ## kernels
 ### gradient_kernel
 **parallelization**
@@ -156,6 +170,31 @@ inject the adjoint signal and add its share of the mass gradient, the part of $\
 `n`: the flat index of the sensor; `load`: the injected value
 **how?**
 - `l2` and `g_mass` both take `atomicAdd`, since a sensor may repeat a node
+### pml_aux_kernel
+**parallelization**
+as `pml_kernel`, one thread per slab node of axis `d`; launched before `pml_adjoint_kernel` in every adjoint step
+**aim**
+advance the adjoint memories of axis `d` by one step backwards
+**input args**
+`l1`: $\lambda^{t+1}$; `stiff`: array of $k$; `aux`: the adjoint memories, updated in place; `profile`, `d`, `lo`, `hi`, `f`, `PML_PARAMS`: as `pml_kernel`
+**internal args**
+`q`: $W\lambda^{t+1}$, what the memories pair with, the stepped adjoint being that over $W$; `ez`: $\eta_\zeta$ before the update
+**how?**
+- the transpose of the forward recursion, each memory reading the divergence memory it fed
+$$\eta^\pm\leftarrow b_{i\pm\frac12}\left(\eta^\pm\pm a_if_dg^\pm\eta_\zeta\right)\pm f_dg^\pm q,\qquad\eta_\zeta\leftarrow b_i\eta_\zeta+q$$
+### pml_adjoint_kernel
+**parallelization**
+one thread per node of the slab of axis `d` grown `STENCIL_RADIUS` rows past each lined front, since a memory row is read back by every node its taps reach
+**aim**
+add the transposed memory terms of axis `d` to $\lambda^t$, after the adjoint step has written it
+**input args**
+`l2`: $\lambda^t$, added to in place; `g_mass`, `u1`, `mf`, `with_mass`: the fused step's inertia accumulator, the forward field it pairs with and its factor, patched only when `with_mass` is set; `stiff`, `minv`, `derive_inertia`: as `fd_kernel`; `aux`: the adjoint memories after `pml_aux_kernel`; `profile`, `d`, `lo`, `hi`, `f`: as `pml_kernel`; `dirichlet`: the face bitmask of `adjoint_kernel`; `PML_PARAMS`: extents and strides
+**internal args**
+`sum`: the gathered taps; `fold`: the ghost read folded onto its mirror; `delta`: the share added to $\lambda^t$
+**how?**
+- `sum` gathers `pml_tap` over the slab rows within `STENCIL_RADIUS`, and at rows 2 and $N-3$ the read of the ghost, which the forward step took through the mirror, folds back onto its image, odd on a Dirichlet face
+$$\lambda^t\mathrel{+}=\frac{1}{mW}\,\textrm{sum}$$
+- `adjoint_gradient_kernel` reads $\lambda^t$ into the inertia gradient before this share arrives, so the fused path subtracts its product with $u$ here rather than reordering the launches
 ### superposed_kernel
 **parallelization**
 threads act over the entire grid, one node each, exactly as `fd_kernel` (`INTERIOR_OR_RETURN`)

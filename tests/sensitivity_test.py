@@ -40,7 +40,23 @@ the reverse march reading only reversible nodes, so it is pinned to `sensitivity
 round-off rather than at a tolerance, damped as well as lossless. What can break it is
 the strip being too thin for the stencil, which shows up as a gradient error growing
 with `space_order`, and a damping field that leaves nothing to rebuild from, which has
-to raise.
+to raise. A strip stored narrower is the one departure it opts into, pinned at the
+tolerance its precision allows.
+
+`spectral_sensitivity` is exact only once both of its runs have decayed, so it is pinned
+to `sensitivity` on a uniformly damped domain, at a tolerance its own `decay` diagnostic
+sets, and has to warn when the run stops short of that and raise when the cost does not
+read the record through its spectrum.
+
+`PmlTest` pins the perfectly matched layer's transpose, which the adjoint steps by hand
+next to the interior one: the ghost read folded onto its mirror (odd on a Dirichlet
+face), the cell weight and inertia the stepped field carries, and the fused step's
+inertia gradient patched for the share added after it. The source gradient checks the
+transpose alone and at every node, sensors inside the layer included; the material
+gradient checks it outside the layer, where the gradient is exact and not zeroed.
+`reconstruction_sensitivity` replays the strip in front of the layer and so has to
+match `sensitivity` at round-off, and `spectral_sensitivity` needs no damping at all
+once the layer opens the domain.
 """
 
 import math
@@ -60,10 +76,16 @@ if HAS_CUDA:
     from cuwave.boundary import (
         Dirichlet,
         Neumann,
+        Pml,
         define_boundary,
         pad_for_sponge,
+        pml_nodes,
         sponge,
     )
+    from cuwave.boundary import Clamped, Conductor, Magnetic, Traction
+    from cuwave.anisotropic import AnisotropicElasticWave
+    from cuwave.elastic import ElasticWave
+    from cuwave.maxwell import DielectricWave
     from cuwave.scalar import AcousticWave, ScalarWave
     from cuwave.sensitivity import (
         l2_misfit,
@@ -71,9 +93,10 @@ if HAS_CUDA:
         reconstruction_sensitivity,
         sensitivity,
         source_sensitivity,
+        spectral_sensitivity,
         superposition_sensitivity,
     )
-    from cuwave.utils import collect_source, point_source
+    from cuwave.utils import collect_source, intensity, point_source
     from cuwave.signals import ricker
     from cuwave.wave import (
         apply_cell_weights,
@@ -176,6 +199,37 @@ def _sponged(order=2, N=NSTEPS, res=NC, beta=0.05, precision="float64"):
     )
     field = sponge(sim, cp.ones(sim.Nx_padded, dtype=sim.dtype), width, beta)
     return replace(sim, damping=field)
+
+
+def _matched(order=2, kind="scalar", boundary=None, faces=None, N=160, ndim=2):
+    """A sim with a six-node pml behind `faces`, its region of interest 26 nodes wide."""
+    res, width = 26, 6
+    Nx = (res + 2 * width, res + 2 * width - 3, res + 2 * width - 1)[:ndim]
+    dx = (1.0 / (res - 3),) * ndim
+    threads = {1: (64,), 2: (4, 32), 3: (2, 4, 32)}[ndim]
+    speed = math.sqrt(5.0) if kind == "acoustic" else 1.0
+    # the vector equations need the CFS shift, the elastic ones a clamped back wall
+    shift = 2.0 if kind in ("elastic", "anisotropic", "maxwell") else 0.0
+    common = dict(
+        precision="float64",
+        space_order=order,
+        boundary=boundary,
+        pml=Pml(width, speed, frequency=shift, faces=faces),
+    )
+    dt = (0.85 if kind in ("scalar", "acoustic") else 0.6) * stable_dt(dx, speed, order)
+    lame = dict(density=1.0, wavespeed_p=1.0, wavespeed_s=0.6)
+    if kind == "scalar":
+        return ScalarWave(Nx, dx, N, dt, threads, wavespeed=1.0, density=1.3, **common)
+    if kind == "elastic":
+        return ElasticWave(Nx, dx, N, dt, threads, **lame, **common)
+    if kind == "anisotropic":
+        return AnisotropicElasticWave(Nx, dx, N, dt, threads, **lame, **common)
+    if kind == "maxwell":
+        eps = dict(permittivity1=1.0, permittivity2=4.0)
+        return DielectricWave(Nx, dx, N, dt, threads, **eps, **common)
+    return AcousticWave(
+        Nx, dx, N, dt, threads, rho1=1.0, rho2=3.0, kappa1=1.0, kappa2=5.0, **common
+    )
 
 
 def _problem(sim, frequency, base):
@@ -467,6 +521,128 @@ class GradientTest(unittest.TestCase):
                 error = cp.abs(fused[name] - separate[name]).max()
                 error = float(error / cp.abs(separate[name]).max())
                 self.assertLess(error, 1e-12, f"{name} off by {error:.2e}")
+
+
+@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
+class PmlTest(unittest.TestCase):
+    MIXED = ((Dirichlet, Neumann), (Neumann, Dirichlet))
+
+    def _rows(self, sim, rows):
+        # a vector unknown takes the component row first, one per column
+        if sim.ncomp > 1:
+            rows = [[k % sim.ncomp for k in range(len(rows[0]))], *rows]
+        return cp.ascontiguousarray(cp.array(rows), dtype=cp.int32)
+
+    def _shot(self, sim):
+        t = np.arange(sim.N) * sim.dt
+        signal = ricker(t, 1.0, 6.0) / np.prod(sim.dx)
+        position = self._rows(sim, [[9, 12], [10, 25], [20, 14]][: sim.ndim])
+        columns = np.stack((signal, -0.6 * signal), axis=1)
+        return Source(position, cp.asarray(columns, dtype=sim.dtype))
+
+    def _case(self, sim):
+        source = self._shot(sim)
+        # one sensor deep in a corner of the layer, one on its front
+        rows = [[8, 20, 29, 4], [7, 15, 28, 3], [9, 16, 7, 3]]
+        sensors = self._rows(sim, rows[: sim.ndim])
+        base = 0.2 if isinstance(sim, AcousticWave) else 1.0
+        rng = np.random.default_rng(0)
+        indicator = cp.asarray(base + 0.3 * rng.random(sim.Nx_padded), dtype=sim.dtype)
+        observed = simulate(sim, source, indicator, sensors)[1] * 0.7
+        objective = l2_misfit(observed)
+
+        def cost_of():
+            return objective(simulate(sim, source, indicator, sensors)[1])[0]
+
+        return source, sensors, indicator, objective, cost_of
+
+    def _cases(self):
+        yield "order 2", _matched()
+        yield "order 4 mixed", _matched(4, boundary=self.MIXED, faces=(0, 3))
+        yield "order 8 Dirichlet", _matched(8, boundary=Dirichlet)
+        yield "acoustic order 4", _matched(4, kind="acoustic")
+        yield "3D order 4", _matched(4, boundary=Dirichlet, ndim=3, N=100)
+        yield "elastic order 2", _matched(2, kind="elastic", boundary=Clamped)
+        mixed = ((Clamped, Traction), (Traction, Clamped))
+        yield "elastic order 4 mixed", _matched(4, "elastic", mixed, faces=(0, 3))
+        yield "elastic 3D order 4", _matched(4, "elastic", Clamped, ndim=3, N=100)
+        yield "anisotropic", _matched(2, "anisotropic", Clamped)
+        yield "anisotropic mixed", _matched(2, "anisotropic", mixed, faces=(0, 3))
+        yield "anisotropic 3D", _matched(2, "anisotropic", Clamped, ndim=3, N=100)
+        yield "maxwell order 4", _matched(4, kind="maxwell")
+        mixed = ((Conductor, Magnetic), (Magnetic, Conductor), (Conductor, Magnetic))
+        yield "maxwell 3D order 2 mixed", _matched(2, "maxwell", mixed, ndim=3, N=100)
+
+    def test_the_source_gradient_matches_finite_differences(self):
+        for name, sim in self._cases():
+            with self.subTest(case=name):
+                source, sensors, indicator, objective, cost_of = self._case(sim)
+                _, gradient, _, _ = source_sensitivity(
+                    sim, source, indicator, sensors, objective
+                )
+                entries = [(0, 0), (11, 1), (30, 0), (61, 1)]
+                reference = _finite_difference(cost_of, source.signal, entries, h=1e-2)
+                adjoint = np.array([float(gradient[e]) for e in entries])
+                error = np.max(np.abs(adjoint - reference)) / np.max(np.abs(reference))
+                self.assertLess(error, 1e-8, f"source gradient off by {error:.2e}")
+
+    def test_the_material_gradient_matches_finite_differences_outside_the_layer(self):
+        for name, sim in self._cases():
+            with self.subTest(case=name):
+                source, sensors, indicator, objective, cost_of = self._case(sim)
+                _, grads, _, _ = sensitivity(sim, source, indicator, sensors, objective)
+                gradient = _combine(sim, grads, indicator)
+                nodes = [(7, 7, 7), (8, 20, 9), (15, 15, 15), (30, 7, 16)]
+                nodes = [n[: sim.ndim] for n in nodes]
+                reference = _finite_difference(cost_of, indicator, nodes, h=1e-6)
+                adjoint = np.array([float(gradient[n]) for n in nodes])
+                error = np.max(np.abs(adjoint - reference)) / np.max(np.abs(reference))
+                self.assertLess(error, 1e-7, f"material gradient off by {error:.2e}")
+
+    def test_the_layer_is_frozen_out_of_the_gradient(self):
+        sim = _matched(4)
+        source, sensors, indicator, objective, _ = self._case(sim)
+        _, grads, _, _ = sensitivity(sim, source, indicator, sensors, objective)
+        layer = pml_nodes(sim)
+        for field in grads.values():
+            self.assertEqual(float(cp.abs(field[layer]).max()), 0.0)
+            self.assertGreater(float(cp.abs(field[~layer]).max()), 0.0)
+
+    def test_reconstruction_matches_sensitivity_at_round_off(self):
+        for name, sim in self._cases():
+            with self.subTest(case=name):
+                source, sensors, indicator, objective, _ = self._case(sim)
+                exact = sensitivity(sim, source, indicator, sensors, objective)[1]
+                rebuilt, info = reconstruction_sensitivity(
+                    sim, source, indicator, sensors, objective
+                )[1::2]
+                self.assertGreater(info["strip"], 0)
+                for key in exact:
+                    # a uniform permeability leaves the maxwell stiffness gradient zero
+                    scale = max(float(cp.abs(exact[key]).max()), 1e-300)
+                    error = float(cp.abs(rebuilt[key] - exact[key]).max()) / scale
+                    self.assertLess(error, 1e-12, f"{key} off by {error:.2e}")
+
+    def test_spectral_matches_sensitivity_through_an_open_domain(self):
+        frequencies = (5.0, 7.0)
+        # an open 2D domain keeps an algebraic tail, so the run is long
+        sim = _matched(4, N=4800)
+        source, sensors, indicator, _, _ = self._case(sim)
+        objective = intensity(sim, frequencies)
+        reference = sensitivity(sim, source, indicator, sensors, objective)[1]
+        _, spectral, _, info = spectral_sensitivity(
+            sim, source, indicator, sensors, objective, frequencies
+        )
+        a, b = _combine(sim, spectral, indicator), _combine(sim, reference, indicator)
+        rel = float(cp.linalg.norm(a - b) / cp.linalg.norm(b))
+        self.assertLess(info["decay"], 1e-3)
+        self.assertLess(rel, 1e-3, f"relative difference {rel:.3e}")
+
+    def test_superposition_refuses_a_pml(self):
+        sim = _matched()
+        source, sensors, indicator, objective, _ = self._case(sim)
+        with self.assertRaises(NotImplementedError):
+            superposition_sensitivity(sim, source, indicator, sensors, objective)
 
 
 @unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
@@ -765,6 +941,36 @@ class ReconstructionTest(unittest.TestCase):
         grew = peaks["reconstruction", 800] / peaks["reconstruction", 100]
         self.assertLess(grew, 0.5 * peaks["standard", 800] / peaks["standard", 100])
 
+    def test_a_narrower_strip_trades_exactness_for_memory(self):
+        # float32 under float64 is near exact, bfloat16 keeps three digits
+        for precision, stored, tolerance in (
+            ("float64", "float32", 1e-6),
+            ("float64", "bfloat16", 1e-2),
+            ("float32", "bfloat16", 1e-2),
+        ):
+            with self.subTest(precision=precision, strip_dtype=stored):
+                sim = _sponged(precision=precision)
+                source, sensors, indicator, objective = _problem(sim, 5.0, 1.0)
+                _, reference, _, _ = sensitivity(
+                    sim, source, indicator, sensors, objective
+                )
+                _, grads, _, _ = reconstruction_sensitivity(
+                    sim, source, indicator, sensors, objective, strip_dtype=stored
+                )
+                _, valid = reconstruction_nodes(sim)
+                a = _combine(sim, grads)[valid]
+                b = _combine(sim, reference)[valid]
+                rel = float(cp.linalg.norm(a - b) / cp.linalg.norm(b))
+                self.assertLess(rel, tolerance, f"relative difference {rel:.3e}")
+
+    def test_a_strip_dtype_no_narrower_is_refused(self):
+        sim = _sponged(precision="float32")
+        source, sensors, indicator, objective = _problem(sim, 5.0, 1.0)
+        with self.assertRaises(ValueError):
+            reconstruction_sensitivity(
+                sim, source, indicator, sensors, objective, strip_dtype="float32"
+            )
+
     def test_a_fully_damped_simulation_is_refused(self):
         # a uniform field leaves no lossless node, so there is nothing to rebuild from
         sim = _scalar()
@@ -772,6 +978,57 @@ class ReconstructionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             reconstruction_sensitivity(
                 _damp(sim, indicator, 0.02), source, indicator, sensors, objective
+            )
+
+
+@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
+class SpectralTest(unittest.TestCase):
+    frequencies = (5.0, 7.0)
+
+    def _both(self, sim, steps=900, beta=0.02, region=None):
+        sim = replace(sim, N=steps)
+        source, sensors, indicator, _ = _problem(sim, 5.0, 1.0)
+        sim = _damp(sim, indicator, beta)
+        objective = intensity(sim, self.frequencies)
+        reference = sensitivity(sim, source, indicator, sensors, objective)
+        spectral = spectral_sensitivity(
+            sim, source, indicator, sensors, objective, self.frequencies, region
+        )
+        return sim, indicator, reference, spectral
+
+    def test_it_matches_sensitivity_once_the_fields_decay(self):
+        for name, sim in (
+            ("scalar", _scalar()),
+            ("scalar order 4", _scalar(order=4)),
+        ):
+            with self.subTest(operator=name):
+                sim, indicator, (c0, g0, _, _), (c1, g1, _, info) = self._both(sim)
+                self.assertEqual(c0, c1)
+                a, b = _combine(sim, g1, indicator), _combine(sim, g0, indicator)
+                rel = float(cp.linalg.norm(a - b) / cp.linalg.norm(b))
+                self.assertLess(info["decay"], 1e-5)
+                self.assertLess(rel, 1e-5, f"{name}: relative difference {rel:.3e}")
+
+    def test_a_region_keeps_the_gradient_inside_it(self):
+        region = cp.zeros(_scalar().Nx_padded, dtype=cp.bool_)
+        region[10:20, 8:16] = True
+        sim, indicator, _, (_, whole, _, _) = self._both(_scalar())
+        _, _, _, (_, part, _, _) = self._both(_scalar(), region=region)
+        a, b = _combine(sim, part, indicator), _combine(sim, whole, indicator)
+        rel = float(cp.linalg.norm(a[region] - b[region]) / cp.linalg.norm(b[region]))
+        self.assertLess(rel, 1e-12, f"relative difference {rel:.3e}")
+        self.assertEqual(float(cp.abs(a[~region]).max()), 0.0)
+
+    def test_a_run_that_has_not_decayed_warns(self):
+        with self.assertWarns(RuntimeWarning):
+            self._both(_scalar(), steps=300, beta=0.002)
+
+    def test_a_cost_off_the_spectrum_is_refused(self):
+        sim = replace(_scalar(), N=600)
+        source, sensors, indicator, objective = _problem(sim, 5.0, 1.0)
+        with self.assertRaises(ValueError):
+            spectral_sensitivity(
+                sim, source, indicator, sensors, objective, self.frequencies
             )
 
 

@@ -32,6 +32,7 @@ if HAS_CUDA:
         SIMP,
         DensityFilter,
         Projection,
+        SmoothedProjection,
         Tikhonov,
         TotalVariation,
         _spatial_grad,
@@ -47,6 +48,11 @@ def _design(shape=(9, 7), low=0.15, high=0.85, seed=0):
     """A float64 design strictly inside [0, 1], where every map is differentiable."""
     cp.random.seed(seed)
     return cp.random.uniform(low, high, size=shape).astype(cp.float64)
+
+
+def _smooth(shape=(24, 20), seed=0):
+    """A filtered design, smooth enough that its level set is a curve."""
+    return DensityFilter(3.0, shape, dtype=cp.float64)(_design(shape, 0.0, 1.0, seed))
 
 
 def _directional(f, x, v, h=STEP):
@@ -138,6 +144,11 @@ class MapAdjointTest(unittest.TestCase):
     def test_simp_is_its_own_transpose_against_dy(self):
         self._check(SIMP(p=3.0, x_min=1e-3), _design())
 
+    def test_the_smoothed_projection_is_its_own_transpose_at_any_beta(self):
+        for beta in [8.0, 64.0, math.inf]:
+            with self.subTest(beta=beta):
+                self._check(SmoothedProjection(beta=beta), _smooth())
+
 
 # --------------------------- properties a driver relies on ---------------------------
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
@@ -202,6 +213,38 @@ class ProjectionTest(unittest.TestCase):
         gentle = float(Projection(beta=1.0)(x).mean())
         sharp = float(Projection(beta=20.0)(x).mean())
         self.assertGreater(sharp, gentle)
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class SmoothedProjectionTest(unittest.TestCase):
+    def test_away_from_the_interface_it_is_the_projection(self):
+        x = cp.full((6, 6), 0.7, dtype=cp.float64)
+        smoothed = SmoothedProjection(beta=8.0)(x)
+        self.assertAlmostEqual(
+            float(cp.abs(smoothed - Projection(beta=8.0)(x)).max()), 0.0, places=12
+        )
+
+    def test_at_infinite_beta_only_the_interface_is_grey(self):
+        x = _smooth()
+        projection = SmoothedProjection(beta=math.inf)
+        y = projection(x)
+        grey = (y > 0.0) & (y < 1.0)
+        self.assertGreater(int(grey.sum()), 0)
+        self.assertTrue(bool(cp.all(projection._interface(x)[2][grey])))
+
+    def test_at_infinite_beta_the_gradient_survives(self):
+        x = _smooth()
+        gradient = SmoothedProjection(beta=math.inf).grad(x, _design(x.shape, seed=6))
+        self.assertGreater(float(cp.abs(gradient).max()), 0.0)
+        self.assertTrue(bool(cp.all(cp.isfinite(gradient))))
+
+    def test_the_output_stays_inside_the_unit_interval(self):
+        x = _smooth()
+        for beta in [1.0, 8.0, math.inf]:
+            with self.subTest(beta=beta):
+                y = SmoothedProjection(beta=beta)(x)
+                self.assertGreaterEqual(float(y.min()), -1e-12)
+                self.assertLessEqual(float(y.max()), 1.0 + 1e-12)
 
 
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")

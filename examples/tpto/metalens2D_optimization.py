@@ -7,13 +7,13 @@ import cupy.typing as cpt
 import matplotlib.pyplot as plt
 import numpy as np
 
-from cuwave.boundary import pad_for_sponge, sponge
+from cuwave.boundary import Pml, pad_for_sponge
 from cuwave.geometry import box
 from cuwave.maxwell import MagneticWave
 from cuwave.optimization import Adam
 from cuwave.postprocessing import markers, show
 from cuwave.regularization import DensityFilter, Projection
-from cuwave.sensitivity import reconstruction_sensitivity
+from cuwave.sensitivity import spectral_sensitivity
 from cuwave.signals import ricker
 from cuwave.utils import (
     Sensors,
@@ -38,7 +38,7 @@ PERMITTIVITY1, PERMITTIVITY2 = 1.0, INDEX_SI**2
 PERMEABILITY = 1.0
 FREQUENCY = 2.0
 AMPLITUDE = 1.0
-T = 10.0
+T = 14.0  # long enough for the lens to ring down, see info["decay"]
 
 # geometry (design wavelengths), from table 1 of Christiansen & Sigmund 2021
 WIDTH, HEIGHT = 8.727, 3.302
@@ -49,8 +49,7 @@ ENVELOPE = 2.727
 SOURCE_DEPTH = 0.15
 
 # boundary
-THICKNESS = 2.0
-SPONGE_DECAY = 4.3  # decay per wavelength travelled
+THICKNESS = 0.5  # pml depth in wavelengths
 
 # optimization
 ITERATIONS = 60
@@ -88,11 +87,10 @@ sim = MagneticWave(
     permittivity1=PERMITTIVITY1,
     permittivity2=PERMITTIVITY2,
     permeability=PERMEABILITY,
+    pml=Pml(pad, 1.0),
 )
-air = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
-sim = replace(sim, damping=sponge(sim, air, pad, SPONGE_DECAY * dt))
 print(
-    f"{Nx[0]} x {Nx[1]} nodes, {pad} sponge, {N} steps of {dt:.4g}, "
+    f"{Nx[0]} x {Nx[1]} nodes, {pad} node pml, {N} steps of {dt:.4g}, "
     f"{1.0 / (INDEX_SI * dx[0]):.0f} points per silicon wavelength"
 )
 
@@ -122,8 +120,8 @@ info = {}
 
 
 def adjoint(*args):
-    """`reconstruction_sensitivity`, keeping the drift its reverse march reports."""
-    out = reconstruction_sensitivity(*args)
+    """`spectral_sensitivity` on the design region, keeping the decay it reports."""
+    out = spectral_sensitivity(*args, FREQUENCY, region=region)
     info.update(out[3])
     return out
 
@@ -160,7 +158,7 @@ for iteration in range(ITERATIONS):
     print(
         f"iteration {iteration}: focus {cost:.4e}  "
         f"{10 * math.log10(cost / bare):+.2f} dB  beta {projection.beta:.0f}  "
-        f"drift {info['drift']:.1e}"
+        f"decay {info['decay']:.1e}"
     )
 cp.cuda.Stream.null.synchronize()
 print(f"{ITERATIONS:d} iterations of {N:d} steps: {time.time() - tic:.1f}s")

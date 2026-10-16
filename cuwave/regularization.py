@@ -47,6 +47,31 @@ def _spatial_grad_adjoint(u: cpt.NDArray, axis: int) -> cpt.NDArray:
     return out
 
 
+def _central_adjoint(u: cpt.NDArray, axis: int) -> cpt.NDArray:
+    """transpose of `cp.gradient` along `axis`: central inside, one-sided at both ends"""
+    n = u.shape[axis]
+    first, last = u[_axis_slice(u.ndim, axis, 0)], u[_axis_slice(u.ndim, axis, n - 1)]
+    inner = 0.5 * u[_axis_slice(u.ndim, axis, slice(1, n - 1))]
+    out = cp.zeros_like(u)
+    out[_axis_slice(u.ndim, axis, slice(2, n))] += inner
+    out[_axis_slice(u.ndim, axis, slice(0, n - 2))] -= inner
+    out[_axis_slice(u.ndim, axis, 1)] += first
+    out[_axis_slice(u.ndim, axis, 0)] -= first
+    out[_axis_slice(u.ndim, axis, n - 1)] += last
+    out[_axis_slice(u.ndim, axis, n - 2)] -= last
+    return out
+
+
+def _fill(s: cpt.NDArray) -> cpt.NDArray:
+    """Fill fraction of a disc whose centre sits `s` radii inside the interface."""
+    return 0.5 - 15.0 / 16.0 * s + 5.0 / 8.0 * s**3 - 3.0 / 16.0 * s**5
+
+
+def _fill_slope(s: cpt.NDArray) -> cpt.NDArray:
+    """Derivative of `_fill`."""
+    return -15.0 / 16.0 + 15.0 / 8.0 * s**2 - 15.0 / 16.0 * s**4
+
+
 # ------------------------------- regularization classes ------------------------------
 class Regularization(abc.ABC):
     """Forward pass in `__call__(x)`, backward pass in `grad(x, dy)`, re-tuned by `set`."""
@@ -127,6 +152,81 @@ class Projection(Regularization):
         a, b = self._ends()
         t = cp.tanh(self.beta * (x - self.eta))
         return dy * self.beta * (1.0 - t * t) / (a + b)
+
+
+class SmoothedProjection(Regularization):
+    """`Projection` with its interface averaged over a node, so it survives `beta = inf`.
+
+    Where the `eta` level set of the filtered design passes within `radius` of a node,
+    the node takes the fill fraction of the two projected phases a disc of that radius
+    sees, read off the distance `(eta - x) / |grad x|` to the interface. The output is
+    then binary everywhere but on the interface, whose gradient stays finite at any
+    `beta`, so a continuation can run to infinity rather than ending on `threshold`.
+    Hammond et al. 2025 (https://arxiv.org/abs/2503.20189), as fdtdx implements it.
+
+    Args:
+        beta: sharpness, `math.inf` for the Heaviside itself.
+        eta: threshold.
+        radius: smoothing radius in nodes, 0.55 as in the reference.
+    """
+
+    def __init__(self, beta: float, eta: float = 0.5, radius: float = 0.55) -> None:
+        self.beta, self.eta, self.radius = beta, eta, radius
+
+    def _project(self, x: cpt.NDArray) -> tuple[cpt.NDArray, cpt.NDArray]:
+        """The plain projection of `x` and its slope, the Heaviside's being zero."""
+        if math.isinf(self.beta):
+            return (x > self.eta).astype(x.dtype), cp.zeros_like(x)
+        projection = Projection(self.beta, self.eta)
+        return projection(x), projection.grad(x)
+
+    def _interface(self, x: cpt.NDArray) -> tuple:
+        """Gradient components, their norm, the near-interface mask, and `d / radius` there."""
+        slopes = cp.gradient(x) if x.ndim > 1 else [cp.gradient(x)]
+        norm = cp.sqrt(sum(s * s for s in slopes))
+        flat = norm == 0.0
+        # a flat node never smooths, so its norm only has to keep the division finite
+        norm = cp.where(flat, 1.0, norm)
+        scaled = (self.eta - x) / (norm * self.radius)
+        near = ~flat & (cp.abs(scaled) < 1.0)
+        return slopes, norm, near, cp.where(near, scaled, 0.0)
+
+    def __call__(self, x: cpt.NDArray) -> cpt.NDArray:
+        """Projected design, the interface nodes replaced by their fill fraction."""
+        projected, _ = self._project(x)
+        _, norm, near, s = self._interface(x)
+        fill, fill_minus = _fill(s), _fill(-s)
+        low, _ = self._project(x - self.radius * norm * fill)
+        high, _ = self._project(x + self.radius * norm * fill_minus)
+        return cp.where(near, (1.0 - fill) * low + fill * high, projected)
+
+    def grad(self, x: cpt.NDArray, dy: cpt.NDArray | float = 1.0) -> cpt.NDArray:
+        """Adjoint: the local chain rule, then the gradient norm's stencil transposed."""
+        _, slope = self._project(x)
+        slopes, norm, near, s = self._interface(x)
+        fill, fill_minus = _fill(s), _fill(-s)
+        dfill, dfill_minus = _fill_slope(s), _fill_slope(-s)
+        low, low_slope = self._project(x - self.radius * norm * fill)
+        high, high_slope = self._project(x + self.radius * norm * fill_minus)
+        jump = high - low
+        low_slope, high_slope = (1.0 - fill) * low_slope, fill * high_slope
+        # d/dx and d/d|grad x| of the smoothed value, s = (eta - x) / (|grad x| R)
+        by_value = (
+            -jump * dfill / (norm * self.radius)
+            + low_slope * (1.0 + dfill)
+            + high_slope * (1.0 + dfill_minus)
+        )
+        by_norm = self.radius * (
+            -jump * dfill * s / (norm * self.radius)
+            + low_slope * (s * dfill - fill)
+            + high_slope * (fill_minus + s * dfill_minus)
+        )
+        dy = cp.broadcast_to(cp.asarray(dy, dtype=x.dtype), x.shape)
+        out = cp.where(near, dy * by_value, dy * slope)
+        weight = cp.where(near, dy * by_norm / norm, 0.0)
+        for axis, component in enumerate(slopes):
+            out += _central_adjoint(weight * component, axis)
+        return out
 
 
 class SIMP(Regularization):

@@ -70,6 +70,30 @@ the engineering shear strain of the $\left(k,l\right)$ pair at its own staggered
 - both derivatives land on the point without averaging, each at its own graded radius
 $$2\,\varepsilon_{kl}=\frac{1}{\Delta x_l}\sum_{j\le r_1}c_j\left(u_k^{a+j}-u_k^{a+1-j}\right)+\frac{1}{\Delta x_k}\sum_{j\le r_2}c_j\left(u_l^{a+j}-u_l^{a+1-j}\right)$$
 
+## pml helpers
+Every pml kernel of this file runs on the slab of one lined axis `e` through `SLAB_OR_RETURN` ([cuda_scalar](cuda_scalar.md)). Its memory `aux` holds `2 * NDIM` rows: the strain memories $\psi_k$ of $\partial_eu_k$ at the strain point $\left(k,e\right)$, then the divergence memories $\zeta_c$ of the axis-$e$ part of $\nabla\cdot\sigma_c$. The `profile` rows are read at the node or at the half point $a+\tfrac12$, whichever the quantity sits on along `e`
+### zeroed_axes
+**aim**
+the bitmask of axes a traction wall zeroes at a node, the set bits of `normal_strains` alone, so the pml stress condenses as the step does
+### stress_row, Stress
+**aim**
+`stress_row(c, e)`: the Voigt row of $\sigma_{ce}$, normal on the diagonal, else its shear pair; `Stress`: $\sigma_{ce}$ `j` nodes along `e` from a node, the stress component the divergence of $c$ reads along `e`
+### strain_term
+**aim**
+$\partial_eu_k$ at the strain point $\left(k,e\right)$, graded at the walls exactly as `normal_strains` and `shear_strain` take it, including the clamped fold
+**input args**
+`u`: any accessor of `(k, j)`, a `Field` forwards and a `Memory` in the adjoint; `k`, `e`: component and axis; `A`, `NN`: node indices and extents; `fe`: $1/\Delta x_e$; `clamped`: the face bitmask
+### divergence_term
+**aim**
+the axis-$e$ part of the divergence of component $c$, as `fd_kernel` takes it, with the same graded taps and clamped fold
+**input args**
+`sig`: any accessor of `(c, j)`, a `Stress` forwards and a `Memory<Stress>` in the adjoint; `c`, `e`, `A`, `NN`, `fe`, `clamped`: as `strain_term`
+### add_stress
+**aim**
+add the stress of the strain terms `t` of axis `e` onto the stress points, through the same condensed $\lambda$ and shear means as `stress_kernel`
+**input args**
+`sigma`: the stress scratch, added to; `gnode`, `gshear`, `lam`, `mu`, `clamped`: as `stress_kernel`; `idx`, `cs`, `e`, `A`, `NN`: geometry; `t`: one strain term per component, $\partial_eu_k$ or its memory
+
 ## kernels
 
 ### stress_kernel
@@ -98,6 +122,54 @@ one thread per grid point, updating every component whose unknown it carries
 - the divergence is the exact transpose of the strain differences: every tap carries the coefficient of the stress point it reads, evaluated by the same `rad_node` / `rad_half`, with the clamped fold doubling the wall tap
 $$f_c=\frac{1}{\Delta x_c}\sum_k c_k^{\left(r\left(a\right)\right)}\left(\sigma_{cc}^{i+k}-\sigma_{cc}^{i-k+1}\right)+\sum_{l\ne c}\frac{1}{\Delta x_l}\sum_j c_j^{\left(r\left(a\right)\right)}\left(\sigma_{cl}^{i+j-1}-\sigma_{cl}^{i-j}\right)$$
 - the march is the three-term recursion of [cuda_scalar](cuda_scalar.md), component by component, `USE_DAMPING` dividing by $1+\beta$ with one damping field serving every component
+
+### pml_stress_kernel
+**parallelization**
+flat 1D launch over the slab of axis `e`, `PML_THREADS` per block; launched once per lined axis after `stress_kernel`
+**aim**
+advance the strain memories of axis `e` and add the stress they carry onto `sigma`
+**input args**
+`u1`: the field at $t-1$; `sigma`: the stresses `stress_kernel` wrote, added to; `gnode`, `gshear`, `lam`, `mu`, `clamped`, `cs`: as `stress_kernel`; `aux`: the memory of this axis; `profile`: its `(4, NN[e])` rows from `pml_profiles`; `e`: the lined axis; `lo, hi`: slab rows; `f0..f2`: $1/\Delta x_d$; `N0..N2`, `s0, s1`: geometry
+**how?**
+$$\psi_k\leftarrow b\,\psi_k+a\,\partial_eu_k,\qquad\sigma\mathrel{+}=\textrm{the stress of }\psi$$
+- every lined axis adds onto the one scratch, so the update reads the stress stretched along all of them, which is what holds a corner together
+### pml_force_kernel
+**parallelization**
+as `pml_stress_kernel`, launched once per lined axis after `fd_kernel`
+**aim**
+advance the divergence memories of axis `e` and add them to the update
+**input args**
+`u1`: unread, kept so one launch list serves this kernel and its adjoint; `u2`: the field at $t$, added to; `sigma`: the stretched stresses; `minv`, `clamped`, `cs`: as `fd_kernel`; `aux`, `profile`, `e`, `lo`, `hi`: as `pml_stress_kernel`; `f0..f2`: $\Delta t^2/\Delta x_d$; `N0..N2`, `s0, s1`: geometry
+**how?**
+$$\zeta_c\leftarrow b\,\zeta_c+a\,\partial_e\sigma_{ce},\qquad u_c^t\mathrel{+}=m_c^{-1}\zeta_c$$
+### pml_adjoint_stress_kernel
+**parallelization**
+as `pml_stress_kernel`, the slab grown `STENCIL_RADIUS` rows past each lined front, since the transposed taps reach that far; launched after `stress_kernel` has formed the stress of $\lambda$
+**aim**
+push the divergence memories back through the strain: the transpose of `pml_force_kernel`
+**input args**
+`l1`: the adjoint at $t+1$; `sigma`: the stress of $\lambda$, added to; `aux`: the adjoint memories, read only; the rest as `pml_stress_kernel`
+**how?**
+- `strain_term` on the `Memory` of $\lambda$ and the divergence memories, $a\left(\lambda_k+\eta_{\zeta,k}\right)$, then `add_stress`
+### pml_adjoint_force_kernel
+**parallelization**
+as `pml_adjoint_stress_kernel`, launched after `fd_kernel`
+**aim**
+push the strain memories back through the divergence, the transpose of `pml_stress_kernel`, and advance the divergence memories
+**input args**
+`l1`: the adjoint at $t+1$; `l2`: the adjoint at $t$, added to; `sigma`, `minv`, `clamped`, `cs`, `aux`, `profile`, `e`, `lo`, `hi`: as `pml_force_kernel`
+**how?**
+$$\lambda_c^t\mathrel{+}=m_c^{-1}\,\partial_e\left(a\left(\sigma_{ce}+\eta_{\psi}\right)\right),\qquad\eta_{\zeta,c}\leftarrow b\left(\eta_{\zeta,c}+\lambda_c^{t+1}\right)$$
+- the divergence memory is advanced only on the slab proper, where `t` is not -1, after the stress pass has read it
+### pml_adjoint_memory_kernel
+**parallelization**
+over the slab proper, launched last in every adjoint step
+**aim**
+advance the strain memories once the update has read them
+**input args**
+`sigma`: the stretched stress of $\lambda$; `cs`, `aux`, `profile`, `e`, `lo`, `hi`, `f0..f2`, `N0..N2`, `s0, s1`: as above
+**how?**
+$$\eta_{\psi,k}\leftarrow b\left(\eta_{\psi,k}+\sigma_{ke}\right)$$
 
 ### excitation_kernel
 From the shared prelude, so this file does not carry it; see [cuda_scalar](cuda_scalar.md). A vector source is `NDIM` entries of `lin_index`, one per component, at `d * cs + idx`, so the `atomicAdd` covers a source and a sensor landing on the same point and component
