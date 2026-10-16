@@ -196,6 +196,18 @@ class GradientTest(unittest.TestCase):
                 replace(sim, devices=DEVICES), source, gamma, sensors.nodes, None
             )
 
+    def test_an_error_in_one_subdomain_reaches_the_caller(self):
+        sim, _ = _scalar()
+        source, sensors, gamma = _experiment(sim, None)
+
+        def objective(traces):
+            raise ArithmeticError("the leader fails, the others wait at its barrier")
+
+        with self.assertRaises(ArithmeticError):
+            sensitivity(
+                replace(sim, devices=DEVICES), source, gamma, sensors.nodes, objective
+            )
+
     def test_a_halo_wider_than_a_share_is_refused(self):
         sim, _ = _scalar(8, Nx=(120, 64))
         source = point_source(sim, [[0.5, 0.3]], np.zeros(sim.N))

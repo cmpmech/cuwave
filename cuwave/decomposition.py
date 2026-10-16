@@ -289,26 +289,27 @@ def _run(function: Callable, sim: Simulation, arguments: dict):
         device = team.devices[k]
         g0, g1 = team.bounds[k][:2]
         with cp.cuda.Device(device), cp.cuda.Stream(non_blocking=True) as stream:
-            local = _subdomain(sim, k, team)
-            position, held, _ = _points(sim, local, source.position, k, team)
-            signal = _columns(source.signal, held, k, team)
-            local_args = {**arguments, "sim": local}
-            local_args["source"] = replace(source, position=position, signal=signal)
-            local_args["indicator"] = _move(indicator[g0:g1], device)
-            if sensors is not None:
-                local_args["sensors"], held, owned = _points(
-                    sim, local, sensors, k, team
-                )
-                columns[k] = (held, owned)
-            if objective is not None:
-                local_args["objective"] = _objective(
-                    objective, k, team, columns, sensors
-                )
-            _context.team, _context.index, _context.sim = team, k, local
             try:
+                local = _subdomain(sim, k, team)
+                position, held, _ = _points(sim, local, source.position, k, team)
+                signal = _columns(source.signal, held, k, team)
+                local_args = {**arguments, "sim": local}
+                local_args["source"] = replace(source, position=position, signal=signal)
+                local_args["indicator"] = _move(indicator[g0:g1], device)
+                if sensors is not None:
+                    local_args["sensors"], held, owned = _points(
+                        sim, local, sensors, k, team
+                    )
+                    columns[k] = (held, owned)
+                if objective is not None:
+                    local_args["objective"] = _objective(
+                        objective, k, team, columns, sensors
+                    )
+                _context.team, _context.index, _context.sim = team, k, local
                 out = function(**local_args)
                 stream.synchronize()
             except BaseException:
+                # released, so no other subdomain waits for this one at a barrier
                 team.barrier.abort()
                 raise
             finally:
@@ -316,7 +317,12 @@ def _run(function: Callable, sim: Simulation, arguments: dict):
         return out
 
     with ThreadPoolExecutor(len(team.devices)) as pool:
-        outs = list(pool.map(work, range(len(team.devices))))
+        futures = [pool.submit(work, k) for k in range(len(team.devices))]
+    errors = [f.exception() for f in futures if f.exception() is not None]
+    if errors:
+        # the subdomain that failed first, not the others its abort released
+        raise min(errors, key=lambda e: isinstance(e, threading.BrokenBarrierError))
+    outs = [f.result() for f in futures]
     total = 0 if sensors is None else sensors.shape[1]
     if objective is None:
         fields = _stitch(
