@@ -1,6 +1,9 @@
+import copy
+import dataclasses
 import itertools
 import warnings
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 
 import cupy as cp
 import cupy.typing as cpt
@@ -20,6 +23,52 @@ def _reparametrize(
     """Chain d(cost)/d(mass, stiff) onto the indicator with `parametrization_jacobian`."""
     d_mass, d_stiff = sim.parametrization_jacobian(indicator)
     return d_mass * grads["mass"] + d_stiff * grads["stiff"]
+
+
+def _replicate(value, device: int):
+    """`value` with every device array in it copied onto `device`, shared if already there"""
+    if isinstance(value, cp.ndarray):
+        if value.device.id == device:
+            return value
+        with cp.cuda.Device(device):
+            return value.copy()
+    if isinstance(value, (list, tuple)):
+        return type(value)(_replicate(v, device) for v in value)
+    if isinstance(value, Sensors):
+        twin = copy.copy(value)
+        vars(twin).update({k: _replicate(v, device) for k, v in vars(value).items()})
+        return twin
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        fields = [f.name for f in dataclasses.fields(value) if f.init]
+        moved = {k: _replicate(getattr(value, k), device) for k in fields}
+        if all(moved[k] is getattr(value, k) for k in fields):
+            return value
+        with cp.cuda.Device(device):
+            return dataclasses.replace(value, **moved)
+    return value
+
+
+def _spread(
+    devices: Sequence[int], work: Callable, shared: tuple, *shots: Sequence
+) -> list:
+    """`work(*shared, *shares)` per device, its share every `len(devices)`-th entry of `shots`.
+
+    Each device runs in its own thread on its own stream, with `shared` and its share
+    replicated there, and what `work` returns comes back onto the calling device.
+    """
+    cp.cuda.get_current_stream().synchronize()
+    home, n = cp.cuda.Device().id, len(devices)
+
+    def run(k):
+        device = devices[k]
+        with cp.cuda.Device(device), cp.cuda.Stream(non_blocking=True) as stream:
+            shares = (_replicate(list(s[k::n]), device) for s in shots)
+            out = work(*_replicate(shared, device), *shares)
+            stream.synchronize()
+        return _replicate(out, home)
+
+    with ThreadPoolExecutor(n) as pool:
+        return list(pool.map(run, range(n)))
 
 
 # -------------------------------------- general --------------------------------------
@@ -321,8 +370,22 @@ def measure(
     sources: Sequence[Source],
     indicator: cpt.NDArray,
     sensors: Sensors,
+    devices: Sequence[int] | None = None,
 ) -> list[cpt.NDArray]:
-    """Receiver traces per shot: the synthetic experiment an inversion is fitted to"""
+    """Receiver traces per shot: the synthetic experiment an inversion is fitted to.
+
+    `devices` spreads the shots over several GPUs, every `len(devices)`-th on each.
+    """
+    if devices is not None:
+        parts = _spread(
+            devices,
+            lambda sim, indicator, sensors, share: measure(
+                sim, share, indicator, sensors
+            ),
+            (sim, indicator, sensors),
+            sources,
+        )
+        return [parts[i % len(parts)][i // len(parts)] for i in range(len(sources))]
     return [
         sensors.traces(simulate(sim, source, indicator, sensors=sensors.nodes)[1])
         for source in sources
@@ -336,12 +399,11 @@ def misfit(
     sensors: Sensors,
     observed: Sequence[cpt.NDArray],
     objective: Callable = l2_misfit,
+    devices: Sequence[int] | None = None,
 ) -> float:
     """The cost `misfit_gradient` returns, without its gradient: forward passes only."""
-    return sum(
-        objective(data)(traces)[0]
-        for traces, data in zip(measure(sim, sources, indicator, sensors), observed)
-    )
+    traces = measure(sim, sources, indicator, sensors, devices)
+    return sum(objective(data)(t)[0] for t, data in zip(traces, observed))
 
 
 def misfit_gradient(
@@ -352,6 +414,7 @@ def misfit_gradient(
     observed: Sequence[cpt.NDArray],
     objective: Callable = l2_misfit,
     adjoint: Callable = sensitivity,
+    devices: Sequence[int] | None = None,
 ) -> tuple[float, cpt.NDArray]:
     """Misfit summed over the shots and its derivative with respect to `indicator`.
 
@@ -364,11 +427,24 @@ def misfit_gradient(
         objective: factory taking one record and returning `objective(traces)`.
         adjoint: which variant computes each shot, `reconstruction_sensitivity`
             where the stored history no longer fits.
+        devices: GPUs to spread the shots over, every `len(devices)`-th on each, or
+            None for the current one.
 
     Returns:
         (cost, gradient), the gradient a field over the padded grid, already
         reparametrized from (mass, stiff) onto `indicator`.
     """
+    if devices is not None:
+        parts = _spread(
+            devices,
+            lambda sim, indicator, sensors, share, data: misfit_gradient(
+                sim, share, indicator, sensors, data, objective, adjoint
+            ),
+            (sim, indicator, sensors),
+            sources,
+            observed,
+        )
+        return sum(c for c, _ in parts), sum(g for _, g in parts)
     cost = 0.0
     gradient = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
     for source, data in zip(sources, observed):

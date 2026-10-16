@@ -10,9 +10,13 @@ against central differences.
 `tdt` / `itdt` are only right with the time origin of each record right, a source row
 `t` sitting at `t dt` and a sensor row at `(t + 1) dt`, which no round trip can see. So
 they are pinned on a real leapfrog run against the exact 1D solution.
+
+`devices` spreads the shots over threads, one stream each, so it must reproduce the
+serial cost and gradient; two entries naming the same GPU exercise that on one card.
 """
 
 import unittest
+from dataclasses import replace
 
 import numpy as np
 
@@ -26,7 +30,19 @@ except Exception:
 if HAS_CUDA:
     from cuwave.scalar import ScalarWave
     from cuwave.signals import ricker
-    from cuwave.utils import intensity, itdt, leapfrog_frequency, point_source, tdt
+    from cuwave.sensitivity import reconstruction_sensitivity, sensitivity
+    from cuwave.utils import (
+        Sensors,
+        intensity,
+        itdt,
+        leapfrog_frequency,
+        measure,
+        misfit,
+        misfit_gradient,
+        point_source,
+        shots,
+        tdt,
+    )
     from cuwave.wave import simulate, stable_dt
 
 
@@ -185,3 +201,41 @@ class TimeDispersionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class DevicesTest(unittest.TestCase):
+    def setUp(self):
+        sim = _sim(N=80)
+        damping = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
+        damping[:, 24:] = 2.0
+        self.sim = replace(sim, damping=damping)
+        coords = [[0.5, 0.5], [1.5, 0.5], [2.5, 1.0]]
+        self.sources = shots(
+            self.sim, coords, ricker(np.arange(80) * self.sim.dt, 1.0, 4.0)
+        )
+        self.sensors = Sensors(self.sim, [[0.5, 2.5], [1.5, 2.5], [2.5, 2.5]])
+        self.gamma = cp.ones(self.sim.Nx_padded, dtype=self.sim.dtype)
+        self.gamma[12:18, 12:18] = 0.8
+        self.observed = measure(
+            self.sim, self.sources, cp.ones_like(self.gamma), self.sensors
+        )
+
+    def test_the_spread_traces_match_the_serial_ones(self):
+        serial = measure(self.sim, self.sources, self.gamma, self.sensors)
+        spread = measure(self.sim, self.sources, self.gamma, self.sensors, [0, 0])
+        for a, b in zip(serial, spread):
+            np.testing.assert_array_equal(a.get(), b.get())
+
+    def test_the_spread_cost_and_gradient_match_the_serial_ones(self):
+        args = (self.sim, self.sources, self.gamma, self.sensors, self.observed)
+        for adjoint in (sensitivity, reconstruction_sensitivity):
+            cost, gradient = misfit_gradient(*args, adjoint=adjoint)
+            spread_cost, spread = misfit_gradient(
+                *args, adjoint=adjoint, devices=[0, 0]
+            )
+            self.assertAlmostEqual(spread_cost / cost, 1.0, places=12)
+            np.testing.assert_allclose(
+                spread.get(), gradient.get(), rtol=1e-10, atol=1e-14
+            )
+            self.assertAlmostEqual(misfit(*args, devices=[0, 0]) / cost, 1.0, places=12)
