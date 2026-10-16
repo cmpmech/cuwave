@@ -74,6 +74,17 @@ def partition(sim: Simulation) -> list[tuple[int, int, int, int]]:
     ]
 
 
+def _on(device: int):
+    """`device` made current, on its legacy stream unless it is the thread's own."""
+    if getattr(_context, "device", None) in (None, device):
+        return cp.cuda.Device(device)
+    # one current stream per thread: a subdomain's own would not match another device
+    stack = contextlib.ExitStack()
+    stack.enter_context(cp.cuda.Device(device))
+    stack.enter_context(cp.cuda.Stream.null)
+    return stack
+
+
 def _rows(array: cpt.NDArray, axis: int, a: int, b: int) -> cpt.NDArray:
     """Rows `a .. b` of `array` along `axis`, as a view."""
     return array[(slice(None),) * axis + (slice(a, b),)]
@@ -82,18 +93,21 @@ def _rows(array: cpt.NDArray, axis: int, a: int, b: int) -> cpt.NDArray:
 def _move(array, device: int) -> cpt.NDArray:
     """`array` (host or any device) on `device`, contiguous, shared if it already is."""
     if isinstance(array, np.ndarray):
-        with cp.cuda.Device(device):
+        with _on(device):
             return cp.asarray(array)
     if array.device.id == device and array.flags.c_contiguous:
         return array
-    with cp.cuda.Device(array.device.id):
+    with _on(array.device.id):
         packed = cp.ascontiguousarray(array)
         cp.cuda.get_current_stream().synchronize()
     if packed.device.id == device:
         return packed
-    with cp.cuda.Device(device):
+    with _on(device):
         out = cp.empty(packed.shape, dtype=packed.dtype)
-        out.data.copy_from_device(packed.data, packed.nbytes)
+        # on the stream the pool recycles `out` from, so behind whatever still reads it
+        stream = cp.cuda.get_current_stream()
+        out.data.copy_from_device_async(packed.data, packed.nbytes, stream)
+        stream.synchronize()
     return out
 
 
@@ -206,16 +220,16 @@ def _points(sim: Simulation, local: Simulation, position, k: int, team: Team) ->
     """Columns of `position` subdomain `k` holds, theirs in local rows, and those it owns."""
     g0, g1, o0, o1 = team.bounds[k]
     axis = sim.node_rows - sim.ndim
-    row = cp.asnumpy(position[axis])
+    row = position[axis]
     held = np.nonzero((row >= g0 + 1) & (row <= g1 - 2))[0]
     owned = (row[held] >= o0) & (row[held] < o1)
-    local_position = cp.asnumpy(position)[:, held]
+    local_position = position[:, held]
     local_position[axis] -= g0
     if not len(held):
         # an idle column at an interior node, so every launch keeps its shape
         local_position = np.ones((sim.node_rows, 1), dtype=np.int32)
         local_position[axis] = (o0 + o1) // 2 - g0
-    with cp.cuda.Device(team.devices[k]):
+    with _on(team.devices[k]):
         local_position = cp.asarray(local_position, dtype=cp.int32)
     return local_position, held, owned
 
@@ -224,21 +238,21 @@ def _columns(record, held, k: int, team: Team) -> cpt.NDArray:
     """Columns `held` of a home `record` on subdomain `k`, one idle zero column if none."""
     device = team.devices[k]
     if not len(held):
-        with cp.cuda.Device(device):
+        with _on(device):
             return cp.zeros((record.shape[0], 1), dtype=record.dtype)
-    with cp.cuda.Device(record.device.id):
+    with _on(record.device.id):
         block = record[:, cp.asarray(held)]
     return _move(block, device)
 
 
 def _gather(parts: list, columns: list, total: int, home: int) -> cpt.NDArray:
     """One (N, total) home record from the owned columns of every subdomain's record."""
-    with cp.cuda.Device(home):
+    with _on(home):
         rows = parts[0].shape[0]
         record = cp.zeros((rows, total), dtype=parts[0].dtype)
         for part, (held, owned) in zip(parts, columns):
             if owned.any():
-                with cp.cuda.Device(part.device.id):
+                with _on(part.device.id):
                     block = part[:, cp.asarray(np.nonzero(owned)[0])]
                 record[:, cp.asarray(held[owned])] = _move(block, home)
     return record
@@ -253,7 +267,7 @@ def _stitch(parts: list, sim: Simulation, team: Team, host: bool):
     ]
     if host:
         return np.concatenate([cp.asnumpy(b) for b in blocks], axis=axis)
-    with cp.cuda.Device(team.home):
+    with _on(team.home):
         return cp.concatenate([_move(b, team.home) for b in blocks], axis=axis)
 
 
@@ -302,6 +316,8 @@ def _run(function: Callable, sim: Simulation, arguments: dict):
     team = Team(tuple(sim.devices), partition(sim), cp.cuda.Device().id)
     source, indicator = arguments["source"], arguments["indicator"]
     sensors, objective = arguments.get("sensors"), arguments.get("objective")
+    positions = cp.asnumpy(source.position)
+    nodes = None if sensors is None else cp.asnumpy(sensors)
     host = isinstance(indicator, np.ndarray)
     columns = [None] * len(team.devices)
 
@@ -309,16 +325,17 @@ def _run(function: Callable, sim: Simulation, arguments: dict):
         device = team.devices[k]
         g0, g1 = team.bounds[k][:2]
         with cp.cuda.Device(device), cp.cuda.Stream(non_blocking=True) as stream:
+            _context.device = device
             try:
                 local = _subdomain(sim, k, team)
-                position, held, _ = _points(sim, local, source.position, k, team)
+                position, held, _ = _points(sim, local, positions, k, team)
                 signal = _columns(source.signal, held, k, team)
                 local_args = {**arguments, "sim": local}
                 local_args["source"] = replace(source, position=position, signal=signal)
                 local_args["indicator"] = _move(indicator[g0:g1], device)
                 if sensors is not None:
                     local_args["sensors"], held, owned = _points(
-                        sim, local, sensors, k, team
+                        sim, local, nodes, k, team
                     )
                     columns[k] = (held, owned)
                 if objective is not None:
@@ -333,7 +350,7 @@ def _run(function: Callable, sim: Simulation, arguments: dict):
                 team.barrier.abort()
                 raise
             finally:
-                _context.team = None
+                _context.team, _context.device = None, None
         return out
 
     with ThreadPoolExecutor(len(team.devices)) as pool:
@@ -373,7 +390,7 @@ def _objective(objective: Callable, k: int, team: Team, columns: list, sensors):
         team.barrier.wait()
         if k == 0:
             record = _gather(team.posts, columns, sensors.shape[1], team.home)
-            with cp.cuda.Device(team.home):
+            with _on(team.home):
                 team.shared = objective(record)
                 cp.cuda.get_current_stream().synchronize()
         team.barrier.wait()

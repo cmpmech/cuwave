@@ -720,7 +720,8 @@ def march(
 
     staging = [cp.empty(s, dtype=w.dtype) for s, w in zip(shapes, windows)]
     if graphed:
-        capture = cp.cuda.Stream()
+        # non-blocking, so legacy-stream work of another thread cannot join the capture
+        capture = cp.cuda.Stream(non_blocking=True)
         with capture:
             capture.begin_capture()
             for k in range(size):
