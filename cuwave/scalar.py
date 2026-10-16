@@ -136,6 +136,7 @@ class PressureWave(Simulation):
             adjoint_step(l0, l1, l2)
             return pml_step(l1, l2)
 
+        pml_adjoint_step.memory = pml_step.memory
         return pml_adjoint_step
 
     def define_pml(self, kernels: cp.RawModule, mat: dict) -> Callable:
@@ -170,9 +171,10 @@ class PressureWave(Simulation):
         R = self.space_order // 2
         factors = self.step_factors()
         fused = grads is not None
-        launches = []
+        launches, memory = [], []
         for d, lo, hi, profile, plane in self.pml_slabs():
             eta = cp.zeros((3, (lo + hi) * plane), dtype=self.dtype)
+            memory.append(eta)
             slab = [np.int32(d), np.int32(lo), np.int32(hi), factors[d]]
             aux_args = [None, mat["stiff"], eta, profile, *slab, *axis_geometry(self)]
             args = [None, grads["mass"] if fused else None, None]
@@ -194,6 +196,8 @@ class PressureWave(Simulation):
                 adjoint_kernel(grid, (PML_THREADS,), args)
             return l2
 
+        # the state the adjoint carries besides the field, for a subdomain to exchange
+        adjoint_pml_step.memory = memory
         return adjoint_pml_step
 
     def build_materials(self, indicator: cpt.NDArray) -> dict:
@@ -281,6 +285,7 @@ class PressureWave(Simulation):
             adjoint_gradient_step(l0, l1, u1)
             return pml_step(l1, l0, u1)
 
+        pml_adjoint_gradient_step.memory = pml_step.memory
         return pml_adjoint_gradient_step
 
     def define_superposed(

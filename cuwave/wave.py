@@ -27,6 +27,7 @@ from .boundary import (
     pml_widths,
     validate_pml,
 )
+from .decomposition import EVERY, active, decomposable, exchange
 from .stencils import STENCILS, cell_coefficients, preamble
 
 PML_THREADS = 256  # threads per block of a pml slab launch
@@ -309,6 +310,7 @@ class Simulation:
     domain: cpt.NDArray | None = None  # nodal mask of the physical domain, None for all
     dirichlet: cpt.NDArray | None = None  # nodal mask held at zero, its cells left open
     pml: Pml | None = None  # perfectly matched layer behind the faces, None for none
+    devices: tuple[int, ...] | None = None  # GPUs axis 0 is split over, None for one
 
     accepts_domain = False  # whether the step kernel honours -DUSE_DOMAIN
     accepts_pml = False  # whether the step and its adjoint carry the pml memory terms
@@ -376,7 +378,7 @@ class Simulation:
             self.Nx_padded if self.ncomp == 1 else (self.ncomp, *self.Nx_padded)
         )
         # flatten_indices accumulates in int32, so the whole field has to address in it
-        if self.ncomp * self.comp_stride >= 2**31:
+        if self.devices is None and self.ncomp * self.comp_stride >= 2**31:
             raise ValueError(
                 f"{self.ncomp} x {self.comp_stride} nodes overflow the int32 flat "
                 f"index; coarsen the grid"
@@ -679,7 +681,9 @@ class Window:
         return self.dtype != self.record.dtype
 
 
-def march(N: int, step: Callable, windows: list[Window] = ()) -> None:
+def march(
+    N: int, step: Callable, windows: list[Window] = (), state: list = ()
+) -> None:
     """Call `step(t, *records)` for t in range(N), replaying chunks as a captured graph.
 
     Per-step host work is the launch itself, which on a small grid outweighs the kernel,
@@ -694,14 +698,24 @@ def march(N: int, step: Callable, windows: list[Window] = ()) -> None:
         N: the number of steps.
         step: launches step t, taking the windows' records in order.
         windows: the records `step` reads or writes per step, each a `Window`.
+        state: the arrays the march carries between steps besides a stored window's
+            halo rows, which a subdomain exchanges every `EVERY` steps.
     """
-    chunk = min(CHUNK, N)
+    size = EVERY if active() else CHUNK
+    chunk = min(size, N)
+    carried = [w for w in windows if w.store and w.halo]
+
+    def refresh(t):
+        exchange([*state, *(w.record[t : t + w.halo] for w in carried)])
+
     shapes = [(chunk + w.halo, *w.record.shape[1:]) for w in windows]
     nbytes = sum(int(np.prod(s)) * w.dtype.itemsize for s, w in zip(shapes, windows))
-    graphed = N >= 2 * CHUNK and nbytes <= cp.cuda.Device().attributes["L2CacheSize"]
+    graphed = N >= 2 * size and nbytes <= cp.cuda.Device().attributes["L2CacheSize"]
     if not graphed and not any(w.converts for w in windows):
         for t in range(N):
             step(t, *(w.record for w in windows))
+            if (t + 1) % chunk == 0 or t == N - 1:
+                refresh(t + 1)
         return
 
     staging = [cp.empty(s, dtype=w.dtype) for s, w in zip(shapes, windows)]
@@ -709,7 +723,7 @@ def march(N: int, step: Callable, windows: list[Window] = ()) -> None:
         capture = cp.cuda.Stream()
         with capture:
             capture.begin_capture()
-            for k in range(CHUNK):
+            for k in range(size):
                 step(k, *staging)
             graph = capture.end_capture()
     for start in range(0, N, chunk):
@@ -718,7 +732,7 @@ def march(N: int, step: Callable, windows: list[Window] = ()) -> None:
             if w.load:
                 rows = w.halo if w.store else count + w.halo
                 buf[:rows] = widen(w.record[start : start + rows], w.dtype)
-        if graphed and count == CHUNK:
+        if graphed and count == size:
             graph.launch()
         else:
             for k in range(count):
@@ -727,6 +741,7 @@ def march(N: int, step: Callable, windows: list[Window] = ()) -> None:
             if w.store:
                 rows = slice(start + w.halo, start + w.halo + count)
                 w.record[rows] = narrow(buf[w.halo : w.halo + count], w.record.dtype)
+        refresh(start + count)
 
 
 # -------------------------------- simulation functions -------------------------------
@@ -845,6 +860,7 @@ def define_dft(
     return dft_step
 
 
+@decomposable
 def simulate(
     sim: Simulation,
     source: Source,
@@ -888,7 +904,7 @@ def simulate(
             get_signal(u, um, t)
 
     if record_every is None:
-        march(sim.N, step, windows)
+        march(sim.N, step, windows, [U, *getattr(fd_step, "memory", [])])
     else:
         snapshots = []
         for t in range(sim.N):

@@ -25,6 +25,7 @@ import numpy as np
 import numpy.typing as npt
 
 from .boundary import define_boundary, pml_nodes
+from .decomposition import agree, decomposable, undivided
 from .wave import (
     BFLOAT16,
     Simulation,
@@ -381,6 +382,7 @@ def spectra(
 
 
 # ---------------------------------- adjoint solvers ----------------------------------
+@decomposable
 def sensitivity(
     sim: Simulation,
     source: Source,
@@ -431,7 +433,8 @@ def sensitivity(
         excitation_step(u, signal, t)
         bc_step(u)
 
-    march(sim.N, forward, [Window(source.signal), Window(V, halo=2, store=True)])
+    windows = [Window(source.signal), Window(V, halo=2, store=True)]
+    march(sim.N, forward, windows, getattr(fd_step, "memory", []))
 
     # gathered off the history rather than probed per step, saving one launch a step
     um = V[2:].reshape(sim.N, -1)[:, flatten_indices(sim, sensors)]
@@ -453,7 +456,8 @@ def sensitivity(
             adjoint_excitation(p, signal, history[m], m)
             bc_step(p)
 
-        march(sim.N, backward, [Window(signal), Window(V[::-1])])
+        state = [P, *getattr(adjoint_step, "memory", [])]
+        march(sim.N, backward, [Window(signal), Window(V[::-1])], state)
         return cost, frozen(sim, sim.finalize_gradients(grads, sens_kernels)), um, {}
 
     adjoint_step = sim.define_adjoint_step(kernels, sens_kernels, mat)
@@ -468,11 +472,13 @@ def sensitivity(
         # inertia pairs lambda^n with the whole triplet, stiffness with its middle slot
         gradient_step(history[m + 2], history[m + 1], history[m], p)
 
-    march(sim.N, backward, [Window(signal), Window(V[::-1], halo=2)])
+    state = [P, *getattr(adjoint_step, "memory", [])]
+    march(sim.N, backward, [Window(signal), Window(V[::-1], halo=2)], state)
 
     return cost, frozen(sim, sim.finalize_gradients(grads, sens_kernels)), um, {}
 
 
+@decomposable
 def reconstruction_sensitivity(
     sim: Simulation,
     source: Source,
@@ -542,6 +548,7 @@ def reconstruction_sensitivity(
     grads = sim.gradient_fields(mat)
     gradient_step = sim.define_gradient(sens_kernels, mat, grads)
     memory = getattr(fd_step, "memory", [])
+    adjoint_memory = getattr(adjoint_step, "memory", [])
 
     U = cp.zeros((3, *sim.field_shape), dtype=sim.dtype)
     snapshot_bytes = 2 * U[0].nbytes + sum(a.nbytes for a in memory)
@@ -551,6 +558,9 @@ def reconstruction_sensitivity(
         # the strip and its reversed copy together cost about one snapshot
         row_bytes = 2 * strip.shape[1] * np.dtype(stored).itemsize
         segment = min(sim.N, max(2, snapshot_bytes // row_bytes))
+    # the subdomains of a split grid cut the run alike, so their marches stay in step
+    segment = agree(segment)
+    if segment < sim.N:
         strip, valid = reconstruction_nodes(sim, indicator, segment)
     require_reconstructable(sim, valid)
     num_strip = strip.shape[1]
@@ -601,7 +611,7 @@ def reconstruction_sensitivity(
             forward(a + k, k, signal, rows, records[0] if records else None)
 
         state["steps"] += b - a
-        march(b - a, step, windows)
+        march(b - a, step, windows, [U, *memory])
 
     # the state at step t sits in slots t % 3 and (t + 1) % 3, as u^(t - 2), u^(t - 1)
     def slots(t):
@@ -662,7 +672,12 @@ def reconstruction_sensitivity(
             windows.append(Window(buffer[: e - s - 1][::-1].copy(), dtype=sim.dtype))
         del buffer
         if e - s > 1:
-            march(e - s - 1, lambda j, *rows: backward(m0 + j, j, *rows), windows)
+            march(
+                e - s - 1,
+                lambda j, *rows: backward(m0 + j, j, *rows),
+                windows,
+                [U, P, *adjoint_memory],
+            )
         adjoint(m1 - 1, m1 - 1, signal)
 
     for action, *segments in checkpoint_schedule(len(starts) - 1, checkpoints or 0):
@@ -695,6 +710,7 @@ def reconstruction_sensitivity(
     return state["cost"], grads, um, info
 
 
+@undivided
 def superposition_sensitivity(
     sim: Simulation,
     source: Source,
@@ -835,6 +851,7 @@ def superposition_sensitivity(
     return cost, accs, um, info
 
 
+@undivided
 def spectral_sensitivity(
     sim: Simulation,
     source: Source,
@@ -991,6 +1008,7 @@ def spectral_sensitivity(
     return cost, grads, um, info
 
 
+@undivided
 def source_sensitivity(
     sim: Simulation,
     source: Source,
