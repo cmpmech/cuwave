@@ -47,7 +47,7 @@ def _sim(N=64, dt=0.013):
 def _line(space_order=8, points=6, frequency=1.0):
     """1D unit medium at `points` nodes per minimum wavelength (2.5 `frequency`)."""
     dx = 1.0 / (2.5 * frequency * points)
-    dt = 0.99 * stable_dt((dx,), 1.0, space_order)
+    dt = 0.99 * stable_dt((dx,), 1.0, space_order, "taylor")
     Nx = (int(60.0 / dx) + 3,)
     return ScalarWave(
         Nx,
@@ -57,6 +57,7 @@ def _line(space_order=8, points=6, frequency=1.0):
         (128,),
         precision="float64",
         space_order=space_order,
+        stencil="taylor",  # resolved enough that Taylor beats the fitted row
         wavespeed=1.0,
         density=1.0,
     )

@@ -44,7 +44,7 @@ def stable_dt(
     dx: tuple[float, ...],
     wavespeed: float,
     space_order: int = 2,
-    stencil: str = "taylor",
+    stencil: str = "optimized",
 ) -> float:
     """CFL-stable timestep for an explicit scheme with grid spacing `dx`."""
     # the flux symbol peaks on the grid's Nyquist mode, at the alternating sum
@@ -303,7 +303,7 @@ class Simulation:
     threads: tuple[int, ...]  # threads per block, per axis
     precision: str = "float32"  # "float32" or "float64"
     space_order: int = 2  # finite difference order: any even number
-    stencil: str = "taylor"  # or "optimized": the full radius fitted for dispersion
+    stencil: str = "optimized"  # or "taylor": the full radius fitted for dispersion
     boundary: tuple = None  # ((low, high),) per axis; None is the equation's default
     damping: cpt.NDArray | None = None  # nodal field d, None for a lossless operator
     domain: cpt.NDArray | None = None  # nodal mask of the physical domain, None for all

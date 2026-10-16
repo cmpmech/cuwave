@@ -364,7 +364,7 @@ def _operator(sim, indicator):
 def _staggered_gradient(sim, phi):
     """The half-point gradient of `phi` at the field points, at the simulation's own order."""
     radius = sim.space_order // 2
-    coefficients = staggered_weights(radius)
+    coefficients = staggered_weights(radius, sim.stencil)
     out = cp.zeros(sim.field_shape, dtype=sim.dtype)
     inner = tuple(slice(radius, n - radius) for n in sim.Nx)
     for c in range(sim.ncomp):

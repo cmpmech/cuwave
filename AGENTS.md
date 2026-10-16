@@ -124,8 +124,8 @@ and the cell onto one stays open with the zero at the cell *midpoint* (radius co
 `cp.RawModule` per `(ndim, precision, damping, space_order)` combination: `NDIM`,
 `USE_FLOAT`, `USE_DAMPING` and `USE_MAGNETIC` go in as `-D` flags, while two source blocks
 are *prepended* so CuPy's module cache keys on them without a flag: the stencil table from
-`stencils.preamble(space_order, stencil)` (`Simulation.stencil="optimized"` swaps in the
-dispersion-fitted full-radius row, wall rows stay Taylor), then `kernels/common.cuh`.
+`stencils.preamble(space_order, stencil)` (`Simulation.stencil`, default `"optimized"`, the
+dispersion-fitted full-radius row; `"taylor"` the formal-order one; wall rows stay Taylor), then `kernels/common.cuh`.
 That prelude holds what every `.cu` repeated (the `real_t` typedef, the `OP_W`/`SG_W`
 accessors, `rad_node`/`rad_half`, `PAIR_ROW`, and the four transfer kernels); the `AXIS_*`
 macro blocks stay per file, since the anisotropic adjoint's signature genuinely differs. Any new flag is added to both the

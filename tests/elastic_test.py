@@ -144,6 +144,7 @@ def _divergence_error(order, n):
         (8, 32),
         precision="float64",
         space_order=order,
+        stencil="taylor",  # formal order holds for the Taylor rows only
         density=RHO,
         wavespeed_p=speed_p,
         wavespeed_s=speed_s,

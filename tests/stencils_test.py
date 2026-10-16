@@ -101,7 +101,7 @@ class CompiledRowTest(unittest.TestCase):
     def test_stable_dt_follows_the_row(self):
         for R in (1, 2, 4):
             with self.subTest(R=R):
-                taylor = stable_dt((1.0,), 1.0, 2 * R)
+                taylor = stable_dt((1.0,), 1.0, 2 * R, "taylor")
                 self.assertAlmostEqual(taylor, 2.0 / np.sqrt(np.abs(weights(R)).sum()))
                 optimized = stable_dt((1.0,), 1.0, 2 * R, "optimized")
                 self.assertLessEqual(optimized, taylor)
