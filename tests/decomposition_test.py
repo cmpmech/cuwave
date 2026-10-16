@@ -24,7 +24,8 @@ except Exception:
 if HAS_CUDA:
     from cuwave.boundary import Clamped, Pml
     from cuwave.elastic import ElasticWave
-    from cuwave.scalar import ScalarWave
+    from cuwave.maxwell import DielectricWave
+    from cuwave.scalar import AcousticWave, ScalarWave
     from cuwave.sensitivity import (
         reconstruction_sensitivity,
         sensitivity,
@@ -145,6 +146,40 @@ class GradientTest(unittest.TestCase):
                 for adjoint in (sensitivity, reconstruction_sensitivity):
                     with self.subTest(make=make.__name__, absorber=absorber):
                         self._check(*make(4, absorber), adjoint)
+
+    def test_the_acoustic_and_maxwell_gradients_split_alike(self):
+        common = dict(precision="float64", space_order=4)
+        dt = 0.5 * stable_dt((0.01, 0.01), 2.0, 4)
+        sims = (
+            AcousticWave(
+                (220, 130),
+                (0.01, 0.01),
+                200,
+                dt,
+                (32, 8),
+                rho1=1.0,
+                rho2=3.0,
+                kappa1=1.0,
+                kappa2=5.0,
+                pml=Pml(10, 1.0),
+                **common,
+            ),
+            DielectricWave(
+                (220, 130),
+                (0.01, 0.01),
+                200,
+                dt,
+                (32, 8),
+                permittivity1=1.0,
+                permittivity2=4.0,
+                pml=Pml(10, 1.0, frequency=1.0),
+                **common,
+            ),
+        )
+        for sim, direction in zip(sims, (None, [0.0, 1.0])):
+            for adjoint in (sensitivity, reconstruction_sensitivity):
+                with self.subTest(sim=type(sim).__name__, adjoint=adjoint.__name__):
+                    self._check(sim, direction, adjoint)
 
     def test_checkpoints_agree_on_one_segment(self):
         adjoint = functools.partial(reconstruction_sensitivity, checkpoints=2)
