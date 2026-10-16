@@ -27,7 +27,7 @@ from .boundary import (
     pml_widths,
     validate_pml,
 )
-from .stencils import preamble, weights
+from .stencils import STENCILS, cell_coefficients, preamble
 
 PML_THREADS = 256  # threads per block of a pml slab launch
 
@@ -40,9 +40,16 @@ PAIRS = {
 
 
 # ------------------------------------- utilities -------------------------------------
-def stable_dt(dx: tuple[float, ...], wavespeed: float, space_order: int = 2) -> float:
+def stable_dt(
+    dx: tuple[float, ...],
+    wavespeed: float,
+    space_order: int = 2,
+    stencil: str = "taylor",
+) -> float:
     """CFL-stable timestep for an explicit scheme with grid spacing `dx`."""
-    lam = float(np.abs(weights(space_order // 2)).sum())
+    # the flux symbol peaks on the grid's Nyquist mode, at the alternating sum
+    c = cell_coefficients(space_order // 2, stencil)
+    lam = 4.0 * abs(float(c @ (-1.0) ** np.arange(len(c))))
     return 2.0 / (wavespeed * float(np.sqrt(lam * sum(1.0 / d**2 for d in dx))))
 
 
@@ -296,6 +303,7 @@ class Simulation:
     threads: tuple[int, ...]  # threads per block, per axis
     precision: str = "float32"  # "float32" or "float64"
     space_order: int = 2  # finite difference order: any even number
+    stencil: str = "taylor"  # or "optimized": the full radius fitted for dispersion
     boundary: tuple = None  # ((low, high),) per axis; None is the equation's default
     damping: cpt.NDArray | None = None  # nodal field d, None for a lossless operator
     domain: cpt.NDArray | None = None  # nodal mask of the physical domain, None for all
@@ -360,6 +368,8 @@ class Simulation:
         )
         if self.space_order % 2 != 0 or self.space_order < 2:
             raise ValueError("space_order must be an even integer >= 2")
+        if self.stencil not in STENCILS:
+            raise ValueError(f"unknown stencil {self.stencil!r}, expected one of {STENCILS}")
         self.comp_stride = int(np.prod(self.Nx_padded))
         self.node_rows = self.ndim + (self.ncomp > 1)
         self.field_shape = (
@@ -425,7 +435,7 @@ def compile_kernels(sim: Simulation, path: Path | None = None) -> cp.RawModule:
     if sim.precision == "float32":
         options.append("-DUSE_FLOAT")
     # injected as source, so the module cache keys on the order without a -D flag
-    code = preamble(sim.space_order) + COMMON_PATH.read_text() + Path(path).read_text()
+    code = preamble(sim.space_order, sim.stencil) + COMMON_PATH.read_text() + Path(path).read_text()
     return cp.RawModule(code=code, options=tuple(options))
 
 
@@ -580,10 +590,11 @@ def define_pair_pml(
     inv_dx = axis_geometry(sim, [sim.dtype(1.0 / d) for d in sim.dx])
     factors = axis_geometry(sim, sim.step_factors())
     reach = sim.space_order // 2 if adjoint else 0
-    firsts, forces, memories = [], [], []
+    firsts, forces, memories, state = [], [], [], []
     for d, lo, hi, profile, plane in sim.pml_slabs():
         # the first pass' memory per component, then the update's per component
         aux = cp.zeros((2 * sim.ndim, (lo + hi) * plane), dtype=sim.dtype)
+        state.append(aux)
         slab = [aux, profile, np.int32(d), np.int32(lo), np.int32(hi)]
         grid = slab_grid(lo, hi, plane, reach)
         firsts.append((grid, [None, scratch, *first_args, *slab, *inv_dx]))
@@ -603,6 +614,8 @@ def define_pair_pml(
         for grid, args in memories:
             memory_kernel(grid, (PML_THREADS,), args)
 
+    # the state the step carries besides the field, for a checkpoint to copy
+    first_step.memory = state
     return first_step, update_step
 
 

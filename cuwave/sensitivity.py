@@ -16,6 +16,7 @@ the source signal rather than the material, which needs no forward field at all.
 import math
 import warnings
 from collections.abc import Callable
+from dataclasses import replace
 
 import cupy as cp
 import cupy.typing as cpt
@@ -38,6 +39,7 @@ from .wave import (
     flatten_indices,
     grid_rows,
     march,
+    narrow,
     simulate,
 )
 
@@ -45,6 +47,9 @@ ADJOINT_DELAY = 1  # lines the adjoint up with the reconstructed forward triplet
 
 # cancellation past which B(w, w) - B(u, u) has eaten too much of the mantissa to trust
 CANCELLATION_LIMIT = {"float32": 1e5, "float64": 1e12}
+
+# round-off growth past which a damped node is recorded rather than run backwards
+REVERSIBLE_GROWTH = {"float32": 1e2, "float64": 1e6}
 
 # what `strip_dtype` stores the strip as, per (strip_dtype, precision)
 STRIP_DTYPES = {
@@ -131,18 +136,45 @@ def require_lossless(sim: Simulation) -> None:
         )
 
 
+def reversible_damping(
+    sim: Simulation, indicator: cpt.NDArray, span: int
+) -> cpt.NDArray[cp.bool_]:
+    """Damped nodes a reverse march of `span` steps runs backwards, its round-off bounded.
+
+    Solved for its trailing slot, the damped update is the same update with the damping
+    negated, so it is exactly invertible; what reversing costs is the decay itself, run
+    as growth. A node is reversible while that growth, `(1 + beta) / (1 - beta)` a step
+    for the static mode, stays under `REVERSIBLE_GROWTH` over `span` steps.
+    """
+    if sim.damping is None:
+        return cp.zeros(sim.Nx_padded, dtype=cp.bool_)
+    # a component point averages its neighbours' inertia, so take the widest of them
+    minv = ndi.maximum_filter(sim.inverse_inertia(indicator), size=3)
+    beta = 0.5 * sim.dt * sim.damping * minv
+    tiny = cp.finfo(sim.dtype).tiny
+    growth = span * cp.log((1.0 + beta) / cp.maximum(1.0 - beta, tiny))
+    bound = math.log(REVERSIBLE_GROWTH[sim.precision])
+    return (sim.damping > 0) & (beta < 1.0) & (growth <= bound)
+
+
 def reconstruction_nodes(
-    sim: Simulation,
+    sim: Simulation, indicator: cpt.NDArray, span: int | None = None
 ) -> tuple[cpt.NDArray[cp.int32], cpt.NDArray[cp.bool_]]:
     """Nodes a reverse march has to replay, and where its gradient stays exact.
 
-    Which nodes those are is decided by `sim.damping` and `sim.pml`, so the caller
-    states neither.
+    Which nodes those are is decided by `sim.damping` and `sim.pml`: a pml node is
+    always irreversible, a damped one only where `reversible_damping` says so.
+
+    Args:
+        sim: the simulation the march reverses.
+        indicator: the design field, whose inertia scales the damping.
+        span: the steps one reverse march covers, `sim.N` by default.
 
     Returns:
         (strip, valid): the (ndim, num) grid indices to record and replay each step,
-        the damped ones a lossless node reads across the interface, and the mask of
-        every lossless interior node, which is where the rebuilt triplet is exact.
+        the irreversible ones a reversible node reads across the interface, and the
+        mask of every reversible interior node, which is where the rebuilt triplet is
+        exact.
     """
     # the reverse step of a node reaches this far, so a strip that thin feeds it
     radius = sim.reach
@@ -150,16 +182,17 @@ def reconstruction_nodes(
     interior[tuple(slice(1, n - 1) for n in sim.Nx)] = True
     if sim.damping is None and sim.pml is None:
         return cp.zeros((sim.node_rows, 0), dtype=cp.int32), interior
-    lossless = interior & ~pml_nodes(sim)
+    reversible = interior & ~pml_nodes(sim)
     if sim.damping is not None:
-        lossless &= ~(sim.damping > 0)
+        span = sim.N if span is None else span
+        reversible &= ~(sim.damping > 0) | reversible_damping(sim, indicator, span)
     # the full square, as a shear or cross term reads the diagonal neighbours
     square = ndi.generate_binary_structure(sim.ndim, sim.ndim)
     reach = ndi.binary_dilation(
-        lossless, structure=square, iterations=radius, brute_force=True
+        reversible, structure=square, iterations=radius, brute_force=True
     )
-    strip = cp.stack(cp.nonzero(interior & ~lossless & reach)).astype(cp.int32)
-    return with_components(sim, strip), lossless
+    strip = cp.stack(cp.nonzero(interior & ~reversible & reach)).astype(cp.int32)
+    return with_components(sim, strip), reversible
 
 
 def frozen(sim: Simulation, grads: dict[str, cpt.NDArray]) -> dict[str, cpt.NDArray]:
@@ -184,12 +217,56 @@ def with_components(
 
 
 def require_reconstructable(sim: Simulation, valid: cpt.NDArray[cp.bool_]) -> None:
-    """Raise if `sim.damping` leaves no lossless interior for a reverse march to rebuild."""
+    """Raise if `sim.damping` leaves no reversible interior for a reverse march to rebuild."""
     if not bool(cp.any(valid)):
         raise ValueError(
-            "damping covers every interior node, so there is nothing to reconstruct; "
-            "damp only the faces with boundary.sponge, or use sensitivity"
+            "damping too strong to reverse covers every interior node, so there is "
+            "nothing to reconstruct; set checkpoints, damp only the faces with "
+            "boundary.sponge, or use sensitivity"
         )
+
+
+def segment_split(lo: int, hi: int, free: int) -> int:
+    """Where to snapshot segments lo .. hi with `free` slots: the binomial treeverse split.
+
+    `free` slots and `r` replays reverse at most `C(free + r, free)` segments, which
+    splits as the `C(free - 1 + r, free - 1)` reversed with one slot fewer past the
+    snapshot and the rest with one replay fewer before it (Griewank & Walther 2000,
+    https://doi.org/10.1145/347837.347846).
+    """
+    r = 0
+    while math.comb(free + r, free) < hi - lo:
+        r += 1
+    return max(lo + 1, hi - math.comb(free - 1 + r, free - 1))
+
+
+def checkpoint_schedule(segments: int, slots: int) -> list[tuple]:
+    """Treeverse over `segments` with `slots` snapshots past the initial state.
+
+    Returns:
+        the actions in order: ("restore", k) and ("store", k) move segment k's start
+        state between a snapshot and the working slots, ("drop", k) frees it,
+        ("advance", a, b) marches from segment a's start to segment b's, and
+        ("leaf", k) replays segment k forwards and reverses it. Every step is first
+        marched in order, before the first leaf turns back.
+    """
+    actions = []
+
+    def reverse(lo, hi, free):
+        while hi - lo > 1:
+            if free == 0:
+                for k in range(hi - 1, lo, -1):
+                    actions.extend((("restore", lo), ("advance", lo, k), ("leaf", k)))
+                break
+            mid = segment_split(lo, hi, free)
+            actions.extend((("restore", lo), ("advance", lo, mid), ("store", mid)))
+            reverse(mid, hi, free - 1)
+            actions.append(("drop", mid))
+            hi = mid
+        actions.extend((("restore", lo), ("leaf", lo)))
+
+    reverse(0, segments, slots)
+    return actions
 
 
 def adjoint_signal(
@@ -403,20 +480,23 @@ def reconstruction_sensitivity(
     sensors: cpt.NDArray[cp.int32],
     objective: Callable,
     strip_dtype: str | None = None,
+    checkpoints: int | None = None,
 ) -> tuple[float, dict[str, cpt.NDArray], cpt.NDArray, dict]:
     """Cost and its gradients as `sensitivity`, storing a boundary strip and not the field.
 
     The lossless recursion is symmetric in its two outer slots, so the same step kernel
-    run with them swapped marches the forward field backwards. Damping breaks that, so
-    the nodes a damped one reaches are recorded each step and replayed on the way back:
-    the reverse march then never reads an irreversible node, and the gradient stays the
-    exact transpose wherever the strip shields it. This is the variant to reach for
-    once the history no longer fits and the domain is open, since
+    run with them swapped marches the forward field backwards, and a damped node runs
+    backwards too with its damping negated. A node too lossy for that (a pml, a strong
+    sponge) breaks it, so the nodes it reaches are recorded each step and replayed on
+    the way back: the reverse march then never reads an irreversible node, and the
+    gradient stays the exact transpose wherever the strip shields it. This is the
+    variant to reach for once the history no longer fits and the domain is open, since
     `superposition_sensitivity` refuses a damping field outright.
 
     Args:
-        sim: the simulation both passes step, damped or lossless. Damping covering
-            every interior node is rejected: nothing is left to rebuild from.
+        sim: the simulation both passes step, damped or lossless. Damping too strong
+            to reverse over every interior node is rejected: nothing is left to
+            rebuild from.
         source: the shot to differentiate, its position interior nodes only.
         indicator: the design field the materials are built from.
         sensors: (ndim, num_sensors) interior grid indices.
@@ -425,18 +505,24 @@ def reconstruction_sensitivity(
             grows with N at the price of the exact transpose: "float32" under a float64
             sim, or "bfloat16" under either. None keeps it exact. As fdtdx stores its
             boundary record (Mahlau et al. 2026, https://doi.org/10.21105/joss.08912).
+        checkpoints: snapshots of the forward state to keep, or None to record the
+            strip over the whole run. Set, the run is cut into segments whose strip
+            costs about one snapshot, each replayed from a snapshot and reversed on
+            its own (`checkpoint_schedule`), so the memory no longer grows with N and
+            the price is replaying: one extra sweep once there are as many snapshots
+            as segments.
 
     Returns:
         (cost, {"mass": ..., "stiff": ...}, traces, info) as `sensitivity`, the
         gradients zeroed outside the region the strip shields, and `info` carrying the
-        `strip` node count and the `drift` the reverse march accumulated.
+        `strip` node count, the `drift` the last reverse march accumulated, the steps
+        per `segment` the run was cut into and the forward `sweeps` it took.
     """
     require_interior(sim, sensors, "sensor")
     require_interior(sim, source.position, "source")
     require_full_domain(sim)
-    strip, valid = reconstruction_nodes(sim)
-    require_reconstructable(sim, valid)
-    num_strip = strip.shape[1]
+    if checkpoints is not None and checkpoints < 0:
+        raise ValueError(f"checkpoints must be non-negative: {checkpoints}")
     stored = STRIP_DTYPES.get((strip_dtype, sim.precision), sim.dtype)
     if strip_dtype is not None and stored == sim.dtype:
         raise ValueError(
@@ -455,68 +541,141 @@ def reconstruction_sensitivity(
     get_signal = define_get_signal(sim, sensors, kernels)
     grads = sim.gradient_fields(mat)
     gradient_step = sim.define_gradient(sens_kernels, mat, grads)
+    memory = getattr(fd_step, "memory", [])
+
+    U = cp.zeros((3, *sim.field_shape), dtype=sim.dtype)
+    snapshot_bytes = 2 * U[0].nbytes + sum(a.nbytes for a in memory)
+    strip, valid = reconstruction_nodes(sim, indicator)
+    segment = sim.N
+    if checkpoints is not None and strip.shape[1]:
+        # the strip and its reversed copy together cost about one snapshot
+        row_bytes = 2 * strip.shape[1] * np.dtype(stored).itemsize
+        segment = min(sim.N, max(2, snapshot_bytes // row_bytes))
+        strip, valid = reconstruction_nodes(sim, indicator, segment)
+    require_reconstructable(sim, valid)
+    num_strip = strip.shape[1]
+    starts = list(range(0, sim.N, segment)) + [sim.N]
     if num_strip:
+        lin_strip = flatten_indices(sim, strip)
         record_strip = define_get_signal(sim, strip, kernels)
         replay_strip = define_set_signal(sim, strip, kernels)
 
-    U = cp.zeros((3, *sim.field_shape), dtype=sim.dtype)
+    # backwards the layer sits behind the strip, and a reversible damping is negated
+    back = replace(sim, pml=None)
+    back_kernels = compile_kernels(back)
+    back_mat = mat
+    if sim.damping is not None:
+        back_mat = {**mat, "damping": cp.where(valid, -mat["damping"], mat["damping"])}
+    reverse_step = back.define_step(back_kernels, back_mat)
+    reverse_excitation = define_excitation(back, source.position, back_kernels, back_mat)
+
     um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
-    # two leading zero rows, so row t + 2 is u^t and the initial states need no branch
-    strip_store = cp.zeros((sim.N + 2, num_strip), dtype=stored)
-    windows = [Window(source.signal), Window(um, store=True)]
-    if num_strip:
-        windows.append(Window(strip_store[2:], store=True, dtype=sim.dtype))
+    P = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
+    adjoint_excitation = define_excitation(sim, sensors, kernels, mat)
+    snapshots = {}
+    state = {"recorded": 0, "steps": 0}
 
 # ------------------------------------ forward pass -----------------------------------
-    def forward(t, signal, um, strip=None):
+    def forward(t, row, signal, um=None, strip=None):
         u = fd_step(U[t % 3], U[(t + 1) % 3], U[(t + 2) % 3])
-        excitation_step(u, signal, t)
+        excitation_step(u, signal, row)
         bc_step(u)
-        get_signal(u, um, t)
+        if um is not None:
+            get_signal(u, um, row)
         if strip is not None:
-            record_strip(u, strip, t)
+            record_strip(u, strip, row)
 
-    march(sim.N, forward, windows)
+    # steps a .. b from the slots, the traces recorded the first time they are stepped
+    def advance(a, b, buffer=None):
+        windows = [Window(source.signal[a:b])]
+        first = a == state["recorded"]
+        if first:
+            windows.append(Window(um[a:b], store=True))
+            state["recorded"] = b
+        if buffer is not None:
+            windows.append(Window(buffer, store=True, dtype=sim.dtype))
 
-    cost, dphi = objective(um)
+        def step(k, signal, *records):
+            records = list(records)
+            rows = records.pop(0) if first else None
+            forward(a + k, k, signal, rows, records[0] if records else None)
 
-# --------------------------------- adjoint excitation --------------------------------
-    signal = adjoint_signal(sim, dphi, sensors)
-    adjoint_excitation = define_excitation(sim, sensors, kernels, mat)
+        state["steps"] += b - a
+        march(b - a, step, windows)
+
+    # the state at step t sits in slots t % 3 and (t + 1) % 3, as u^(t - 2), u^(t - 1)
+    def slots(t):
+        return U[t % 3], U[(t + 1) % 3]
+
+    def store(k):
+        snapshots[k] = [field.copy() for field in (*slots(starts[k]), *memory)]
+
+    def restore(k):
+        for field, saved in zip((*slots(starts[k]), *memory), snapshots.get(k, ())):
+            field[...] = saved
+        if k == 0:
+            for field in (*slots(0), *memory):
+                field[...] = 0.0
 
 # ----------------------------------- backward pass -----------------------------------
-    P = cp.zeros((2, *sim.field_shape), dtype=sim.dtype)
-    # the forward rotation left the last three states live, which is the whole seed
-    seed = float(cp.linalg.norm(U[(sim.N + 1) % 3] * valid))
-
-    # the triplet (u^(n - 1), u^n, u^(n + 1)) for n = N - 1 - m, rotating backwards
+    # the triplet (u^(n - 2), u^(n - 1), u^n) for n = N - 1 - m, rotating backwards
     def triplet(m):
         return tuple(U[(sim.N + i - m) % 3] for i in (2, 0, 1))
 
-    def adjoint(m, signal):
+    def adjoint(m, row, signal):
         p = adjoint_step(P[m % 2], P[1 - m % 2], P[m % 2])  # lambda^n
-        adjoint_excitation(p, signal, m)
+        adjoint_excitation(p, signal, row)
         bc_step(p)
         # inertia pairs lambda^n with the whole triplet, stiffness with its middle slot
         gradient_step(*triplet(m), p)
 
-    def backward(m, signal, source_rows, strip_rows=None):
-        adjoint(m, signal)
+    def backward(m, row, signal, source_rows, strip_rows=None):
+        adjoint(m, row, signal)
         a, b, c = triplet(m)
         # read backwards, so the source rides two steps ahead of the state it rebuilds
-        c = fd_step(b, a, c)
-        excitation_step(c, source_rows, m)
+        c = reverse_step(b, a, c)
+        reverse_excitation(c, source_rows, row)
         if strip_rows is not None:
-            replay_strip(c, strip_rows, m)
+            replay_strip(c, strip_rows, row)
         bc_step(c)
 
-    # row m of each is row n - 1 forwards, contiguous since the kernels index by row
-    windows = [Window(signal), Window(source.signal[sim.N - 2 :: -1].copy())]
-    if num_strip:
-        windows.append(Window(strip_store[sim.N - 2 :: -1].copy(), dtype=sim.dtype))
-    march(sim.N - 1, backward, windows)
-    adjoint(sim.N - 1, signal)
-    a = triplet(sim.N - 1)[0]
+    def leaf(k):
+        s, e = starts[k], starts[k + 1]
+        # row t - s + 2 is u^t, the two the segment starts from read off the slots
+        buffer = cp.zeros((e - s + 2, num_strip), dtype=stored)
+        if num_strip and s:
+            for row, field in enumerate(slots(s)):
+                buffer[row] = narrow(field.ravel()[lin_strip], stored)
+        advance(s, e, buffer[2:] if num_strip else None)
+        if "signal" not in state:
+            state["cost"], dphi = objective(um)
+            state["signal"] = adjoint_signal(sim, dphi, sensors)
+        signal = state["signal"]
+        m0, m1 = sim.N - e, sim.N - s
+        if not s:
+            # the forward rotation left the last three states live, which is the seed
+            state["seed"] = float(cp.linalg.norm(triplet(m0)[2] * valid))
+        # row k of each is reverse step m0 + k, contiguous since the kernels index by row
+        windows = [Window(signal[m0 : m1 - 1])]
+        windows.append(Window(source.signal[s : e - 1][::-1].copy()))
+        if num_strip:
+            windows.append(Window(buffer[: e - s - 1][::-1].copy(), dtype=sim.dtype))
+        del buffer
+        if e - s > 1:
+            march(e - s - 1, lambda j, *rows: backward(m0 + j, j, *rows), windows)
+        adjoint(m1 - 1, m1 - 1, signal)
+
+    for action, *segments in checkpoint_schedule(len(starts) - 1, checkpoints or 0):
+        if action == "advance":
+            advance(starts[segments[0]], starts[segments[1]])
+        elif action == "store":
+            store(segments[0])
+        elif action == "restore":
+            restore(segments[0])
+        elif action == "drop":
+            del snapshots[segments[0]]
+        else:
+            leaf(segments[0])
 
     grads = sim.finalize_gradients(grads, sens_kernels)
     # assigned, not multiplied, so a NaN outside cannot survive as 0 * NaN
@@ -524,9 +683,16 @@ def reconstruction_sensitivity(
     for field in grads.values():
         field[outside] = 0.0
     # the march ends on the initial state, which is zero, so what is left is round-off
+    seed = state["seed"]
+    a = triplet(sim.N - 1)[0]
     drift = float(cp.linalg.norm(a * valid)) / seed if seed > 0.0 else float("inf")
-    info = {"strip": num_strip, "drift": drift}
-    return cost, grads, um, info
+    info = {
+        "strip": num_strip,
+        "drift": drift,
+        "segment": segment,
+        "sweeps": state["steps"] / sim.N,
+    }
+    return state["cost"], grads, um, info
 
 
 def superposition_sensitivity(

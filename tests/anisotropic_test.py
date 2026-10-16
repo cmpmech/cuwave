@@ -274,7 +274,7 @@ class OperatorTest(unittest.TestCase):
         # a stiffened C must stiffen the assembled operator, at unchanged speeds
         stiffened = 2.0 * voigt(2, RHO * (CP**2 - 2.0 * CS**2), RHO * CS**2)
         base, aniso = _sim((14, 14), N=1), _sim((14, 14), N=1, C=stiffened)
-        ratio = float(cp.abs(aniso.stencil()).max() / cp.abs(base.stencil()).max())
+        ratio = float(cp.abs(aniso.stencil_table()).max() / cp.abs(base.stencil_table()).max())
         self.assertAlmostEqual(ratio, 2.0, places=10)
 
 

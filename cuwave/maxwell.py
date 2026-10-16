@@ -294,6 +294,7 @@ class MaxwellWave(Simulation):
             force_pml(u1, u2)
             return u2
 
+        pml_step.memory = curl_pml.memory
         return pml_step
 
     def excitation_weights(

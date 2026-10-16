@@ -88,6 +88,7 @@ if HAS_CUDA:
     from cuwave.maxwell import DielectricWave
     from cuwave.scalar import AcousticWave, ScalarWave
     from cuwave.sensitivity import (
+        checkpoint_schedule,
         l2_misfit,
         reconstruction_nodes,
         reconstruction_sensitivity,
@@ -466,6 +467,13 @@ class GradientTest(unittest.TestCase):
         for name, sim, base, hz, damp in (
             ("scalar order 4", _scalar(order=4), 1.0, 4.0, None),
             ("scalar order 8", _scalar(order=8), 1.0, 4.0, None),
+            (
+                "optimized order 8",
+                replace(_scalar(order=8), stencil="optimized"),
+                1.0,
+                4.0,
+                None,
+            ),
             ("mixed walls order 4", _scalar(order=4, boundary=mixed), 1.0, 4.0, None),
             ("acoustic order 8", _acoustic(order=8), 0.3, 400.0, None),
             ("damped acoustic order 4", _acoustic(order=4), 0.3, 400.0, 0.02),
@@ -843,7 +851,7 @@ class ReconstructionTest(unittest.TestCase):
         source, sensors, indicator, objective = _problem(sim, 5.0, 1.0)
         reference = sensitivity(sim, source, indicator, sensors, objective)
         rebuilt = reconstruction_sensitivity(sim, source, indicator, sensors, objective)
-        _, valid = reconstruction_nodes(sim)
+        _, valid = reconstruction_nodes(sim, indicator)
         return reference, rebuilt, valid
 
     def _cases(self):
@@ -881,7 +889,8 @@ class ReconstructionTest(unittest.TestCase):
         region = pad_for_sponge((NC, NC - 2), dx, 5.0 * dx[0])[3]
         for order in (2, 4):
             with self.subTest(space_order=order):
-                _, valid = reconstruction_nodes(_sponged(order=order))
+                sim = _sponged(order=order)
+                _, valid = reconstruction_nodes(sim, _problem(sim, 5.0, 1.0)[2])
                 design = cp.zeros(valid.shape, dtype=cp.bool_)
                 design[region] = True
                 dropped = int((design & ~valid).sum())
@@ -889,12 +898,12 @@ class ReconstructionTest(unittest.TestCase):
 
     def test_it_matches_finite_differences_through_a_sponge(self):
         # the check no other variant runs damped: superposition refuses the field
-        for order in (2, 4):
-            with self.subTest(space_order=order):
+        for order, checkpoints in ((2, None), (4, None), (4, 2)):
+            with self.subTest(space_order=order, checkpoints=checkpoints):
                 sim = _sponged(order=order)
                 source, sensors, indicator, objective = _problem(sim, 5.0, 1.0)
                 _, grads, _, _ = reconstruction_sensitivity(
-                    sim, source, indicator, sensors, objective
+                    sim, source, indicator, sensors, objective, checkpoints=checkpoints
                 )
                 nodes = [(11, 9), (17, 14), (13, 11), (22, 15)]
 
@@ -957,7 +966,7 @@ class ReconstructionTest(unittest.TestCase):
                 _, grads, _, _ = reconstruction_sensitivity(
                     sim, source, indicator, sensors, objective, strip_dtype=stored
                 )
-                _, valid = reconstruction_nodes(sim)
+                _, valid = reconstruction_nodes(sim, indicator)
                 a = _combine(sim, grads)[valid]
                 b = _combine(sim, reference)[valid]
                 rel = float(cp.linalg.norm(a - b) / cp.linalg.norm(b))
@@ -972,13 +981,103 @@ class ReconstructionTest(unittest.TestCase):
             )
 
     def test_a_fully_damped_simulation_is_refused(self):
-        # a uniform field leaves no lossless node, so there is nothing to rebuild from
+        # too strong to reverse everywhere, so there is nothing to rebuild from
         sim = _scalar()
         source, sensors, indicator, objective = _problem(sim, 5.0, 1.0)
         with self.assertRaises(ValueError):
             reconstruction_sensitivity(
-                _damp(sim, indicator, 0.02), source, indicator, sensors, objective
+                _damp(sim, indicator, 0.3), source, indicator, sensors, objective
             )
+
+    def test_a_weak_damping_everywhere_is_run_backwards(self):
+        for precision, tolerance in (("float64", 1e-12), ("float32", 1e-5)):
+            with self.subTest(precision=precision):
+                sim = _scalar(precision=precision)
+                source, sensors, indicator, objective = _problem(sim, 5.0, 1.0)
+                sim = _damp(sim, indicator, 0.002)
+                (_, gr, _, _), (_, g, _, info), valid = self._both(sim)
+                self.assertEqual(info["strip"], 0)
+                self.assertEqual(int(valid.sum()), (sim.Nx[0] - 2) * (sim.Nx[1] - 2))
+                a, b = _combine(sim, g)[valid], _combine(sim, gr)[valid]
+                rel = float(cp.linalg.norm(a - b) / cp.linalg.norm(b))
+                self.assertLess(rel, tolerance, f"relative difference {rel:.3e}")
+
+    def _checkpointed(self):
+        # a step past a multiple of the segment leaves a last segment one step long
+        yield "sponge", _sponged(beta=0.2, N=127), _problem
+        yield "pml", _matched(4), _problem
+        yield "elastic pml", _matched(2, "elastic", Clamped), PmlTest()._case
+
+    def test_checkpoints_keep_the_exact_transpose(self):
+        for name, sim, problem in self._checkpointed():
+            args = problem(sim)[:4] if problem is not _problem else problem(sim, 5.0, 1.0)
+            source, sensors, indicator, objective = args
+            reference = sensitivity(sim, source, indicator, sensors, objective)[1]
+            for checkpoints in (0, 1, 2, 64):
+                with self.subTest(case=name, checkpoints=checkpoints):
+                    _, grads, _, info = reconstruction_sensitivity(
+                        sim, source, indicator, sensors, objective,
+                        checkpoints=checkpoints,
+                    )
+                    segments = -(-sim.N // info["segment"])
+                    self.assertGreater(segments, 4)
+                    _, valid = reconstruction_nodes(sim, indicator, info["segment"])
+                    for key in reference:
+                        a, b = grads[key][..., valid], reference[key][..., valid]
+                        rel = float(cp.linalg.norm(a - b) / cp.linalg.norm(b))
+                        self.assertLess(rel, 1e-12, f"{key} off by {rel:.3e}")
+                    self.assertLess(info["drift"], 1e-10)
+                    if checkpoints >= segments:
+                        self.assertLess(info["sweeps"], 2.0)
+
+    def test_checkpoint_memory_does_not_grow_with_the_number_of_steps(self):
+        # only the traces still grow with N, which every variant records
+        pool = cp.get_default_memory_pool()
+        peaks = {}
+        for steps in (200, 1600):
+            for checkpoints in (None, 4):
+                pool.free_all_blocks()
+                sim = _sponged(N=steps, res=192, beta=0.3, precision="float32")
+                source, sensors, indicator, objective = _problem(sim, 5.0, 1.0)
+                base = pool.total_bytes()
+                reconstruction_sensitivity(
+                    sim, source, indicator, sensors, objective, checkpoints=checkpoints
+                )
+                peaks[steps, checkpoints] = pool.total_bytes() - base
+                pool.free_all_blocks()
+        grew = {c: peaks[1600, c] - peaks[200, c] for c in (None, 4)}
+        self.assertLess(grew[4], 0.1 * grew[None])
+
+
+class CheckpointScheduleTest(unittest.TestCase):
+    def test_every_segment_is_reversed_once_from_its_own_start(self):
+        for segments in (1, 2, 7, 40):
+            for slots in (0, 1, 3, 50):
+                with self.subTest(segments=segments, slots=slots):
+                    held, at, leaves, reached = {0}, None, [], 0
+                    for action, *k in checkpoint_schedule(segments, slots):
+                        if action == "restore":
+                            self.assertIn(k[0], held)
+                            at = k[0]
+                        elif action == "advance":
+                            self.assertEqual(at, k[0])
+                            if not leaves:
+                                # the first sweep marches every step in order
+                                self.assertEqual(k[0], reached)
+                                reached = k[1]
+                            at = k[1]
+                        elif action == "store":
+                            held.add(k[0])
+                            self.assertLessEqual(len(held) - 1, slots)
+                        elif action == "drop":
+                            held.remove(k[0])
+                        else:
+                            self.assertEqual(at, k[0])
+                            if not leaves:
+                                self.assertEqual(k[0], reached)
+                            leaves.append(k[0])
+                            at = None
+                    self.assertEqual(leaves, list(range(segments))[::-1])
 
 
 @unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")

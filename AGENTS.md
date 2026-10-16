@@ -82,7 +82,9 @@ elastic's stress+update pair does), still without touching `simulate`.
 
 The vector siblings: `elastic.ElasticWave` is staggered (component `c` half a node up
 axis `c`, declared via `component_offsets`, which `utils.distribute` honours), carries any
-even `space_order` at per-axis cost, and is the exact transpose at every order.
+even `space_order` at per-axis cost, and is the exact transpose at every order. Its kernels
+read `gamma` alone and average it onto each point per read (no inertia or shear grids), and
+`deep_node` sends threads 2r inside every wall down a template path with no wall terms.
 `anisotropic.AnisotropicElasticWave` is the collocated cell assembly: order 2 only (the
 gather costs `(2r)**(2*ndim)`), but it takes an arbitrary symmetric Voigt `C`, which the
 staggered layout cannot. Both are lossless-reversible with kernel-less Traction/Clamped
@@ -122,10 +124,11 @@ and the cell onto one stays open with the zero at the cell *midpoint* (radius co
 `cp.RawModule` per `(ndim, precision, damping, space_order)` combination: `NDIM`,
 `USE_FLOAT`, `USE_DAMPING` and `USE_MAGNETIC` go in as `-D` flags, while two source blocks
 are *prepended* so CuPy's module cache keys on them without a flag: the stencil table from
-`stencils.preamble(space_order)`, then `kernels/common.cuh`. That prelude holds what every
-`.cu` repeated (the `real_t` typedef, the `OP_W`/`SG_W` accessors, `rad_node`/`rad_half`,
-`PAIR_ROW`, and the four transfer kernels); the `AXIS_*` macro blocks stay per file, since
-the anisotropic adjoint's signature genuinely differs. Any new flag is added to both the
+`stencils.preamble(space_order, stencil)` (`Simulation.stencil="optimized"` swaps in the
+dispersion-fitted full-radius row, wall rows stay Taylor), then `kernels/common.cuh`.
+That prelude holds what every `.cu` repeated (the `real_t` typedef, the `OP_W`/`SG_W`
+accessors, `rad_node`/`rad_half`, `PAIR_ROW`, and the four transfer kernels); the `AXIS_*`
+macro blocks stay per file, since the anisotropic adjoint's signature genuinely differs. Any new flag is added to both the
 `.cu` header block and `Simulation.compile_flags`.
 
 **Closure factories.** `sim.define_step`, `define_boundary`, `define_excitation`,
@@ -166,7 +169,7 @@ backward pass:
 | | memory | `sim.damping` | gradient |
 |---|---|---|---|
 | `sensitivity` | stores all `N + 2` fields | supported | exact transpose of the discretization |
-| `reconstruction_sensitivity` | 7 grids and `N + 2` copies of the strip | supported, and what the strip pays for | the same transpose, wherever the strip shields it |
+| `reconstruction_sensitivity` | 7 grids and `N + 2` copies of the strip, or `checkpoints + 1` snapshots | supported: weak damping is run backwards, strong damping is what the strip pays for | the same transpose, wherever the strip shields it |
 | `superposition_sensitivity` | 5 grids, independent of `N` | rejected (`require_lossless`) | consistent, not exact; `scale` (k) trades a k² bias against round-off |
 | `spectral_sensitivity` | 8 grids, independent of `N`, plus a running DFT on `region` | supported | exact once both runs decay; spectral costs only (`intensity`) |
 
@@ -180,6 +183,12 @@ puts it behind the strip (dilated in every direction, diagonals included), and
 `spectral_sensitivity` restarts the adjoint memories per frequency.
 `reconstruction_sensitivity(..., strip_dtype=)` stores the strip as float32 or bfloat16
 (a `uint16` record that `Window(dtype=)` widens on staging), trading exactness for memory.
+A damped node is irreversible only past `REVERSIBLE_GROWTH` (`reversible_damping`): the
+reverse march is `fd_step` with the damping negated, so physical attenuation needs no strip.
+`checkpoints=c` cuts the run into segments whose strip costs about one snapshot (fields plus
+the step closure's `memory`, the pml aux buffers every pml factory exposes) and reverses
+them in the treeverse order of `checkpoint_schedule`: memory independent of `N`, at the cost
+of replaying (`info["sweeps"]`).
 
 `spectral_sensitivity` (adapted from fdtdx and the Meep adjoint) needs no history at all: the
 cost's derivative is fitted by sinusoids at `frequencies` (raises if it is not spectral), the

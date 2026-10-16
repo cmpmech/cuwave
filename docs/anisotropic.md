@@ -36,7 +36,7 @@ On top of [Simulation](wave.md) and mirroring [ElasticWave](elastic.md), with th
 | member | signature | description |
 |---|---|---|
 | constructor | `AnisotropicElasticWave(Nx, dx, N, dt, threads, density=None, wavespeed_p=None, wavespeed_s=None, plane="strain", C=None)` | the two speeds and the background density; `C` overrides the isotropic Voigt matrix with any symmetric one at $\gamma=1$ |
-| stencil | `stencil()` | one cell's $-\mathbf{B}^\top\mathbf{C}\mathbf{B}$ at $\gamma=1$, flattened for the kernel and built once |
+| stencil | `stencil_table()` | one cell's $-\mathbf{B}^\top\mathbf{C}\mathbf{B}$ at $\gamma=1$, flattened for the kernel and built once |
 | stencil | `cell_stencil(ndim, dx, C)` | the same matrix as a host function, ordered (node, component) in `corner_bits` order |
 | averaging | `cell_average(sim, field)` | the harmonic corner mean $\gamma_c$, stored at the cell's low corner |
 | inertia | `inverse_inertia(indicator)` | lumped $1/\left(\gamma\rho_0VW\right)$, the mass the interior-cell assembly implies |

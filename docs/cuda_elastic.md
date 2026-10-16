@@ -38,6 +38,16 @@ $$r_\textrm{half}\left(a\right)=\min\left(R,\,a,\,N-2-a\right)$$
 ### clamped_face
 Reads bit $2d+\textrm{side}$ of the `clamped` mask, the faces `Simulation.boundary` marks `Clamped`
 
+### deep_node, node_radius, half_radius, clamped_at
+**aim**
+the wall-free path: a node more than $2R$ nodes inside every wall reads no graded tap, no wall weight and no clamped fold
+**input args**
+`A`, `NN`: geometry; `DEEP`: the template switch
+**how?**
+- with `DEEP` set, `node_radius` and `half_radius` return `STENCIL_RADIUS` and `clamped_at` returns false, so the tap guards and the `SG_W` row are compile-time constants; unset, they are `rad_node`, `rad_half` and `clamped_face`
+- every helper below that reads a radius or a wall takes `DEEP` as a template argument defaulting to false, and `stress_kernel` and `fd_kernel` branch on `deep_node` per thread, so only the warps that hold a near-wall node run both paths
+- the deep path is the general one with the wall terms removed, so the two agree bitwise
+
 ### normal_strains
 **aim**
 the node's normal strains, one per axis, and which axes graded to a zero row
@@ -70,6 +80,35 @@ the engineering shear strain of the $\left(k,l\right)$ pair at its own staggered
 - both derivatives land on the point without averaging, each at its own graded radius
 $$2\,\varepsilon_{kl}=\frac{1}{\Delta x_l}\sum_{j\le r_1}c_j\left(u_k^{a+j}-u_k^{a+1-j}\right)+\frac{1}{\Delta x_k}\sum_{j\le r_2}c_j\left(u_l^{a+j}-u_l^{a+1-j}\right)$$
 
+## material helpers
+
+### wall_weight
+The cell weight $W$ of a node, halved on the walls of every axis outside the bitmask `skip`, which are the axes the point is staggered along
+
+### node_gamma, shear_gamma
+**aim**
+the design on the normal and on the $\left(k,l\right)$ shear stress point, formed from `gamma` per read rather than stored
+**how?**
+$$W\gamma\qquad\textrm{and}\qquad w_s\gamma_s=w_s\,\frac{4}{\sum_{4\textrm{ nodes}}1/\gamma}$$
+- the harmonic mean over the four nodes around the shear point, `TINY` guarding a void node as the Python averages do
+
+### point_minv
+**aim**
+the inverse inertia of component `c` on its own point, zero where a clamped wall holds it
+**how?**
+$$m_c^{-1}=\frac{1}{\rho_0\,W\,\tfrac12\left(\gamma_i+\gamma_{i+e_c}\right)}$$
+- the volume is left out, since the force leaves it out too; `ElasticWave.point_inverse_inertia` evaluates the same value on the host for the excitation weights
+
+## step helpers
+
+### stress_point
+**aim**
+every stress of the node at `idx`, zero off the point a family does not carry, as `stress_kernel` writes them; see there for the formulas
+
+### nodal_force
+**aim**
+the stress divergence on component `c`'s point, as `fd_kernel` takes it; see there for the taps
+
 ## pml helpers
 Every pml kernel of this file runs on the slab of one lined axis `e` through `SLAB_OR_RETURN` ([cuda_scalar](cuda_scalar.md)). Its memory `aux` holds `2 * NDIM` rows: the strain memories $\psi_k$ of $\partial_eu_k$ at the strain point $\left(k,e\right)$, then the divergence memories $\zeta_c$ of the axis-$e$ part of $\nabla\cdot\sigma_c$. The `profile` rows are read at the node or at the half point $a+\tfrac12$, whichever the quantity sits on along `e`
 ### zeroed_axes
@@ -92,7 +131,7 @@ the axis-$e$ part of the divergence of component $c$, as `fd_kernel` takes it, w
 **aim**
 add the stress of the strain terms `t` of axis `e` onto the stress points, through the same condensed $\lambda$ and shear means as `stress_kernel`
 **input args**
-`sigma`: the stress scratch, added to; `gnode`, `gshear`, `lam`, `mu`, `clamped`: as `stress_kernel`; `idx`, `cs`, `e`, `A`, `NN`: geometry; `t`: one strain term per component, $\partial_eu_k$ or its memory
+`sigma`: the stress scratch, added to; `gamma`, `lam`, `mu`, `clamped`: as `stress_kernel`; `idx`, `cs`, `e`, `A`, `NN`: geometry; `t`: one strain term per component, $\partial_eu_k$ or its memory
 
 ## kernels
 
@@ -100,7 +139,7 @@ add the stress of the strain terms `t` of axis `e` onto the stress points, throu
 **parallelization**
 one thread per grid point, writing every stress family whose point it carries
 **input args**
-`u1`: the field at $t-1$; `gnode`: $W\gamma$ on the nodes; `gshear`: `NPAIRS` fields of $w_s\gamma_s$, the harmonic shear means, `NDIM >= 2` only; `lam`, `mu`: $\lambda$ (plane-reduced on the host) and $\mu$; `clamped`: the face bitmask; `cs`: component stride; `f0..f2`: $1/\Delta x_d$; `N0..N2`, `s0, s1`: geometry
+`u1`: the field at $t-1$; `gamma`: the nodal design, which `node_gamma` and `shear_gamma` take onto the stress points; `lam`, `mu`: $\lambda$ (plane-reduced on the host) and $\mu$; `clamped`: the face bitmask; `cs`: component stride; `f0..f2`: $1/\Delta x_d$; `N0..N2`, `s0, s1`: geometry
 **output args**
 `sigma`: `NVOIGT` fields, the normal stresses first and the pairs in Voigt order, assigned rather than accumulated; points no family writes stay at the zero the scratch was allocated with
 **how?**
@@ -113,7 +152,7 @@ $$\sigma_{kl}=w_s\gamma_s\,\mu\left(2\,\varepsilon_{kl}\right)$$
 **parallelization**
 one thread per grid point, updating every component whose unknown it carries
 **input args**
-`u0`, `u1`: the fields at $t-2$ and $t-1$; `sigma`: the stresses `stress_kernel` just wrote; `minv`: `NDIM` fields of $1/\left(\rho_0W\bar{\gamma}\right)$, one per component at its own points, the volume deliberately left out since the force below leaves it out too; `damping`: nodal $d$, with `USE_DAMPING` only; `dt`: $\Delta t$, with `USE_DAMPING` only; `clamped`, `cs`: as above; `f0..f2`: $\Delta t^2/\Delta x_d$
+`u0`, `u1`: the fields at $t-2$ and $t-1$; `sigma`: the stresses `stress_kernel` just wrote; `gamma`, `rho`: the nodal design and $\rho_0$, from which `point_minv` forms the inverse inertia per component; `damping`: nodal $d$, with `USE_DAMPING` only; `dt`: $\Delta t$, with `USE_DAMPING` only; `clamped`, `cs`: as above; `f0..f2`: $\Delta t^2/\Delta x_d$
 **output args**
 `u2`: the field at $t$, same layout as `u1`
 **internal args**
@@ -129,7 +168,7 @@ flat 1D launch over the slab of axis `e`, `PML_THREADS` per block; launched once
 **aim**
 advance the strain memories of axis `e` and add the stress they carry onto `sigma`
 **input args**
-`u1`: the field at $t-1$; `sigma`: the stresses `stress_kernel` wrote, added to; `gnode`, `gshear`, `lam`, `mu`, `clamped`, `cs`: as `stress_kernel`; `aux`: the memory of this axis; `profile`: its `(4, NN[e])` rows from `pml_profiles`; `e`: the lined axis; `lo, hi`: slab rows; `f0..f2`: $1/\Delta x_d$; `N0..N2`, `s0, s1`: geometry
+`u1`: the field at $t-1$; `sigma`: the stresses `stress_kernel` wrote, added to; `gamma`, `lam`, `mu`, `clamped`, `cs`: as `stress_kernel`; `aux`: the memory of this axis; `profile`: its `(4, NN[e])` rows from `pml_profiles`; `e`: the lined axis; `lo, hi`: slab rows; `f0..f2`: $1/\Delta x_d$; `N0..N2`, `s0, s1`: geometry
 **how?**
 $$\psi_k\leftarrow b\,\psi_k+a\,\partial_eu_k,\qquad\sigma\mathrel{+}=\textrm{the stress of }\psi$$
 - every lined axis adds onto the one scratch, so the update reads the stress stretched along all of them, which is what holds a corner together
@@ -139,7 +178,7 @@ as `pml_stress_kernel`, launched once per lined axis after `fd_kernel`
 **aim**
 advance the divergence memories of axis `e` and add them to the update
 **input args**
-`u1`: unread, kept so one launch list serves this kernel and its adjoint; `u2`: the field at $t$, added to; `sigma`: the stretched stresses; `minv`, `clamped`, `cs`: as `fd_kernel`; `aux`, `profile`, `e`, `lo`, `hi`: as `pml_stress_kernel`; `f0..f2`: $\Delta t^2/\Delta x_d$; `N0..N2`, `s0, s1`: geometry
+`u1`: unread, kept so one launch list serves this kernel and its adjoint; `u2`: the field at $t$, added to; `sigma`: the stretched stresses; `gamma`, `rho`, `clamped`, `cs`: as `fd_kernel`; `aux`, `profile`, `e`, `lo`, `hi`: as `pml_stress_kernel`; `f0..f2`: $\Delta t^2/\Delta x_d$; `N0..N2`, `s0, s1`: geometry
 **how?**
 $$\zeta_c\leftarrow b\,\zeta_c+a\,\partial_e\sigma_{ce},\qquad u_c^t\mathrel{+}=m_c^{-1}\zeta_c$$
 ### pml_adjoint_stress_kernel
@@ -157,7 +196,7 @@ as `pml_adjoint_stress_kernel`, launched after `fd_kernel`
 **aim**
 push the strain memories back through the divergence, the transpose of `pml_stress_kernel`, and advance the divergence memories
 **input args**
-`l1`: the adjoint at $t+1$; `l2`: the adjoint at $t$, added to; `sigma`, `minv`, `clamped`, `cs`, `aux`, `profile`, `e`, `lo`, `hi`: as `pml_force_kernel`
+`l1`: the adjoint at $t+1$; `l2`: the adjoint at $t$, added to; `sigma`, `gamma`, `rho`, `clamped`, `cs`, `aux`, `profile`, `e`, `lo`, `hi`: as `pml_force_kernel`
 **how?**
 $$\lambda_c^t\mathrel{+}=m_c^{-1}\,\partial_e\left(a\left(\sigma_{ce}+\eta_{\psi}\right)\right),\qquad\eta_{\zeta,c}\leftarrow b\left(\eta_{\zeta,c}+\lambda_c^{t+1}\right)$$
 - the divergence memory is advanced only on the slab proper, where `t` is not -1, after the stress pass has read it
@@ -180,4 +219,4 @@ From the shared prelude, the component folded into `lin_index` the same way
 ### set_signal_kernel
 From the shared prelude, assignment rather than `atomicAdd`, so it restores a recorded state
 
-The `sigma` scratch is allocated once by `define_step` and reused every step: the two launches replace the single fused one because each stress value is read by up to $2r$ updates, so forming it once trades one round of global traffic against recomputing every strain per reader
+The `sigma` scratch is allocated once by `define_step` and reused every step: the two launches replace a single fused one because each stress value is read by up to $2r$ updates, so forming it once trades one round of global traffic against recomputing every strain per reader. A tile that forms the stresses in shared memory pays that recomputation on its halo, which at the block sizes a register budget allows costs more than the scratch saves. The materials are the opposite case: averaging $\gamma$ per read costs a few loads the cache already holds, and spares the inertia and shear grids, so a 2D step holds the fields, `gamma` and the scratch alone

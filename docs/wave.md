@@ -26,7 +26,8 @@ From those it derives everything the kernels are launched and compiled with: so 
 
 | member         | signature         | description                                                                                                                                                 |
 | -------------- | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| derived layout | `__post_init__()` | resolves the dimension `ndim`, the padded shape `Nx_padded`, the C-contiguous `strides` and the `dtype`, and rejects a `space_order` that is odd or below 2 |
+| derived layout | `__post_init__()` | resolves the dimension `ndim`, the padded shape `Nx_padded`, the C-contiguous `strides` and the `dtype`, and rejects a `space_order` that is odd or below 2 and an unknown `stencil` |
+| stencil | `stencil="taylor"` | the full-radius coefficient row the kernels compile against, `"optimized"` for the dispersion-fitted one of [stencils](stencils.md) |
 | kernel options | `compile_flags`   | extra `nvcc -D` flags, empty here and extended by the derived classes                                                                                       |
 | step | `define_step(kernels, mat)` | the step closure, one `fd_kernel` launch here; a scheme needing several launches per step overrides it, which is how the staggered [elastic](elastic.md) exists without touching `simulate` |
 | adjoint step | `define_adjoint_step(kernels, sens_kernels, mat)` | the closure stepping the adjoint field by the transpose of the step's operator under the cell weights: `define_step` itself here, for an operator that is its own transpose, and overridden by [scalar](scalar.md) `PressureWave`, whose operator is not above order 2 |

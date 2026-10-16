@@ -28,9 +28,7 @@ from .wave import (
     axis_geometry,
     define_pair_pml,
     grid_block,
-    pair_average,
     pair_average_adjoint,
-    point_average,
     point_average_adjoint,
     wall_weights,
 )
@@ -162,35 +160,32 @@ class ElasticWave(Simulation):
         return 1.0 / cp.maximum(mass, cp.finfo(self.dtype).tiny)
 
     def build_materials(self, indicator: cpt.NDArray) -> dict:
-        """Point inverse inertia per component and the design field on the stress points."""
-        gamma = cp.ascontiguousarray(indicator, dtype=self.dtype)
-        minv = cp.zeros((self.ncomp, *self.Nx_padded), dtype=self.dtype)
-        for c in range(self.ncomp):
-            mass = (
-                self.density
-                * wall_weights(self, (c,))
-                * point_average(self, gamma, c)
-            )
-            minv[c] = 1.0 / cp.maximum(mass, cp.finfo(self.dtype).tiny)
-        for face in faces_with(self, Clamped):
-            wall = [slice(None)] * self.ndim
-            wall[face // 2] = 1 if face % 2 == 0 else self.Nx[face // 2] - 2
-            for c in range(self.ncomp):
-                if c != face // 2:
-                    minv[(c, *wall)] = 0.0
-        mat = {
-            "minv": cp.ascontiguousarray(minv),
-            "gnode": apply_cell_weights(self, gamma.copy()),
-            "gamma": gamma,
-        }
-        if self.ndim > 1:
-            gshear = cp.zeros((self.npairs, *self.Nx_padded), dtype=self.dtype)
-            for p, axes in enumerate(PAIRS[self.ndim][self.ndim :]):
-                gshear[p] = wall_weights(self, axes) * pair_average(self, gamma, axes)
-            mat["gshear"] = cp.ascontiguousarray(gshear)
+        """The design field alone: the kernels average it onto the stress and component points."""
+        mat = {"gamma": cp.ascontiguousarray(indicator, dtype=self.dtype)}
         if self.damping is not None:
             mat["damping"] = self.damping
         return mat
+
+    def point_inverse_inertia(
+        self, gamma: cpt.NDArray, lin_index: cpt.NDArray[cp.int32]
+    ) -> cpt.NDArray:
+        """`1 / (rho0 W mean gamma)` on the component points `lin_index`, as `point_minv` forms it."""
+        component, node = lin_index // self.comp_stride, lin_index % self.comp_stride
+        rows = [node // s % n for s, n in zip(self.strides, self.Nx_padded)]
+        step = cp.asarray(self.strides, dtype=lin_index.dtype)[component]
+        flat = gamma.ravel()
+        mean = 0.5 * (flat[node] + flat[node + step])
+        weight = cp.ones(lin_index.shape, dtype=self.dtype)
+        for d, a in enumerate(rows):
+            for index in (1, self.Nx[d] - 2):
+                weight = cp.where((a == index) & (component != d), 0.5 * weight, weight)
+        mass = self.density * weight * mean
+        minv = 1.0 / cp.maximum(mass, cp.finfo(self.dtype).tiny)
+        for face in faces_with(self, Clamped):
+            d = face // 2
+            wall = 1 if face % 2 == 0 else self.Nx[d] - 2
+            minv = cp.where((rows[d] == wall) & (component != d), 0.0, minv)
+        return minv.astype(self.dtype)
 
     def define_step(self, kernels: cp.RawModule, mat: dict) -> Callable:
         """Closure launching the stress kernel and then the update over (u0, u1, u2)."""
@@ -204,9 +199,9 @@ class ElasticWave(Simulation):
 
     def _define_pair(self, kernels: cp.RawModule, mat: dict, adjoint: bool) -> Callable:
         """The stress and update launches, each followed by its pml terms if there are any."""
+        grid, block = grid_block(self)
         stress_kernel = kernels.get_function("stress_kernel")
         fd_kernel = kernels.get_function("fd_kernel")
-        grid, block = grid_block(self)
         sigma, sargs, uargs = self.step_args(mat)
         if self.pml is None:
 
@@ -225,7 +220,7 @@ class ElasticWave(Simulation):
             "stress",
             sigma,
             [*self.stress_material(mat), face_mask(self, Clamped), cs],
-            [mat["minv"], face_mask(self, Clamped), cs],
+            [mat["gamma"], self.dtype(self.density), face_mask(self, Clamped), cs],
             adjoint,
         )
 
@@ -238,6 +233,7 @@ class ElasticWave(Simulation):
             force_pml(u1, u2)
             return u2
 
+        pml_step.memory = stress_pml.memory
         return pml_step
 
     def step_args(self, mat: dict) -> tuple[cpt.NDArray, list, list]:
@@ -248,27 +244,27 @@ class ElasticWave(Simulation):
         inv_dx = [self.dtype(1.0 / d) for d in self.dx]
         sargs = [None, sigma, *self.stress_material(mat), clamped]
         sargs += [np.int32(self.comp_stride), *axis_geometry(self, inv_dx)]
-        uargs = [None, None, None, sigma, mat["minv"]]
-        if self.damping is not None:
-            uargs += [mat["damping"], self.dtype(self.dt)]
-        uargs += [
-            clamped,
-            np.int32(self.comp_stride),
-            *axis_geometry(self, self.step_factors()),
-        ]
+        uargs = [None, None, None, sigma, mat["gamma"], self.dtype(self.density)]
+        uargs += [*self.damping_args(mat), clamped, np.int32(self.comp_stride)]
+        uargs += axis_geometry(self, self.step_factors())
         return sigma, sargs, uargs
 
+    def damping_args(self, mat: dict) -> list:
+        """The damping field and the step it is scaled by, if there is one."""
+        if self.damping is None:
+            return []
+        return [mat["damping"], self.dtype(self.dt)]
+
     def stress_material(self, mat: dict) -> list:
-        """The design on the stress points and the two Lame parameters, as the kernels take them."""
-        fields = [mat["gnode"], mat["gshear"]] if self.ndim > 1 else [mat["gnode"]]
-        return [*fields, self.dtype(self.lame), self.dtype(self.shear)]
+        """The design field and the two Lame parameters, as the kernels take them."""
+        return [mat["gamma"], self.dtype(self.lame), self.dtype(self.shear)]
 
     def excitation_weights(
         self, mat: dict, lin_index: cpt.NDArray[cp.int32]
     ) -> cpt.NDArray:
         """Source weights `dt**2 / (inertia V)`: the kernel inertia leaves the volume out."""
         volume = self.dtype(1.0 / float(np.prod(self.dx)))
-        weight = mat["minv"].ravel()[lin_index] * volume
+        weight = self.point_inverse_inertia(mat["gamma"], lin_index) * volume
         if self.damping is not None:
             node = lin_index % np.int32(self.comp_stride)
             beta = 0.5 * weight * mat["damping"].ravel()[node] * self.dt

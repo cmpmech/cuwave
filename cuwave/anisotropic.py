@@ -223,7 +223,7 @@ class AnisotropicElasticWave(Simulation):
             return self.C
         return voigt(self.ndim, self.lame, self.shear, self.plane)
 
-    def stencil(self) -> cpt.NDArray:
+    def stencil_table(self) -> cpt.NDArray:
         """Stencil table at `gamma = 1`: one cell's `-B^T C B`, flattened for the kernel."""
         if self._stencil is not None:
             return self._stencil
@@ -252,7 +252,7 @@ class AnisotropicElasticWave(Simulation):
             "minv": cp.ascontiguousarray(minv, dtype=self.dtype),
             "gamma": cp.ascontiguousarray(indicator, dtype=self.dtype),
             "cell": cell_average(self, indicator),
-            "stencil": self.stencil(),
+            "stencil": self.stencil_table(),
         }
         if self.damping is not None:
             mat["damping"] = self.damping
@@ -336,6 +336,7 @@ class AnisotropicElasticWave(Simulation):
                 kernel(grid, (PML_THREADS,), args)
             return u2
 
+        pml_step.memory = [common[0]]
         return pml_step
 
     def step_factors(self) -> list:
@@ -405,7 +406,7 @@ class AnisotropicElasticWave(Simulation):
         grid, block = grid_block(self)
         volume = float(np.prod(self.dx))
         args = [accs["mass"], accs["cell"], None, None, None] + [
-            self.stencil(),
+            self.stencil_table(),
             self.dtype(sign * self.density * volume / (2.0 * self.dt) ** 2),
             self.dtype(-sign),
             np.int32(self.comp_stride),

@@ -54,7 +54,8 @@ The reconstruction strip of [sensitivity](sensitivity.md) follows `reach` $=2r-1
 | staggering | `component_offsets` | component `c` half a node up axis `c`, what [distribute](utils.md) shifts by |
 | stencil radius | `radius` | half `space_order`, each derivative reaching twice it |
 | strip radius | `reach` | $2r-1$, the nodes one step reads past a point |
-| materials | `build_materials(indicator)` | the point inverse inertia per component, the design field on the node and shear stress points, and `damping` |
+| materials | `build_materials(indicator)` | the design field alone, and `damping`: the kernels average $\gamma$ onto the stress and component points themselves, so no material grid is stored beside it |
+| point inertia | `point_inverse_inertia(gamma, lin_index)` | $1/\left(\rho_0W\bar{\gamma}\right)$ on the component points `lin_index`, zero where a clamped wall holds them, the value the kernels form, for the excitation weights |
 | step | `define_step(kernels, mat)` | the two-launch closure: the stress kernel, then the update, each followed by its [pml](boundary.md) terms when `pml` is set |
 | adjoint step | `define_adjoint_step(kernels, sens_kernels, mat)` | the step itself, or with a pml its transpose, which pushes each memory back through the other pass |
 | pml margin | `pml_margin` | $r-1$, the undamped layer nodes before the front, since a corrected strain is read that far |

@@ -97,7 +97,9 @@ def _operator(sim, indicator):
     """The mass weighted spatial operator on the free unknowns, an exact transpose."""
     mat = sim.build_materials(indicator)
     step = sim.define_step(compile_kernels(sim), mat)
-    mass = cp.where(mat["minv"] > 0, 1.0 / cp.maximum(mat["minv"], 1e-300), 0.0)
+    every = cp.arange(sim.ncomp * sim.comp_stride, dtype=cp.int32)
+    minv = sim.point_inverse_inertia(mat["gamma"], every).reshape(sim.field_shape)
+    mass = cp.where(minv > 0, 1.0 / cp.maximum(minv, 1e-300), 0.0)
     slices = [
         (c, *(slice(1, n - 1 - (d == c)) for d, n in enumerate(sim.Nx)))
         for c in range(sim.ncomp)
@@ -107,7 +109,7 @@ def _operator(sim, indicator):
         out = cp.zeros_like(x)
         for sl in slices:
             out[sl] = x[sl]
-        return out * (mat["minv"] > 0)
+        return out * (minv > 0)
 
     def apply(x):
         out = cp.zeros_like(x)
@@ -334,6 +336,10 @@ class GradientTest(unittest.TestCase):
                 sim = _sim((24, 26), space_order=order)
                 self._check(sim, [(6, 9), (12, 12), (1, 10), (22, 11), (1, 1)])
 
+    def test_it_matches_finite_differences_with_an_optimized_stencil(self):
+        sim = _sim((24, 26), space_order=6, stencil="optimized")
+        self._check(sim, [(6, 9), (12, 12), (1, 10), (22, 11)])
+
     def test_it_matches_finite_differences_in_3D(self):
         sim = _sim((14, 13, 15), N=50, space_order=4)
         self._check(sim, [(6, 6, 7), (1, 6, 7), (12, 5, 8)])
@@ -416,7 +422,7 @@ class VariantTest(unittest.TestCase):
                 )
                 args, cost, reference = self._reference(sim)
                 got, grads, _, info = reconstruction_sensitivity(sim, *args)
-                _, valid = reconstruction_nodes(sim)
+                _, valid = reconstruction_nodes(sim, args[1])
                 total = (grads["mass"] + grads["stiff"]) * valid
                 self.assertEqual(got, cost)
                 self.assertGreater(info["strip"], 0)

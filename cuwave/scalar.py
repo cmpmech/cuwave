@@ -92,6 +92,7 @@ class PressureWave(Simulation):
             step(u0, u1, u2)
             return pml_step(u1, u2)
 
+        fd_step.memory = pml_step.memory
         return fd_step
 
     def define_streamed_step(self, kernels: cp.RawModule, mat: dict) -> Callable:
@@ -141,10 +142,11 @@ class PressureWave(Simulation):
         """Closure adding the pml memory terms of `u1` into `u2`, one launch per lined axis."""
         pml_kernel = kernels.get_function("pml_kernel")
         factors = self.step_factors()
-        launches = []
+        launches, memory = [], []
         for d, lo, hi, profile, plane in self.pml_slabs():
             # the three memory variables per slab node: plus cell, minus cell, divergence
             aux = cp.zeros((3, (lo + hi) * plane), dtype=self.dtype)
+            memory.append(aux)
             args = [None, None, *self.step_kernel_args(mat), aux, profile]
             args += [np.int32(d), np.int32(lo), np.int32(hi), factors[d]]
             launches.append((slab_grid(lo, hi, plane), args + axis_geometry(self)))
@@ -155,6 +157,8 @@ class PressureWave(Simulation):
                 pml_kernel(grid, (PML_THREADS,), args)
             return u2
 
+        # the state the step carries besides the field, for a checkpoint to copy
+        pml_step.memory = memory
         return pml_step
 
     def define_adjoint_pml(
