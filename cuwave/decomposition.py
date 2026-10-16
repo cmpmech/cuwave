@@ -7,6 +7,7 @@ kernels. The wall its cut makes spreads an error inward by `sim.reach` rows a st
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import inspect
 import threading
@@ -47,6 +48,11 @@ class Team:
 def halo_rows(sim: Simulation) -> int:
     """Rows held past a cut: two exchange intervals of reach, then the gradient's read."""
     return 2 * EVERY * sim.reach + sim.space_order + 2
+
+
+def stale_rows(sim: Simulation) -> int:
+    """Halo rows one exchange interval can spoil: its reach past the cut wall's own stencil."""
+    return EVERY * sim.reach + sim.space_order + 2
 
 
 def partition(sim: Simulation) -> list[tuple[int, int, int, int]]:
@@ -139,7 +145,11 @@ def exchange(state: list) -> None:
     team.barrier.wait()
     g0, g1, o0, o1 = team.bounds[k]
     device = team.devices[k]
-    for j, (a, b) in ((k - 1, (g0, o0)), (k + 1, (o1, g1))):
+    depth = halo_rows(sim) if getattr(_context, "deep", False) else stale_rows(sim)
+    for j, (a, b) in (
+        (k - 1, (g0, min(o0, g0 + depth))),
+        (k + 1, (max(o1, g1 - depth), g1)),
+    ):
         if b <= a:
             continue
         offset = team.bounds[j][0]
@@ -149,6 +159,16 @@ def exchange(state: list) -> None:
             _rows(array, axis, a - g0, b - g0)[...] = halo
     cp.cuda.get_current_stream().synchronize()
     team.barrier.wait()
+
+
+@contextlib.contextmanager
+def replaying():
+    """Exchange whole halos inside: a replayed strip brings back what its recording held stale."""
+    _context.deep = True
+    try:
+        yield
+    finally:
+        _context.deep = False
 
 
 def agree(value, reduce: Callable = min):

@@ -25,7 +25,7 @@ import numpy as np
 import numpy.typing as npt
 
 from .boundary import define_boundary, pml_nodes
-from .decomposition import agree, decomposable, undivided
+from .decomposition import agree, decomposable, replaying, undivided
 from .wave import (
     BFLOAT16,
     Simulation,
@@ -672,12 +672,13 @@ def reconstruction_sensitivity(
             windows.append(Window(buffer[: e - s - 1][::-1].copy(), dtype=sim.dtype))
         del buffer
         if e - s > 1:
-            march(
-                e - s - 1,
-                lambda j, *rows: backward(m0 + j, j, *rows),
-                windows,
-                [U, P, *adjoint_memory],
-            )
+            with replaying():
+                march(
+                    e - s - 1,
+                    lambda j, *rows: backward(m0 + j, j, *rows),
+                    windows,
+                    [U, P, *adjoint_memory],
+                )
         adjoint(m1 - 1, m1 - 1, signal)
 
     for action, *segments in checkpoint_schedule(len(starts) - 1, checkpoints or 0):

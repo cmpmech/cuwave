@@ -4,7 +4,9 @@
 
 Each device steps one **subdomain**: an ordinary `Simulation` over the rows it owns plus $H$ rows of each neighbour, the **halo**, stepped by the unmodified kernels. The subdomain sees a wall where its rows end, so the rows next to that wall are wrong. The error travels inward by at most `sim.reach` rows a step, and every $K$ steps an exchange overwrites each halo with the rows its owner computed. The owned rows therefore never see it, and they come out bitwise equal to the run on one device:
 $$H=2K\,r_\textrm{reach}+p+2\qquad K=6$$
-with the halo `halo_rows(sim)` $H$, the exchange interval `EVERY` $K$, the one-step read reach `sim.reach` $r_\textrm{reach}$ and the `space_order` $p$. One interval of reach covers the forward march. The second covers a strip a reverse march replays, which was itself recorded with up to one interval of error, and $p+2$ covers the gradient's read across the triplet. $K$ is a multiple of the slot rotation periods 2 and 3, which is what lets `march` still replay its chunks as a captured graph
+with the halo `halo_rows(sim)` $H$, the exchange interval `EVERY` $K$, the one-step read reach `sim.reach` $r_\textrm{reach}$ and the `space_order` $p$. One interval of reach covers the forward march, and $p+2$ the rows the cut wall's own stencil spoils. The second interval covers a strip a reverse march replays, which was itself recorded with up to one interval of error. $K$ is a multiple of the slot rotation periods 2 and 3, which is what lets `march` still replay its chunks as a captured graph
+
+An exchange refreshes only the outer `stale_rows(sim)` $=K\,r_\textrm{reach}+p+2$ rows of each halo, the ones an interval can have spoilt, since every deeper row is still right. Inside `replaying()`, which `reconstruction_sensitivity` wraps around its reverse march, it refreshes the whole halo, because the replayed strip brings back values that were stale when they were recorded
 
 | member | signature | description |
 |---|---|---|
@@ -14,6 +16,7 @@ with the halo `halo_rows(sim)` $H$, the exchange interval `EVERY` $K$, the one-s
 | halo | `halo_rows(sim)` | the rows held past each cut |
 | layout | `partition(sim)` | the rows each subdomain holds and owns, raising where a share is thinner than the halo or a halo reaches an axis-0 pml |
 | march hook | `exchange(state)` | refreshes the halo of every array a march carries, a no-op outside a split run |
+| replay | `replaying()` | context in which an exchange refreshes the whole halo rather than its stale rows |
 | collective | `agree(value, reduce=min)` | one value every subdomain shares, so a schedule decided per subdomain stays in step |
 
 Inputs and outputs keep the single-device shapes: the indicator, the source and the sensors are global, and the returned field, gradients and record are global on the calling device. A host `indicator` returns the fields on the host instead, which is how a grid larger than the calling device is assembled at all. Sources and sensors are injected wherever a subdomain holds them, halo included, and the objective sees the whole record once, so any objective works unchanged
