@@ -711,7 +711,7 @@ def reconstruction_sensitivity(
     return state["cost"], grads, um, info
 
 
-@undivided
+@decomposable
 def superposition_sensitivity(
     sim: Simulation,
     source: Source,
@@ -783,7 +783,7 @@ def superposition_sensitivity(
         if not fused:
             subtract_step(u0, u1, u2)
 
-    march(sim.N, forward, [Window(source.signal), Window(um, store=True)])
+    march(sim.N, forward, [Window(source.signal), Window(um, store=True)], [U])
     if fused:
         t = sim.N - 1
         last = (U[t % 3], U[(t + 1) % 3], U[(t + 2) % 3])
@@ -825,7 +825,9 @@ def superposition_sensitivity(
 
     # outside the graph, as the first fused step's triplet before is the forward's last
     backward(0, backward_signal, 0, mass=False)
-    march(sim.N - 1, shifted, [Window(backward_signal[1:])])
+    # a step outside the march stales one reach more than an interval does
+    with replaying():
+        march(sim.N - 1, shifted, [Window(backward_signal[1:])], [U])
     if fused:
         last = (U[(1 + i) % 3] for i in (1, 0, 2))
         sim.define_frechet(sens_kernels, accs, 1.0, stiffness=False)(*last)

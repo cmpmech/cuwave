@@ -165,8 +165,8 @@ lined axis' memory (the shared scratch for the staggered schemes, one buffer plu
 axis 0 (`decomposition.py`): every subdomain is a plain local `Simulation` stepping its
 rows plus a wide halo with the unmodified kernels, and `march` calls `exchange(state)` every
 `EVERY` steps, so `state` (field slots plus the closures' `memory`) must name everything a
-march carries. `simulate`, `sensitivity` and `reconstruction_sensitivity` carry
-`@decomposable`; the rest are `@undivided`. The split run is bitwise the whole one.
+march carries. `simulate`, `sensitivity`, `reconstruction_sensitivity` and `superposition_sensitivity`
+carry `@decomposable`; the rest are `@undivided`. The split run is bitwise the whole one.
 
 ### Adjoint sensitivities (`sensitivity.py` + `kernels/<equation>_sensitivity.cu`)
 

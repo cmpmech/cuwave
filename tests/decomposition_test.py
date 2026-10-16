@@ -29,6 +29,7 @@ if HAS_CUDA:
     from cuwave.sensitivity import (
         reconstruction_sensitivity,
         sensitivity,
+        spectral_sensitivity,
         superposition_sensitivity,
     )
     from cuwave.signals import ricker
@@ -181,6 +182,11 @@ class GradientTest(unittest.TestCase):
                 with self.subTest(sim=type(sim).__name__, adjoint=adjoint.__name__):
                     self._check(sim, direction, adjoint)
 
+    def test_the_split_superposition_gradient_is_the_whole_one(self):
+        for make in (_scalar, _elastic):
+            with self.subTest(make=make.__name__):
+                self._check(*make(4), superposition_sensitivity)
+
     def test_checkpoints_agree_on_one_segment(self):
         adjoint = functools.partial(reconstruction_sensitivity, checkpoints=2)
         for absorber in ("sponge", "pml"):
@@ -192,8 +198,8 @@ class GradientTest(unittest.TestCase):
         sim, _ = _scalar()
         source, sensors, gamma = _experiment(sim, None)
         with self.assertRaises(NotImplementedError):
-            superposition_sensitivity(
-                replace(sim, devices=DEVICES), source, gamma, sensors.nodes, None
+            spectral_sensitivity(
+                replace(sim, devices=DEVICES), source, gamma, sensors.nodes, None, 1.0
             )
 
     def test_an_error_in_one_subdomain_reaches_the_caller(self):
