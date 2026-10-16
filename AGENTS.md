@@ -4,7 +4,7 @@ This file provides guidance to coding agents (Claude Code, Codex, etc.) when wor
 
 ## What this is
 
-CuWave is a single-GPU, differentiable finite-difference wave solver. The forward solve is
+CuWave is a differentiable finite-difference wave solver on one GPU or several. The forward solve is
 CuPy + hand-written CUDA (`cp.RawModule`); the adjoint is hand-derived, not autodiff. Torch
 appears only in `cuwave/nn.py`, matplotlib only in `cuwave/postprocessing.py` and the
 drivers. Applications: full waveform inversion and transient acoustic topology
@@ -159,6 +159,14 @@ pml no equation's adjoint is `define_step` any more. A stretched stress or curl 
 lined axis' memory (the shared scratch for the staggered schemes, one buffer plus a
 `layers` table for the anisotropic one), which is what holds the corners. It excludes
 `damping` and a `domain` mask; the material gradient is zeroed on `pml_nodes` (`frozen`).
+
+**Multi-GPU** comes two ways. `misfit_gradient(..., devices=[0, 1])` (and `measure`,
+`misfit`) deals shots out, one thread and stream per device. `Simulation.devices` splits
+axis 0 (`decomposition.py`): every subdomain is a plain local `Simulation` stepping its
+rows plus a wide halo with the unmodified kernels, and `march` calls `exchange(state)` every
+`EVERY` steps, so `state` (field slots plus the closures' `memory`) must name everything a
+march carries. `simulate`, `sensitivity` and `reconstruction_sensitivity` carry
+`@decomposable`; the rest are `@undivided`. The split run is bitwise the whole one.
 
 ### Adjoint sensitivities (`sensitivity.py` + `kernels/<equation>_sensitivity.cu`)
 

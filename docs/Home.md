@@ -24,6 +24,7 @@ See [install](install.md) for the installation
 - [maxwell](maxwell.md) with [forward CUDA](cuda_maxwell.md) kernels, the 2D reductions running on the scalar ones
 - [stencils](stencils.md)
 - [boundary](boundary.md)
+- [decomposition](decomposition.md), one grid split over several GPUs
 
 ## sensitivity analysis
 

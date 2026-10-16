@@ -17,9 +17,9 @@ Sources and receivers are placed by **coordinate**, not by node index, and multi
 | stacking | `stack(sources)` | concatenates positions and signal columns, firing several shots in a single simulation |
 | receivers | `Sensors(sim, coords, direction=None)` | precomputes the interpolation once; `traces(record)` reduces a node record onto receivers and `scatter(dphi)` is its transpose |
 | lifting | `Sensors.objective(objective)` | wraps a receiver-space objective into the node space [sensitivity](sensitivity.md) wants |
-| experiment | `measure(sim, sources, indicator, sensors)` | the receiver traces per shot, i.e. the synthetic experiment an inversion is fitted to |
-| cost | `misfit(sim, sources, indicator, sensors, observed, objective=l2_misfit)` | the summed cost alone, forward passes only |
-| cost and gradient | `misfit_gradient(sim, sources, indicator, sensors, observed, objective=l2_misfit, adjoint=sensitivity)` | the same cost with its derivative, already reparametrized from $(m,k)$ onto the indicator |
+| experiment | `measure(sim, sources, indicator, sensors, devices=None)` | the receiver traces per shot, i.e. the synthetic experiment an inversion is fitted to |
+| cost | `misfit(sim, sources, indicator, sensors, observed, objective=l2_misfit, devices=None)` | the summed cost alone, forward passes only |
+| cost and gradient | `misfit_gradient(sim, sources, indicator, sensors, observed, objective=l2_misfit, adjoint=sensitivity, devices=None)` | the same cost with its derivative, already reparametrized from $(m,k)$ onto the indicator |
 | objective | `energy(sim)` | factory for $J=\tfrac{1}{2}\Delta t\prod_d\Delta x_d\sum p^2$, the acoustic energy reaching the sensor nodes |
 | objective | `intensity(sim, frequencies, weights=None)` | factory for $J=\sum_{fc}w_{fc}\lvert\hat{u}_{fc}\rvert^2$, the spectral intensity at the sensor nodes, `weights` pairing each frequency with the port it is scored on |
 | time dispersion | `tdt(sim, signal, offset=0)` | the time-dispersion transform: the signal leapfrog must be fed, or a measured record must become, for the run to carry no time error |
@@ -35,6 +35,8 @@ The three applications get the same pair twice: `misfit` / `misfit_gradient` sum
 `response` returns the field alongside the cost because the thresholded design is re-simulated precisely to be looked at: the number and the picture come from the same solve, and cannot drift apart
 
 Both gradients take the adjoint variant itself as an argument, so a sponged run swaps in `reconstruction_sensitivity` without touching the objective, the shot loop or the chain rule; see [sensitivity](sensitivity.md) on which variant fits
+
+`devices` deals the shots of all three out over several GPUs, every `len(devices)`-th to each, in a thread and a stream of its own, with the simulation, the sensors and the data copied over once per call; costs and gradients are summed back on the calling device. A shot then never leaves its device, which is why this split scales with the shots and needs no exchange, against the row split of [decomposition](decomposition.md) that one shot too large for a device needs
 
 `misfit` and `misfit_gradient` are the pair a line search needs: a trial step evaluates the first, which is one forward pass per shot, and only an accepted iteration pays for the second, which adds an adjoint pass; see the [optimization](optimization.md) line search on what that ratio buys
 
