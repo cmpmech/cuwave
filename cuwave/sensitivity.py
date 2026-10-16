@@ -842,7 +842,7 @@ def superposition_sensitivity(
             f"gradient is largely round-off. Raise scale by about "
             f"{cancellation / limit:.0e}.",
             RuntimeWarning,
-            stacklevel=2,
+            stacklevel=3,  # past the devices wrapper, onto the caller
         )
 
     # B(u, lambda) = [B(w, w) - B(u, u)] / 2k, scaled in place to spare a field
@@ -1005,7 +1005,7 @@ def spectral_sensitivity(
             f"the gradient misses the tail the run cut off (info['decay'] says how "
             f"much). Lengthen the run or damp the faces.",
             RuntimeWarning,
-            stacklevel=2,
+            stacklevel=3,  # past the devices wrapper, onto the caller
         )
     info = {"decay": decay, "fit": fit}
     return cost, grads, um, info
