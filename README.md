@@ -5,7 +5,7 @@
   <img src="https://raw.githubusercontent.com/cmpmech/cuwave/main/.assets/readme-light.webp" width="100%">
 </picture>
 
-**CuWave** is a differentiable finite difference wave propagation code that runs on one GPU or several.
+**CuWave** is a GPU-accelerated (single or multi), differentiable finite difference wave propagation code.
 Possible applications include
 
 <table width="100%">
