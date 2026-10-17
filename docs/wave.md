@@ -34,6 +34,7 @@ From those it derives everything the kernels are launched and compiled with: so 
 | staggering | `component_offsets` | `(ncomp, ndim)` grid offsets of each component, `None` for a nodal unknown; what [distribute](utils.md) shifts by |
 | domain | `domain` | a nodal mask of the physical domain, `None` for the whole box: its tiles alone are stepped and its wall is a zero-flux staircase, see [scalar](scalar.md), the one family that takes it |
 | held nodes | `dirichlet` | a nodal mask held at zero and never stepped, the cells onto it left open onto a zero at their midpoint: a homogeneous Dirichlet wall or obstacle, anywhere in the box |
+| devices | `devices=None` | the GPUs axis 0 is split over, which every function taking the `Simulation` then runs on, see [decomposition](decomposition.md); `None` for the current device alone |
 | strip radius | `reach` | nodes one step reads past a point, `space_order // 2` here; what sizes the [reconstruction](sensitivity.md) strip |
 | measured timestep | `stable_timestep(sim, indicator, iterations=60, safety=0.95)` | the largest stable step, power-iterated on the step kernel rather than estimated from the speed and the spacing as `stable_dt` is |
 

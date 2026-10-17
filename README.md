@@ -5,7 +5,7 @@
   <img src="https://raw.githubusercontent.com/cmpmech/cuwave/main/.assets/readme-light.webp" width="100%">
 </picture>
 
-**CuWave** is a single-GPU, differentiable finite difference wave propagation code.
+**CuWave** is a differentiable finite difference wave propagation code that runs on one GPU or several.
 Possible applications include
 
 <table width="100%">
@@ -40,6 +40,16 @@ Possible applications include
 
 - see the [documentation](https://github.com/cmpmech/cuwave/blob/main/docs/Home.md) for how the code works (AI-assisted; verify with sources for critical details)
 - see [examples](https://github.com/cmpmech/cuwave/tree/main/examples) for how to apply the code
+
+## Multiple GPUs
+
+Several GPUs take one argument, and the driver otherwise stays as it is:
+- `Simulation(..., devices=(0, 1))` splits **one grid** along its first axis over the listed GPUs, for grids too large or too slow for one. `simulate`, `sensitivity`, `reconstruction_sensitivity` and `superposition_sensitivity` then run split and return the same result as on one GPU, bitwise. Try it with the `DEVICES` setting of
+	- [examples/forward/scalarND.py](https://github.com/cmpmech/cuwave/blob/main/examples/forward/scalarND.py), the forward problem in 2D or 3D
+	- [examples/sensitivity/scalar2D_sensitivity.py](https://github.com/cmpmech/cuwave/blob/main/examples/sensitivity/scalar2D_sensitivity.py), the gradient
+- `misfit_gradient(..., devices=[0, 1])` (and `measure`, `misfit`) deals the **shots** of an inversion out over the GPUs, which needs no communication and is the faster choice whenever one shot fits one GPU.
+
+On two RTX 5090s the grid split raises the largest scalar 3D forward grid from 1280³ to 1600³ nodes and the largest `superposition_sensitivity` grid from 1024³ to 1280³, at 1.3 to 1.7x the speed of one GPU on large grids. See [docs/decomposition.md](https://github.com/cmpmech/cuwave/blob/main/docs/decomposition.md) for how it works and what is not split yet (`spectral_sensitivity`, `source_sensitivity`).
 
 ## Development status
 

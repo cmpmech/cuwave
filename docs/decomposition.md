@@ -1,6 +1,6 @@
 # Decomposition
 
-**Decomposition** splits one grid over several GPUs along axis 0, so a problem can outgrow a single device in memory and run on several at once. It is switched on with one setting, `Simulation.devices`, and nothing else in a driver changes
+**Decomposition** splits one grid over several GPUs along axis 0, so a problem can outgrow a single device in memory and run on several at once. It is switched on with one setting, `Simulation.devices`, and nothing else in a driver changes: the `DEVICES` setting of `examples/forward/scalarND.py` and `examples/sensitivity/scalar2D_sensitivity.py` is all it takes
 
 Each device steps one **subdomain**: an ordinary `Simulation` over the rows it owns plus $H$ rows of each neighbour, the **halo**, stepped by the unmodified kernels. The subdomain sees a wall where its rows end, so the rows next to that wall are wrong. The error travels inward by at most `sim.reach` rows a step, and every $K$ steps an exchange overwrites each halo with the rows its owner computed. The owned rows therefore never see it, and they come out bitwise equal to the run on one device:
 $$H=2K\,r_\textrm{reach}+p+2\qquad K=6$$

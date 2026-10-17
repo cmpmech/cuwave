@@ -11,6 +11,8 @@ $$\textrm{electromagnetic:}\qquad\varepsilon\ddot{\mathbf{E}}+\sigma\dot{\mathbf
 
 Gradients useful in **optimization** scenarios such as inverse problems (full waveform inversion) or structural optimization (transient acoustic and photonic topology optimization)
 
+**Several GPUs** take either the rows of one grid, through `Simulation.devices` (see [decomposition](decomposition.md)), or the shots of an inversion, through the `devices` of `misfit_gradient` (see [utils](utils.md))
+
 Common **helpers** ease the creation of driver files for applied problem setups
 
 See [install](install.md) for the installation
