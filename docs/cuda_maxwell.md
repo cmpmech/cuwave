@@ -84,9 +84,9 @@ $$f_c=\sum_{m\ne c}\pm\frac{1}{\Delta x_m}\sum_jc_j^{\left(r\left(a\right)\right
 - the march is the three-term recursion of [cuda_scalar](cuda_scalar.md), component by component, `USE_DAMPING` dividing by $1+\beta$ with one conductivity field serving every component
 
 ### pml_curl_kernel, pml_force_kernel, pml_adjoint_curl_kernel, pml_adjoint_force_kernel, pml_adjoint_memory_kernel
-The five pml kernels of [cuda_elastic](cuda_elastic.md), launched in the same order and on the same slabs, with `curl_term`, `divergence_term` and `add_curl` in place of the strain, divergence and stress helpers, and `h` in place of `sigma`
+Flat 1D launches over the slab of each lined axis: `pml_curl_kernel` after `curl_kernel`, `pml_force_kernel` after `fd_kernel`, their adjoints in the same places, and `pml_adjoint_memory_kernel` last in every adjoint step. They carry the terms [cuda_elastic](cuda_elastic.md) folds into its step kernels (`stress_memory`, `force_memory`, `settle_memory`), with `curl_term`, `divergence_term` and `add_curl` in place of the strain, divergence and stress helpers, and `h` in place of `sigma`
 **input args**
-as their elastic namesakes, with `h`, `nu_pair` and `nu` of `curl_kernel` in place of `sigma` and the elastic material, and no `clamped` mask: a `Conductor` wall is already a zeroed `minv`
+flat over the slab rather than the grid, each takes the memory `aux`, its `profile`, the lined axis `e` and the slab rows `lo, hi` that `force_memory` of [cuda_elastic](cuda_elastic.md) takes, with `h`, `nu_pair` and `nu` of `curl_kernel` in place of `sigma` and the elastic material, and no `clamped` mask: a `Conductor` wall is already a zeroed `minv`
 **how?**
 - forwards, $\psi_k\leftarrow b\,\psi_k+a\,\partial_eE_k$ onto every pair point $\left(k,e\right)$ and $\zeta_c\leftarrow b\,\zeta_c+a\,\partial_eh_{ce}$ into the update; the component along `e` carries neither
 - the adjoint pushes each memory back through the other pass, exactly as the elastic one does

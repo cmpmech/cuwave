@@ -26,7 +26,6 @@ from .wave import (
     Simulation,
     apply_cell_weights,
     axis_geometry,
-    define_pair_pml,
     grid_block,
     pair_average_adjoint,
     point_average_adjoint,
@@ -123,6 +122,11 @@ class ElasticWave(Simulation):
                     raise ValueError(f"elastic faces are Traction or Clamped: {pair}")
 
     @property
+    def compile_flags(self) -> tuple[str, ...]:
+        """The base flags, plus `-DUSE_PML` folding the layer into both step kernels."""
+        return super().compile_flags + (("-DUSE_PML",) if self.pml is not None else ())
+
+    @property
     def radius(self) -> int:
         """Half the stencil width, so `space_order` is twice it."""
         return self.space_order // 2
@@ -198,43 +202,46 @@ class ElasticWave(Simulation):
         return self._define_pair(kernels, mat, adjoint=self.pml is not None)
 
     def _define_pair(self, kernels: cp.RawModule, mat: dict, adjoint: bool) -> Callable:
-        """The stress and update launches, each followed by its pml terms if there are any."""
+        """The stress and update launches, a pml folded into both."""
         grid, block = grid_block(self)
         stress_kernel = kernels.get_function("stress_kernel")
         fd_kernel = kernels.get_function("fd_kernel")
-        sigma, sargs, uargs = self.step_args(mat)
-        if self.pml is None:
+        _, sargs, uargs = self.step_args(mat)
+        memory = []
+        if self.pml is not None:
+            fold, memory = self._pml_fold(adjoint)
+            sargs += fold
+            uargs += fold
 
-            def fd_step(u0, u1, u2):
-                sargs[0] = u1
-                stress_kernel(grid, block, sargs)
-                uargs[0], uargs[1], uargs[2] = u0, u1, u2
-                fd_kernel(grid, block, uargs)
-                return u2
-
-            return fd_step
-        cs = np.int32(self.comp_stride)
-        stress_pml, force_pml = define_pair_pml(
-            self,
-            kernels,
-            "stress",
-            sigma,
-            [*self.stress_material(mat), face_mask(self, Clamped), cs],
-            [mat["gamma"], self.dtype(self.density), face_mask(self, Clamped), cs],
-            adjoint,
-        )
-
-        def pml_step(u0, u1, u2):
+        def fd_step(u0, u1, u2):
             sargs[0] = u1
             stress_kernel(grid, block, sargs)
-            stress_pml(u1)
             uargs[0], uargs[1], uargs[2] = u0, u1, u2
             fd_kernel(grid, block, uargs)
-            force_pml(u1, u2)
+            if adjoint:  # the strain memory swaps its two row blocks
+                sargs[-1] = uargs[-1] = np.int32(3 - sargs[-1])
             return u2
 
-        pml_step.memory = stress_pml.memory
-        return pml_step
+        fd_step.memory = memory
+        return fd_step
+
+    def _pml_fold(self, adjoint: bool) -> tuple[list, list]:
+        """The step kernels' pml arguments and the memory per lined axis."""
+        slabs = {d: rest for d, *rest in self.pml_slabs()}
+        unlined = cp.zeros(1, dtype=self.dtype)
+        fold, memory = [], []
+        for d in range(self.ndim):
+            if d not in slabs:
+                fold += [unlined, unlined, np.int32(0), np.int32(0)]
+                continue
+            lo, hi, profile, plane = slabs[d]
+            # the strain then the divergence memory per component, the adjoint's
+            # strain memory twice: read off one block and settled into the other
+            rows = (3 if adjoint else 2) * self.ndim
+            aux = cp.zeros((rows, (lo + hi) * plane), dtype=self.dtype)
+            memory.append(aux)
+            fold += [aux, profile, np.int32(lo), np.int32(hi)]
+        return fold + [np.int32(1 if adjoint else 0)], memory
 
     def step_args(self, mat: dict) -> tuple[cpt.NDArray, list, list]:
         """A stress scratch and the argument lists of the stress and update kernels on it."""

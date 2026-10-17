@@ -2,11 +2,20 @@
 // Compile-time configuration this file responds to:
 //   NDIM = 1 | 2 | 3
 //   USE_DAMPING
+//   USE_PML
+
+#ifdef USE_PML
+// the slowest axis' blocks alternately from either end, so the slabs there run
+// in the first wave rather than trailing the last
+#define BLOCK_ROW(b, n) ((b) % 2 ? (n) - 1 - (b) / 2 : (b) / 2)
+#else
+#define BLOCK_ROW(b, n) (b)
+#endif
 
 #if NDIM == 1
 #define AXIS_PARAMS const real_t f0, const int N0
 #define INTERIOR_OR_RETURN                                                     \
-  const int a0 = blockIdx.x * blockDim.x + threadIdx.x;                        \
+  const int a0 = BLOCK_ROW(blockIdx.x, gridDim.x) * blockDim.x + threadIdx.x;  \
   if (!(a0 > 0 && a0 < N0 - 1))                                                \
     return;                                                                    \
   const int idx = a0
@@ -17,7 +26,7 @@
   const real_t f0, const int N0, const real_t f1, const int N1, const int s0
 #define INTERIOR_OR_RETURN                                                     \
   const int a1 = blockIdx.x * blockDim.x + threadIdx.x;                        \
-  const int a0 = blockIdx.y * blockDim.y + threadIdx.y;                        \
+  const int a0 = BLOCK_ROW(blockIdx.y, gridDim.y) * blockDim.y + threadIdx.y;  \
   if (!(a0 > 0 && a0 < N0 - 1 && a1 > 0 && a1 < N1 - 1))                       \
     return;                                                                    \
   const int idx = a0 * s0 + a1
@@ -31,7 +40,7 @@
 #define INTERIOR_OR_RETURN                                                     \
   const int a2 = blockIdx.x * blockDim.x + threadIdx.x;                        \
   const int a1 = blockIdx.y * blockDim.y + threadIdx.y;                        \
-  const int a0 = blockIdx.z * blockDim.z + threadIdx.z;                        \
+  const int a0 = BLOCK_ROW(blockIdx.z, gridDim.z) * blockDim.z + threadIdx.z;  \
   if (!(a0 > 0 && a0 < N0 - 1 && a1 > 0 && a1 < N1 - 1 && a2 > 0 &&            \
         a2 < N2 - 1))                                                          \
     return;                                                                    \
@@ -39,6 +48,43 @@
 #define AXIS_GEOM                                                              \
   const int A[3] = {a0, a1, a2}, S[3] = {s0, s1, 1}, NN[3] = {N0, N1, N2}
 #define AXIS_FACTORS const real_t F[3] = {f0, f1, f2}
+#endif
+
+// per axis the pml memory, its profile and its rows on either side, 0 unlined;
+// phase 0 forwards, 1 or 2 the adjoint reading its strain memory off row 0 or
+// 2 NDIM and settling it into the other
+#ifdef USE_PML
+#if NDIM == 1
+#define PML_FOLD                                                               \
+  , real_t *__restrict__ m0, const real_t *__restrict__ p0, const int lo0,     \
+      const int hi0, const int phase
+#define FOLD_GEOM                                                              \
+  real_t *M[1] = {m0};                                                         \
+  const real_t *P[1] = {p0};                                                   \
+  const int LO[1] = {lo0}, HI[1] = {hi0}
+#elif NDIM == 2
+#define PML_FOLD                                                               \
+  , real_t *__restrict__ m0, const real_t *__restrict__ p0, const int lo0,     \
+      const int hi0, real_t *__restrict__ m1, const real_t *__restrict__ p1,   \
+      const int lo1, const int hi1, const int phase
+#define FOLD_GEOM                                                              \
+  real_t *M[2] = {m0, m1};                                                     \
+  const real_t *P[2] = {p0, p1};                                               \
+  const int LO[2] = {lo0, lo1}, HI[2] = {hi0, hi1}
+#elif NDIM == 3
+#define PML_FOLD                                                               \
+  , real_t *__restrict__ m0, const real_t *__restrict__ p0, const int lo0,     \
+      const int hi0, real_t *__restrict__ m1, const real_t *__restrict__ p1,   \
+      const int lo1, const int hi1, real_t *__restrict__ m2,                   \
+      const real_t *__restrict__ p2, const int lo2, const int hi2,             \
+      const int phase
+#define FOLD_GEOM                                                              \
+  real_t *M[3] = {m0, m1, m2};                                                 \
+  const real_t *P[3] = {p0, p1, p2};                                           \
+  const int LO[3] = {lo0, lo1, lo2}, HI[3] = {hi0, hi1, hi2}
+#endif
+#else
+#define PML_FOLD
 #endif
 
 // a node 2R inside every wall: full radius on every tap, no wall terms
@@ -380,12 +426,12 @@ __device__ __forceinline__ real_t divergence_term(const F &sig, const int c,
   return fe * acc;
 }
 
-// G times the strain terms t of axis e, added onto the stress points
+// G times the strain terms t of axis e, added onto the node's stresses sig
 __device__ __forceinline__ void
-add_stress(real_t *__restrict__ sigma, const real_t *__restrict__ gamma,
-           const int idx, const int cs, const int e, const real_t *t,
-           const int *A, const int *S, const int *NN, const real_t lam,
-           const real_t mu, const int clamped) {
+add_stress(real_t *sig, const real_t *__restrict__ gamma, const int idx,
+           const int e, const real_t *t, const int *A, const int *S,
+           const int *NN, const real_t lam, const real_t mu,
+           const int clamped) {
   const int zeroed = zeroed_axes(A, NN, clamped);
   if (!((zeroed >> e) & 1)) {
     const real_t lam_eff = condensed_lame(lam, mu, zeroed);
@@ -393,17 +439,143 @@ add_stress(real_t *__restrict__ sigma, const real_t *__restrict__ gamma,
 #pragma unroll
     for (int d = 0; d < NDIM; ++d)
       if (!((zeroed >> d) & 1))
-        sigma[d * cs + idx] += g * ((d == e ? 2.f * mu : (real_t)0) + lam_eff);
+        sig[d] += g * ((d == e ? 2.f * mu : (real_t)0) + lam_eff);
   }
 #if NDIM >= 2
 #pragma unroll
   for (int k = 0; k < NDIM; ++k)
     if (k != e && A[k] <= NN[k] - 3 && A[e] <= NN[e] - 3) {
-      const int v = stress_row(k, e);
-      sigma[v * cs + idx] +=
+      sig[stress_row(k, e)] +=
           shear_gamma(gamma, idx, min(k, e), max(k, e), A, S, NN) * mu * t[k];
     }
 #endif
+}
+
+// the slab offset of a node off axis d: the other axes flattened, as slab_node
+__device__ __forceinline__ int slab_offset(const int d, const int *A,
+                                           const int *NN, const int *S) {
+  int off = 0;
+#pragma unroll
+  for (int e = 0; e < NDIM; ++e)
+    if (e != d)
+      off = off * padded_extent(e, NN, S) + A[e];
+  return off;
+}
+
+// whether a node lies in axis e's slab, grown ext rows past its front
+__device__ __forceinline__ bool in_slab(const int a, const int e, const int lo,
+                                        const int hi, const int ext,
+                                        const int *NN) {
+  return (lo && a - 1 < lo + ext) || (hi && NN[e] - 2 - a < hi + ext);
+}
+
+// axis e's memory terms on the node's stresses: the strain memory, or in the
+// adjoint the divergence memory pushed back through the strain
+__device__ __forceinline__ void
+stress_memory(const real_t *__restrict__ u, const real_t *__restrict__ gamma,
+              const int idx, const int cs, const int e,
+              real_t *__restrict__ aux, const real_t *__restrict__ profile,
+              const int lo, const int hi, const int phase, const int *A,
+              const int *S, const int *NN, const real_t *F, const real_t lam,
+              const real_t mu, const int clamped, real_t *sig) {
+  const int a = A[e];
+  if (!in_slab(a, e, lo, hi, phase ? STENCIL_RADIUS : 0, NN))
+    return;
+  const int plane = slab_plane(e, NN, S), size = (lo + hi) * plane;
+  const int off = slab_offset(e, A, NN, S);
+  real_t q[NDIM];
+  if (phase) {
+    const Memory<Field> h = {{u, idx, cs, S[e]},
+                             aux,
+                             profile,
+                             NN,
+                             size,
+                             NDIM,
+                             a,
+                             off,
+                             e,
+                             lo,
+                             hi,
+                             plane,
+                             true};
+#pragma unroll
+    for (int k = 0; k < NDIM; ++k)
+      q[k] = strain_term(h, k, e, A, NN, F[e], clamped);
+  } else {
+    const Field f = {u, idx, cs, S[e]};
+    const int t = slab_index(a, off, e, lo, hi, NN, plane);
+#pragma unroll
+    for (int k = 0; k < NDIM; ++k) {
+      const int at = (k == e ? 0 : 2 * NN[e]) + a; // node, or the half point
+      q[k] = profile[NN[e] + at] * aux[k * size + t] +
+             profile[at] * strain_term(f, k, e, A, NN, F[e], clamped);
+      aux[k * size + t] = q[k];
+    }
+  }
+  add_stress(sig, gamma, idx, e, q, A, S, NN, lam, mu, clamped);
+}
+
+// axis e's memory term on component c's force: the divergence memory, or in
+// the adjoint the strain memory pushed back, its own memory then taking l1
+__device__ __forceinline__ real_t
+force_memory(const real_t *__restrict__ sigma, const real_t *__restrict__ u1,
+             const int idx, const int cs, const int c, const int e,
+             real_t *__restrict__ aux, const real_t *__restrict__ profile,
+             const int lo, const int hi, const int phase, const int *A,
+             const int *S, const int *NN, const real_t *F, const int clamped) {
+  const int a = A[e];
+  if (!in_slab(a, e, lo, hi, phase ? STENCIL_RADIUS : 0, NN))
+    return (real_t)0;
+  const int plane = slab_plane(e, NN, S), size = (lo + hi) * plane;
+  const int off = slab_offset(e, A, NN, S);
+  const int t = slab_index(a, off, e, lo, hi, NN, plane);
+  const int at = (c == e ? 2 * NN[e] : 0) + a; // half point, or the node
+  real_t *z = aux + (NDIM + c) * size + t;
+  if (phase) {
+    const Memory<Stress> k = {{sigma, idx, cs, S[e], e},
+                              aux,
+                              profile,
+                              NN,
+                              size,
+                              phase == 1 ? 0 : 2 * NDIM,
+                              a,
+                              off,
+                              e,
+                              lo,
+                              hi,
+                              plane,
+                              false};
+    const real_t term = divergence_term(k, c, e, A, NN, F[e], clamped);
+    if (t >= 0) // the divergence memory, read by the stress pass before
+      *z = profile[NN[e] + at] * (*z + u1[c * cs + idx]);
+    return term;
+  }
+  const Stress sig = {sigma, idx, cs, S[e], e};
+  *z = profile[NN[e] + at] * *z +
+       profile[at] * divergence_term(sig, c, e, A, NN, F[e], clamped);
+  return *z;
+}
+
+// the adjoint's strain memory of axis e, read off one row block and settled
+// with this step's stress into the other, which the next step reads
+__device__ __forceinline__ void
+settle_memory(const real_t *__restrict__ sigma, const int idx, const int cs,
+              const int e, real_t *__restrict__ aux,
+              const real_t *__restrict__ profile, const int lo, const int hi,
+              const int phase, const int *A, const int *S, const int *NN) {
+  const int a = A[e];
+  if (!in_slab(a, e, lo, hi, 0, NN))
+    return;
+  const int plane = slab_plane(e, NN, S), size = (lo + hi) * plane;
+  const int t = slab_index(a, slab_offset(e, A, NN, S), e, lo, hi, NN, plane);
+  const int from = phase == 1 ? 0 : 2 * NDIM, to = 2 * NDIM - from;
+#pragma unroll
+  for (int k = 0; k < NDIM; ++k) {
+    const int at = (k == e ? 0 : 2 * NN[e]) + a;
+    aux[(to + k) * size + t] =
+        profile[NN[e] + at] *
+        (aux[(from + k) * size + t] + sigma[stress_row(k, e) * cs + idx]);
+  }
 }
 
 // -------------------------------------- kernels
@@ -413,7 +585,8 @@ extern "C" {
 __global__ void
 stress_kernel(const real_t *__restrict__ u1, real_t *__restrict__ sigma,
               const real_t *__restrict__ gamma, const real_t lam,
-              const real_t mu, const int clamped, const int cs, AXIS_PARAMS) {
+              const real_t mu, const int clamped, const int cs,
+              AXIS_PARAMS PML_FOLD) {
   INTERIOR_OR_RETURN;
   AXIS_GEOM;
   AXIS_FACTORS;
@@ -423,6 +596,14 @@ stress_kernel(const real_t *__restrict__ u1, real_t *__restrict__ sigma,
     stress_point<true>(u1, gamma, idx, cs, A, S, NN, F, lam, mu, clamped, sig);
   else
     stress_point(u1, gamma, idx, cs, A, S, NN, F, lam, mu, clamped, sig);
+#ifdef USE_PML
+  FOLD_GEOM;
+#pragma unroll
+  for (int e = 0; e < NDIM; ++e)
+    if (LO[e] + HI[e])
+      stress_memory(u1, gamma, idx, cs, e, M[e], P[e], LO[e], HI[e], phase, A,
+                    S, NN, F, lam, mu, clamped, sig);
+#endif
 #pragma unroll
   for (int v = 0; v < NVOIGT; ++v)
     sigma[v * cs + idx] = sig[v];
@@ -436,10 +617,13 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
 #ifdef USE_DAMPING
           const real_t *__restrict__ damping, const real_t dt,
 #endif
-          const int clamped, const int cs, AXIS_PARAMS) {
+          const int clamped, const int cs, AXIS_PARAMS PML_FOLD) {
   INTERIOR_OR_RETURN;
   AXIS_GEOM;
   AXIS_FACTORS;
+#ifdef USE_PML
+  FOLD_GEOM;
+#endif
 
   const bool deep = deep_node(A, NN);
 #pragma unroll
@@ -455,144 +639,29 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
              : point_minv(gamma, idx, c, A, S, NN, rho, clamped);
 #ifdef USE_DAMPING
     const real_t beta = 0.5f * mi * damping[idx] * dt;
-    u2[n] = (2.f * u1[n] - u0[n] * (1.f - beta) + mi * force) / (1.f + beta);
+    real_t next =
+        (2.f * u1[n] - u0[n] * (1.f - beta) + mi * force) / (1.f + beta);
 #else
-    u2[n] = -u0[n] + 2.f * u1[n] + mi * force;
+    real_t next = -u0[n] + 2.f * u1[n] + mi * force;
 #endif
-  }
-}
-
-// ------------------------------------------------------------------------------------
-__global__ void
-pml_stress_kernel(const real_t *__restrict__ u1, real_t *__restrict__ sigma,
-                  const real_t *__restrict__ gamma, const real_t lam,
-                  const real_t mu, const int clamped,
-                  const int cs, real_t *__restrict__ aux,
-                  const real_t *__restrict__ profile, const int e, const int lo,
-                  const int hi, AXIS_PARAMS) {
-  PML_AXES;
-  SLAB_OR_RETURN(0);
-  const Field u = {u1, idx, cs, S[e]};
-  real_t psi[NDIM];
+#ifdef USE_PML
 #pragma unroll
-  for (int k = 0; k < NDIM; ++k) {
-    const int at = (k == e ? 0 : 2 * NN[e]) + a; // node, or the half point
-    psi[k] = profile[NN[e] + at] * aux[k * size + t] +
-             profile[at] * strain_term(u, k, e, A, NN, F[e], clamped);
-    aux[k * size + t] = psi[k];
+    for (int e = 0; e < NDIM; ++e)
+      if (LO[e] + HI[e])
+        next += mi * force_memory(sigma, u1, idx, cs, c, e, M[e], P[e], LO[e],
+                                  HI[e], phase, A, S, NN, F, clamped);
+#endif
+    u2[n] = next;
   }
-  add_stress(sigma, gamma, idx, cs, e, psi, A, S, NN, lam, mu, clamped);
-}
-
-// ------------------------------------------------------------------------------------
-__global__ void
-pml_force_kernel(const real_t *__restrict__ u1, real_t *__restrict__ u2,
-                 const real_t *__restrict__ sigma,
-                 const real_t *__restrict__ gamma, const real_t rho,
-                 const int clamped, const int cs, real_t *__restrict__ aux,
-                 const real_t *__restrict__ profile, const int e, const int lo,
-                 const int hi, AXIS_PARAMS) {
-  // u1 unread: the adjoint's signature, so one launch list serves both
-  PML_AXES;
-  SLAB_OR_RETURN(0);
-  const Stress sig = {sigma, idx, cs, S[e], e};
+#ifdef USE_PML
+  if (phase) {
 #pragma unroll
-  for (int c = 0; c < NDIM; ++c) {
-    if (A[c] > NN[c] - 3)
-      continue; // no unknown on the staggered ghost of its own axis
-    const int at = (c == e ? 2 * NN[e] : 0) + a; // half point, or the node
-    real_t *z = aux + (NDIM + c) * size + t;
-    *z = profile[NN[e] + at] * *z +
-         profile[at] * divergence_term(sig, c, e, A, NN, F[e], clamped);
-    u2[c * cs + idx] += point_minv(gamma, idx, c, A, S, NN, rho, clamped) * *z;
+    for (int e = 0; e < NDIM; ++e)
+      if (LO[e] + HI[e])
+        settle_memory(sigma, idx, cs, e, M[e], P[e], LO[e], HI[e], phase, A, S,
+                      NN);
   }
-}
-
-// ------------------------------------------------------------------------------------
-__global__ void pml_adjoint_stress_kernel(
-    const real_t *__restrict__ l1, real_t *__restrict__ sigma,
-    const real_t *__restrict__ gamma, const real_t lam, const real_t mu,
-    const int clamped, const int cs,
-    const real_t *__restrict__ aux, const real_t *__restrict__ profile,
-    const int e, const int lo, const int hi, AXIS_PARAMS) {
-  PML_AXES;
-  SLAB_OR_RETURN(STENCIL_RADIUS);
-  // the divergence memory pushed back through the strain: the force's transpose
-  const Memory<Field> h = {{l1, idx, cs, S[e]},
-                           aux,
-                           profile,
-                           NN,
-                           size,
-                           NDIM,
-                           a,
-                           off,
-                           e,
-                           lo,
-                           hi,
-                           plane,
-                           true};
-  real_t q[NDIM];
-#pragma unroll
-  for (int k = 0; k < NDIM; ++k)
-    q[k] = strain_term(h, k, e, A, NN, F[e], clamped);
-  add_stress(sigma, gamma, idx, cs, e, q, A, S, NN, lam, mu, clamped);
-}
-
-// ------------------------------------------------------------------------------------
-__global__ void
-pml_adjoint_force_kernel(const real_t *__restrict__ l1, real_t *__restrict__ l2,
-                         const real_t *__restrict__ sigma,
-                         const real_t *__restrict__ gamma, const real_t rho,
-                         const int clamped, const int cs,
-                         real_t *__restrict__ aux,
-                         const real_t *__restrict__ profile, const int e,
-                         const int lo, const int hi, AXIS_PARAMS) {
-  PML_AXES;
-  SLAB_OR_RETURN(STENCIL_RADIUS);
-  // the strain memory pushed back through the divergence: the stress' transpose
-  const Memory<Stress> k = {{sigma, idx, cs, S[e], e},
-                            aux,
-                            profile,
-                            NN,
-                            size,
-                            0,
-                            a,
-                            off,
-                            e,
-                            lo,
-                            hi,
-                            plane,
-                            false};
-#pragma unroll
-  for (int c = 0; c < NDIM; ++c) {
-    if (A[c] > NN[c] - 3)
-      continue;
-    const int n = c * cs + idx;
-    l2[n] += point_minv(gamma, idx, c, A, S, NN, rho, clamped) *
-             divergence_term(k, c, e, A, NN, F[e], clamped);
-    if (t >= 0) { // the divergence memory, read by the stress pass before
-      const int at = (c == e ? 2 * NN[e] : 0) + a;
-      real_t *z = aux + (NDIM + c) * size + t;
-      *z = profile[NN[e] + at] * (*z + l1[n]);
-    }
-  }
-}
-
-// ------------------------------------------------------------------------------------
-__global__ void pml_adjoint_memory_kernel(const real_t *__restrict__ sigma,
-                                          const int cs,
-                                          real_t *__restrict__ aux,
-                                          const real_t *__restrict__ profile,
-                                          const int e, const int lo,
-                                          const int hi, AXIS_PARAMS) {
-  PML_AXES;
-  SLAB_OR_RETURN(0);
-#pragma unroll
-  for (int k = 0; k < NDIM; ++k) {
-    const int at = (k == e ? 0 : 2 * NN[e]) + a;
-    real_t *m = aux + k * size + t;
-    *m = profile[NN[e] + at] * (*m + sigma[stress_row(k, e) * cs + idx]);
-  }
+#endif
 }
 
 } // extern "C"
