@@ -48,18 +48,9 @@ Several GPUs take one argument, and the driver otherwise stays as it is:
 	- [examples/forward/scalarND.py](https://github.com/cmpmech/cuwave/blob/main/examples/forward/scalarND.py), the forward problem in 2D or 3D
 	- [examples/sensitivity/scalar2D_sensitivity.py](https://github.com/cmpmech/cuwave/blob/main/examples/sensitivity/scalar2D_sensitivity.py), the gradient
 - `misfit_gradient(..., devices=[0, 1])` (and `measure`, `misfit`) deals the **shots** of an inversion out over the GPUs, which needs no communication and is the faster choice whenever one shot fits one GPU.
-
-On two RTX 5090s the grid split raises the largest scalar 3D forward grid from 1280³ to 1600³ nodes and the largest `superposition_sensitivity` grid from 1024³ to 1280³, at 1.3 to 1.7x the speed of one GPU on large grids. See [docs/decomposition.md](https://github.com/cmpmech/cuwave/blob/main/docs/decomposition.md) for how it works and what is not split yet (`spectral_sensitivity`, `source_sensitivity`).
-
 ## Development status
 
-**Scalar** & **acoustic wave** equations have been developed over the last 2 years and are thoroughly validated.
-
-The **electromagnetic wave** equations (2D `ElectricWave`/`MagneticWave`, 2D/3D `DielectricWave`) were developed with AI assistance (Claude) and are cross-validated against the independent FDTD code [FDTDX](https://github.com/ymahlau/fdtdx): with the permittivity placed the same way in both codes, the probe traces agree to round-off (about 1e-15 relative, in float64) in 2D and 3D, in vacuum and through a dielectric block. Where the two codes place the permittivity differently (cuwave takes the harmonic mean onto staggered points, FDTDX staircases it), the traces differ at the discretization level (1e-4 to 1e-3), and that gap closes under refinement. See `examples/validation/` and `docs/maxwell.md`.
-
-> [!IMPORTANT]
-> The **elastic wave** equations were developed with AI assistance (Claude) and have undergone less validation. They are currently being validated against experimental results.
-
+**Scalar** & **acoustic wave** equations have been developed over the last 2 years and are thoroughly validated. The **elastic wave** and **electromagnetic wave** equations were developed with AI assistance (Claude). The first is validated on experimental data, while the latter are cross-validated against the independent FDTD code [FDTDX](https://github.com/ymahlau/fdtdx). 
 ## Performance
 
 CuWave's runtime for identical discretizations is comparable to that of other established wave propagation finite difference codes. Speedups in 2D with reflecting boundaries (**a ratio above 1 means CuWave is that many times faster**) compared to the following frameworks:
@@ -93,15 +84,7 @@ _Herrmann, L., Bürchner, T., Kudela, L., Kollmannsberger, S., 2026, **A memory-
 
 ## Acknowledgements
 
-Ideas adapted from [FDTDX](https://github.com/ymahlau/fdtdx) ([Mahlau, Schubert, Berg & Rosenhahn 2026](https://doi.org/10.21105/joss.08912)), which also serves as the reference for validating the electromagnetic solvers:
-- `spectral_sensitivity`, the frequency-domain adjoint for spectral objectives, following FDTDX's frequency-mode adjoint and the hybrid time/frequency adjoint of Meep ([Hammond, Oskooi, Johnson & Ralph 2022](https://doi.org/10.1364/OE.442074))
-- `SmoothedProjection`, the subpixel-smoothed projection of [Hammond et al. 2025](https://arxiv.org/abs/2503.20189), as FDTDX implements it
-- the reduced-precision boundary record behind `reconstruction_sensitivity(strip_dtype=...)`
-
-The harmonic permittivity mean onto each `DielectricWave` component point, adopted after the comparison with FDTDX, follows the subpixel smoothing of [Farjadpour et al. 2006](https://doi.org/10.1364/OL.31.002972).
-
-No code was copied: FDTDX differentiates with JAX, and every adjoint here is derived by hand.
-
+Ideas adapted from [FDTDX](https://github.com/ymahlau/fdtdx) ([Mahlau, Schubert, Berg & Rosenhahn 2026](https://doi.org/10.21105/joss.08912)), which also serves as the reference for validating the electromagnetic solvers.
 ## Contact
 
 For questions, bug reports, or collaboration inquiries, please don't hesitate to contact Leon Herrmann at [herrmann.leon@pm.me](mailto:herrmann.leon@pm.me).
