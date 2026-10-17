@@ -27,6 +27,7 @@ if HAS_CUDA:
     from cuwave.maxwell import DielectricWave
     from cuwave.scalar import AcousticWave, ScalarWave
     from cuwave.sensitivity import (
+        l2_misfit,
         reconstruction_sensitivity,
         sensitivity,
         spectral_sensitivity,
@@ -91,8 +92,9 @@ def _experiment(sim, direction):
     source = point_source(sim, [[1.0, *tail], [0.3, *tail]], signal, direction)
     rows = [0.25, 0.72, 0.99, 1.1, 1.46, 1.95]
     sensors = Sensors(sim, [[x, *tail] for x in rows], direction)
-    gamma = cp.ones(sim.Nx_padded, dtype=sim.dtype)
-    gamma[80:120, 40:60] = 0.7
+    # rough, so a subdomain writing into a neighbour's rows shows
+    gamma = np.random.default_rng(0).uniform(0.7, 1.0, sim.Nx_padded)
+    gamma = cp.asarray(gamma, dtype=sim.dtype)
     return source, sensors, gamma
 
 
@@ -186,6 +188,17 @@ class GradientTest(unittest.TestCase):
         for make in (_scalar, _elastic):
             with self.subTest(make=make.__name__):
                 self._check(*make(4), superposition_sensitivity)
+
+    def test_the_split_cancellation_is_the_whole_one(self):
+        sim, direction = _scalar(4)
+        source, sensors, gamma = _experiment(sim, direction)
+        (observed,) = measure(sim, [source], cp.ones_like(gamma), sensors)
+        args = (source, gamma, sensors.nodes, sensors.objective(l2_misfit(observed)))
+        info = superposition_sensitivity(sim, *args)[3]
+        split_info = superposition_sensitivity(replace(sim, devices=DEVICES), *args)[3]
+        self.assertAlmostEqual(
+            split_info["cancellation"] / info["cancellation"], 1.0, places=10
+        )
 
     def test_checkpoints_agree_on_one_segment(self):
         adjoint = functools.partial(reconstruction_sensitivity, checkpoints=2)

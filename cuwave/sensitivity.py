@@ -25,7 +25,7 @@ import numpy as np
 import numpy.typing as npt
 
 from .boundary import define_boundary, pml_nodes
-from .decomposition import agree, decomposable, replaying, undivided
+from .decomposition import agree, decomposable, owned, replaying, undivided
 from .wave import (
     BFLOAT16,
     Simulation,
@@ -88,7 +88,8 @@ def windowed_misfit(observed: cpt.NDArray, window: cpt.NDArray) -> Callable:
 
 def _accumulated(accs: dict) -> float:
     """Norm over every accumulator, so the diagnostic names no material field."""
-    return float(sum(float(cp.linalg.norm(f)) ** 2 for f in accs.values()) ** 0.5)
+    squares = sum(float(cp.linalg.norm(owned(f))) ** 2 for f in accs.values())
+    return agree(squares, sum) ** 0.5
 
 
 def l2_misfit(observed: cpt.NDArray) -> Callable:

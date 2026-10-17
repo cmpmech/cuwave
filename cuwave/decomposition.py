@@ -185,6 +185,15 @@ def replaying():
         _context.deep = False
 
 
+def owned(array: cpt.NDArray) -> cpt.NDArray:
+    """The rows of a local field this subdomain owns, all of it outside a split run."""
+    team = getattr(_context, "team", None)
+    if team is None:
+        return array
+    g0, _, o0, o1 = team.bounds[_context.index]
+    return _rows(array, array.ndim - _context.sim.ndim, o0 - g0, o1 - g0)
+
+
 def agree(value, reduce: Callable = min):
     """`reduce` of `value` over every subdomain, so their schedules stay in step."""
     team = getattr(_context, "team", None)
@@ -332,7 +341,9 @@ def _run(function: Callable, sim: Simulation, arguments: dict):
                 signal = _columns(source.signal, held, k, team)
                 local_args = {**arguments, "sim": local}
                 local_args["source"] = replace(source, position=position, signal=signal)
-                local_args["indicator"] = _move(indicator[g0:g1], device)
+                part = _move(indicator[g0:g1], device)
+                # private, since `build_materials` mirrors the cut's ghost rows in place
+                local_args["indicator"] = part if part.base is None else part.copy()
                 if sensors is not None:
                     local_args["sensors"], held, owned = _points(
                         sim, local, nodes, k, team
