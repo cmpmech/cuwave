@@ -21,6 +21,7 @@ SPACE_ORDER = 2  # cheapest operator; the adjoint is exact at any order
 PRECISION = "float32"
 METHOD = "standard"  # "standard" or "superposition" (memory-efficient alternative)
 SUPERPOSITION_SCALE = 1e2
+DEVICES = None  # e.g. (0, 1) splits axis 0 over two GPUs
 RESOLUTION = 240
 SAFETY = 0.99
 
@@ -55,6 +56,7 @@ sim = ScalarWave(
     space_order=SPACE_ORDER,
     wavespeed=WAVESPEED,
     density=DENSITY,
+    devices=DEVICES,
 )
 
 x, y = grid_coords(Nx, dx, dtype=sim.dtype)

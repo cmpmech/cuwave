@@ -14,6 +14,7 @@ from cuwave.wave import Source, simulate, stable_dt
 DIM = 3
 PRECISION = "float32"
 SPACE_ORDER = 8
+DEVICES = None  # e.g. (0, 1) splits axis 0 over two GPUs (2D and 3D)
 SAFETY = 0.99  # fraction of stable time step
 # per dimension
 THREADS = {1: (128,), 2: (4, 128), 3: (1, 16, 32)}[DIM]
@@ -46,6 +47,7 @@ sim = ScalarWave(
     space_order=SPACE_ORDER,
     wavespeed=WAVESPEED,
     density=DENSITY,
+    devices=DEVICES,
 )
 indicator = cp.ones(sim.Nx_padded, dtype=sim.dtype)
 
