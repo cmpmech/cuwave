@@ -168,6 +168,16 @@ rows plus a wide halo with the unmodified kernels, and `march` calls `exchange(s
 march carries. `simulate`, `sensitivity`, `reconstruction_sensitivity` and `superposition_sensitivity`
 carry `@decomposable`; the rest are `@undivided`. The split run is bitwise the whole one.
 
+**The split is not distributed end to end.** The indicator goes in as one global array and
+every output (field, gradients, record) comes back assembled: on the calling GPU for a cupy
+indicator, in host RAM for a numpy one, which is the only way past one GPU's memory. Host
+RAM must therefore hold the indicator plus the returned fields (about 8 B/node forward,
+12 B/node superposition in float32, plus about one field during assembly), and everything
+runs in one process on one node. Size a run against that, not only against the GPUs,
+including on the Ilmenau A100 nodes (4 per node, 8 on makalu88). Per-GPU input and output
+pieces, and a multi-node exchange, are not implemented yet; both are needed before a run
+spanning nodes (e.g. 12 H200s, where one 4500³ field is about 365 GB).
+
 ### Adjoint sensitivities (`sensitivity.py` + `kernels/<equation>_sensitivity.cu`)
 
 Four variants, identical signature and return (the spectral one adds `frequencies` and an
