@@ -83,7 +83,7 @@ def faces_with(sim: Simulation, condition: BoundaryCondition) -> list[int]:
         2 * d + side
         for d, pair in enumerate(sim.boundary)
         for side, marker in enumerate(pair)
-        if marker is condition
+        if marker == condition  # a copied or unpickled condition is still the same
     ]
 
 

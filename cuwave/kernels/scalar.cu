@@ -699,6 +699,7 @@ __global__ void __launch_bounds__(TILE1 *TILE2)
   real_t *sk = shared + 2 * STEPS * AREA, *means = sk + 2 * AREA;
   for (int e = ty * TILE2 + tx; e < 2 * AREA; e += TILE1 * TILE2)
     sk[e] = 1;
+  __syncthreads(); // before the first plane's stiffness lands in it
   // u^k on planes z - k - 2 .. z - k, u^-1 on z - 1 and z, the axis-0 cell
   // means from planes z - STEPS - 1, 1 / m from z - 1 on
   real_t Q[STEPS][3], P[2], G[STEPS + 1], MI[STEPS];

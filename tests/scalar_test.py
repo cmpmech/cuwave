@@ -16,6 +16,7 @@ A 3D order-2 run past L2 marches columns of tiles along axis 0 with the same cla
 checked on a grid whose last tile and last chunk of planes hold one node each.
 """
 
+import copy
 import itertools
 import unittest
 from dataclasses import replace
@@ -227,6 +228,11 @@ class BlockedTest(unittest.TestCase):
                 sim = _scalar(order, "float32", Dirichlet, N=50)
                 blocks = (((tile[0], tile[1], steps),),) * 2
                 self._assert_bitwise(*_runs(sim, 6, SMALL_BLOCKS=blocks))
+
+    def test_a_copied_simulation(self):
+        # a deep copy holds equal, not identical, conditions
+        sim = copy.deepcopy(_scalar(2, "float32", Dirichlet, N=20))
+        self._assert_bitwise(*_runs(sim, 3))
 
     def test_a_last_core_of_one_node(self):
         # cores (24, 56): each axis's last core holds the node beside the ghost alone
