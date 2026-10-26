@@ -428,7 +428,9 @@ def misfit_gradient(
         adjoint: which variant computes each shot, `reconstruction_sensitivity`
             where the stored history no longer fits.
         devices: GPUs to spread the shots over, every `len(devices)`-th on each, or
-            None for the current one.
+            None for the current one. A GPU listed twice runs two shots at once,
+            which pays only while the fields of both fit in its L2 cache together
+            and slows a larger grid down.
 
     Returns:
         (cost, gradient), the gradient a field over the padded grid, already

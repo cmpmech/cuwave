@@ -637,11 +637,9 @@ def reconstruction_sensitivity(
         p = adjoint_step(P[m % 2], P[1 - m % 2], P[m % 2])  # lambda^n
         adjoint_excitation(p, signal, row)
         bc_step(p)
-        # inertia pairs lambda^n with the whole triplet, stiffness with its middle slot
-        gradient_step(*triplet(m), p)
+        return p
 
-    def backward(m, row, signal, source_rows, strip_rows=None):
-        adjoint(m, row, signal)
+    def reverse(m, row, source_rows, strip_rows=None):
         a, b, c = triplet(m)
         # read backwards, so the source rides two steps ahead of the state it rebuilds
         c = reverse_step(b, a, c)
@@ -649,6 +647,28 @@ def reconstruction_sensitivity(
         if strip_rows is not None:
             replay_strip(c, strip_rows, row)
         bc_step(c)
+
+    # the reverse and the adjoint march meet only in the gradient, so they may overlap
+    side = cp.cuda.Stream(non_blocking=True)
+    forked = cp.cuda.Event(disable_timing=True)
+    joined = cp.cuda.Event(disable_timing=True)
+    # past L2 the two would evict each other's fields
+    carried = U.nbytes + P.nbytes + sum(field.nbytes for field in grads.values())
+    overlap = carried <= cp.cuda.Device().attributes["L2CacheSize"]
+
+    # reverse step m on the side stream, beside adjoint step m + 1
+    def backward(m, row, signal, source_rows, strip_rows=None):
+        main = cp.cuda.get_current_stream()
+        lane = side if overlap else main
+        forked.record(main)
+        lane.wait_event(forked)
+        with lane:
+            reverse(m, row, source_rows, strip_rows)
+            joined.record(lane)
+        p = adjoint(m + 1, row, signal)
+        main.wait_event(joined)
+        # inertia pairs lambda^n with the whole triplet, stiffness with its middle slot
+        gradient_step(*triplet(m + 1), p)
 
     def leaf(k):
         s, e = starts[k], starts[k + 1]
@@ -666,8 +686,9 @@ def reconstruction_sensitivity(
         if not s:
             # the forward rotation left the last three states live, which is the seed
             state["seed"] = float(cp.linalg.norm(triplet(m0)[2] * valid))
-        # row k of each is reverse step m0 + k, contiguous since the kernels index by row
-        windows = [Window(signal[m0 : m1 - 1])]
+        gradient_step(*triplet(m0), adjoint(m0, m0, signal))
+        # row k is reverse step m0 + k and adjoint step m0 + 1 + k, as kernels index rows
+        windows = [Window(signal[m0 + 1 : m1])]
         windows.append(Window(source.signal[s : e - 1][::-1].copy()))
         if num_strip:
             windows.append(Window(buffer[: e - s - 1][::-1].copy(), dtype=sim.dtype))
@@ -680,7 +701,6 @@ def reconstruction_sensitivity(
                     windows,
                     [U, P, *adjoint_memory],
                 )
-        adjoint(m1 - 1, m1 - 1, signal)
 
     for action, *segments in checkpoint_schedule(len(starts) - 1, checkpoints or 0):
         if action == "advance":

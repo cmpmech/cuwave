@@ -38,6 +38,8 @@ Both gradients take the adjoint variant itself as an argument, so a sponged run 
 
 `devices` deals the shots of all three out over several GPUs, every `len(devices)`-th to each, in a thread and a stream of its own, with the simulation, the sensors and the data copied over once per call; costs and gradients are summed back on the calling device. A shot then never leaves its device, which is why this split scales with the shots and needs no exchange, against the row split of [decomposition](decomposition.md) that one shot too large for a device needs
 
+A device may be listed twice, `devices=[0, 0]`, and then runs two of its shots at once. That fills a GPU whose single shot leaves it idle between launches, as on a grid whose fields stay in L2, and slows the run down once the fields of both shots no longer fit there together, so it is the setting for many shots on a small grid only. The per-shot gradients are summed in another order, so the result moves at round-off
+
 `misfit` and `misfit_gradient` are the pair a line search needs: a trial step evaluates the first, which is one forward pass per shot, and only an accepted iteration pays for the second, which adds an adjoint pass; see the [optimization](optimization.md) line search on what that ratio buys
 
 `stack` trades resolution for cost. A stacked shot is one simulation and one record instead of `len(sources)`, but the gradient it produces is the superposition of the individual ones and cannot be separated again; encode the shots by scaling their signals (random signs, phase shifts) before stacking if the crosstalk matters

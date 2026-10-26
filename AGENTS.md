@@ -161,7 +161,9 @@ lined axis' memory (the shared scratch for the staggered schemes, one buffer plu
 `damping` and a `domain` mask; the material gradient is zeroed on `pml_nodes` (`frozen`).
 
 **Multi-GPU** comes two ways. `misfit_gradient(..., devices=[0, 1])` (and `measure`,
-`misfit`) deals shots out, one thread and stream per device. `Simulation.devices` splits
+`misfit`) deals shots out, one thread and stream per device; a device may repeat
+(`devices=[0, 0]`), two shots then sharing it, which pays only while both shots' fields
+fit in L2 together. `Simulation.devices` splits
 axis 0 (`decomposition.py`): every subdomain is a plain local `Simulation` stepping its
 rows plus a wide halo with the unmodified kernels, and `march` calls `exchange(state)` every
 `EVERY` steps, so `state` (field slots plus the closures' `memory`) must name everything a
@@ -201,6 +203,8 @@ puts it behind the strip (dilated in every direction, diagonals included), and
 `spectral_sensitivity` restarts the adjoint memories per frequency.
 `reconstruction_sensitivity(..., strip_dtype=)` stores the strip as float32 or bfloat16
 (a `uint16` record that `Window(dtype=)` widens on staging), trading exactness for memory.
+Its reverse step runs on a side stream beside the next adjoint step, the two meeting only
+in the gradient, bitwise the serial order; off once `U`, `P` and the gradients exceed L2.
 A damped node is irreversible only past `REVERSIBLE_GROWTH` (`reversible_damping`): the
 reverse march is `fd_step` with the damping negated, so physical attenuation needs no strip.
 `checkpoints=c` cuts the run into segments whose strip costs about one snapshot (fields plus
