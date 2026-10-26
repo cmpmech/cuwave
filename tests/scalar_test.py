@@ -12,6 +12,8 @@ A 2D float32 run on a small or a DRAM-bound grid advances several steps a launch
 (`define_blocked_step`), the excitation, the ghost refill and the record inside the tile.
 It claims the plain run bit for bit, so it is compared with `array_equal` over orders,
 boundaries, damping, inertia, tiles, step counts and sources and sensors on the wall.
+A 3D order-2 run past L2 marches columns of tiles along axis 0 with the same claim,
+checked on a grid whose last tile and last chunk of planes hold one node each.
 """
 
 import itertools
@@ -272,6 +274,89 @@ class BlockedTest(unittest.TestCase):
             (1024, 1024), (0.1, 0.1), 6, 1e-3, (4, 32), wavespeed=1.0, density=1.0
         )
         self.assertIsNone(middle.define_blocked_step(mat, source, None))
+
+
+def _scalar3d(boundary, N, Nx=(259, 171, 171)):
+    # cores (24, 24) and 64 planes: the last of each holds the node beside the ghost
+    dx = (0.1, 0.1, 0.1)
+    dt = 0.5 * stable_dt(dx, 1.0, 2)
+    common = dict(space_order=2, boundary=boundary)
+    return ScalarWave(Nx, dx, N, dt, (1, 16, 32), wavespeed=1.0, density=1.0, **common)
+
+
+def _shot3d(sim, seed):
+    """Sources beside two corners and inside, sensors by the walls and along a column."""
+    n = sim.Nx
+    signal = np.random.default_rng(seed).standard_normal((sim.N, 3))
+    position = [[2, n[0] - 3, n[0] // 2], [2, n[1] - 3, n[1] // 3], [3, n[2] - 3, 7]]
+    column = [[a, 5, n[2] // 2] for a in range(1, 12)]
+    near = [[1, 1, 1], [n[0] - 2, n[1] - 2, n[2] - 2], [n[0] - 2, 2, 50], [70, 1, 9]]
+    sensors = np.array(column + near + [[66, 30, n[2] - 2], [3, 2, 3]]).T
+    source = Source(cp.array(position, dtype=cp.int32), cp.asarray(signal, sim.dtype))
+    # inside the two phases, which also keeps the scalar density positive
+    indicator = 0.25 + 0.5 * (_random(sim, seed)[0] - 0.3)
+    return source, indicator, cp.array(sensors, dtype=cp.int32)
+
+
+def _runs3d(sim, seed):
+    """The (field, record) of the marched run, then of the plain run."""
+    source, indicator, sensors = _shot3d(sim, seed)
+    mat = sim.build_materials(indicator)
+    assert sim.define_blocked_step(mat, source, sensors) is not None
+    blocked = simulate(sim, source, indicator, sensors=sensors)
+    with mock.patch.object(type(sim), "define_blocked_step", lambda *a, **k: None):
+        plain = simulate(sim, source, indicator, sensors=sensors)
+    return blocked, plain
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class MarchedTest(unittest.TestCase):
+    def _assert_bitwise(self, blocked, plain):
+        self.assertGreater(float(cp.abs(plain[0]).max()), 0.0)
+        for a, b in zip(blocked, plain):
+            self.assertTrue(bool(cp.array_equal(a, b)))
+
+    def test_a_marched_run_is_the_plain_run_bit_for_bit(self):
+        mixed = ((Neumann, Dirichlet), (Dirichlet, Neumann), (Dirichlet, Dirichlet))
+        for boundary in (None, mixed):
+            for N in (3, 14):
+                with self.subTest(boundary=boundary, N=N):
+                    self._assert_bitwise(*_runs3d(_scalar3d(boundary, N), 3))
+
+    def test_a_formed_inertia(self):
+        sim = AcousticWave(
+            (259, 171, 171),
+            (0.1, 0.1, 0.1),
+            10,
+            1e-5,
+            (1, 16, 32),
+            space_order=2,
+            boundary=Dirichlet,
+            rho1=1.2,
+            rho2=2600.0,
+            kappa1=1.4e5,
+            kappa2=6.9e8,
+        )
+        self._assert_bitwise(*_runs3d(sim, 4))
+
+    def test_what_the_plain_step_keeps(self):
+        sim = _scalar3d(None, 4)
+        source, indicator, sensors = _shot3d(sim, 8)
+        refused = {
+            "damping": replace(sim, damping=sponge(sim, indicator, 10, 0.1)),
+            "order 4": replace(sim, space_order=4),
+            "in L2": _scalar3d(None, 4, (40, 40, 40)),
+            "a sensor on a ghost": sim,
+        }
+        for name, each in refused.items():
+            with self.subTest(name=name):
+                mat = each.build_materials(indicator)
+                taken = sensors.copy()
+                if name == "a sensor on a ghost":
+                    taken[0, 0] = 0
+                if name == "in L2":
+                    taken = None
+                self.assertIsNone(each.define_blocked_step(mat, source, taken))
 
 
 if __name__ == "__main__":

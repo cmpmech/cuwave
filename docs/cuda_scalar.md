@@ -10,7 +10,8 @@
 | `-DUSE_DAMPING`               | `sim.compile_flags`, once `Simulation.damping` is set | compiles the damping term and its two extra kernel parameters |
 | `-DUSE_DOMAIN`                | `sim.compile_flags`, once `Simulation.domain` is set  | launches `fd_kernel` over a tile list and grades the cells at the domain wall, two extra kernel parameters |
 | `-DUSE_STREAM`, `-DSTREAM_TX` | `sim.compile_flags`, where `PressureWave.streams` (a wide unmasked 2D stencil on a full grid) | compiles the streaming `fd_kernel` below instead of the per-thread one, its tile `STREAM_TX = threads[-1]` wide |
-| `-DSTEPS`, `-DTILE0`, `-DTILE1`, `-DROWS` | `PressureWave.define_blocked_step`, from `SMALL_BLOCKS` or `LARGE_BLOCKS` | compiles `blocked_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
+| `-DSTEPS`, `-DTILE0`, `-DTILE1`, `-DROWS` | `PressureWave.define_blocked_step` in 2D, from `SMALL_BLOCKS` or `LARGE_BLOCKS` | compiles `blocked_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
+| `-DSTEPS`, `-DTILE1`, `-DTILE2`, `-DPLANES` | `PressureWave.define_blocked_step` in 3D, from `MARCHED_BLOCK` | compiles the 3D `blocked_kernel` (order 2): the steps a launch advances, the tile in the plane and the planes a block marches |
 | `STENCIL_RADIUS`, `OP_COEFFS` | `stencils.preamble(space_order)`                                      | the radius $R$ and the cell-coefficient table                 |
 | `--use_fast_math`             | always                                                                |                                                               |
 
@@ -155,7 +156,7 @@ as `fd_kernel` without `cells, tiles`, plus `chunk`: the rows of axis 0 a block 
 **parallelization**
 a 2D launch of `(TILE1, ROWS)` threads per block, one block per tile of `TILE0` $\times$ `TILE1` nodes; a thread owns `NODES` $=$ `TILE0 / ROWS` consecutive nodes of its column. Tiles overlap by a halo of `HALO` $=$ `STEPS` $\cdot R$ nodes each side and write back only their core, `C0` $\times$ `C1`
 **input args**
-`u0, u1`: $u^{t-1}, u^t$; `v0, v1`: the arrays receiving $u^{t+S-1}, u^{t+S}$, never `u0, u1` themselves, since a neighbouring tile still reads its halo there; `stiff, minv, derive_inertia` and under `-DUSE_DAMPING` `damping, dt`: as `fd_kernel`; `signal`: the `(N, num_sources)` record staged by `march`, row $t$ at `t0 + t`; `weights, num_sources`: as `excitation_kernel`; `record, num_sensors`: the `(N, num_sensors)` record; `source_starts, source_entries`: per tile the sources its nodes hold, halo included, as CSR rows of `local node | source << 16`; `sensor_starts, sensor_entries`: the same for the sensors its core records, a ghost sensor at the tile owning the node it clamps to; `t0`: the step the launch starts at; `neumann, dirichlet`: face masks; `f0, N0, f1, N1, s0`: as `fd_kernel`
+`u0, u1`: $u^{t-1}, u^t$; `v0, v1`: the arrays receiving $u^{t+S-1}, u^{t+S}$, never `u0, u1` themselves, since a neighbouring tile still reads its halo there; `stiff, minv, derive_inertia` and under `-DUSE_DAMPING` `damping, dt`: as `fd_kernel`; `signal`: the `(N, num_sources)` record staged by `march`, row $t$ at `t0 + t`; `weights, num_sources`: as `excitation_kernel`; `record, num_sensors`: the `(N, num_sensors)` record; `source_starts, source_entries`: per tile the sources its nodes hold, halo included, as CSR rows of `local node | source << 16`; `sensor_starts, sensor_entries`: the same for the sensors its core records, a ghost sensor at the tile owning the ghost's mirror; `t0`: the step the launch starts at; `neumann, dirichlet`: face masks; `f0, N0, f1, N1, s0`: as `fd_kernel`
 **internal args**
 `shared`: $u$ of this step and the next (`cu`, `nu`, swapped every step), each with a guard ring $R$ wide; `up, uc, mi, beta, tag`: per owned node in registers, `tag` the source $+1$ and the sensor $+1$ in its two halves; `g0, gm1, gp1`: the harmonic cell stiffnesses of the owned nodes in registers, `g0[k]` the cell between nodes $k-1$ and $k$ of the run; `stepped, ghost`: bit masks of the owned interior and refilled ghost nodes; `refill`: whether the tile holds a ghost, uniform over the block
 **how?**
@@ -164,6 +165,22 @@ a 2D launch of `(TILE1, ROWS)` threads per block, one block per tile of `TILE0` 
 - each step reads `cu` and writes `nu`, so one barrier separates the steps; a tile holding a ghost takes a second one, for the ghost to read its mirror two nodes in, the sign held for Dirichlet
 - the edge nodes of a tile read the guard ring and go wrong, one radius deeper every step; after `STEPS` steps the error stops short of the core
 - the laplacian, the update and $\beta$'s two divisors $1\mp\beta$ are rounded by `FMA_RN` and `MUL_RN` as nvcc contracts them in `fd_kernel` ($\Delta t\,d/2m$ fused into $1\mp\beta$, one axis fused onto the other), and the source term rounded apart as `excitation_kernel` adds it atomically
+- a ghost is written back by the tile whose core holds its mirror, the one tile where the mirror is valid after the last step; a core of one node beside the ghost would leave it to a tile that reads the mirror past its valid region, so the halo is at least 2
+
+### blocked_kernel (3D)
+`STEPS` steps of the order-2 `fd_kernel` between one load and one store of every plane, the excitation, the ghost refill and the record included, bitwise the launches one at a time; float32 only, no damping
+**parallelization**
+a 2D block of `(TILE2, TILE1)` threads per column of tiles, one thread per node of the tile in the plane; the grid is the tiles in the plane times the chunks of `PLANES` planes along axis 0. Tiles overlap by a halo of `HALO` $=$ `STEPS` nodes each side in the plane and write back their core, `C1` $\times$ `C2`; a chunk marches `HALO` planes past each of its ends
+**input args**
+`u0, u1, v0, v1, stiff, minv, derive_inertia, signal, weights, num_sources, record, num_sensors, t0`: as the 2D `blocked_kernel`; `source_starts, source_entries`: per thread column of every tile the sources it holds, halo included, as CSR rows of `(plane, source)` pairs sorted by plane; `sensor_starts, sensor_entries`: the same for the sensors its core records, interior only; `dirichlet`: face mask, every other face Neumann; `f0, N0, f1, N1, s0, f2, N2, s1`: as `fd_kernel`
+**internal args**
+`shared`: $u$ of steps $0$ to `STEPS` $-1$ on the plane each reads in the plane (`cur`, `nxt`, swapped every plane), the stiffness of the plane loaded (twice), and the cell stiffnesses toward $+1$ of axes 1 and 2 on the last `STEPS` $+1$ planes, each plane with a guard ring of one node; `Q`: $u^k$ of the thread's column on the three planes around the one step $k+1$ updates; `P`: $u^{-1}$ on the last two planes; `G`: the axis-0 cell stiffnesses between the last `STEPS` $+2$ planes; `MI`: $1/m$ on the last `STEPS` planes; `sourced, sensed`: bit $k$ set where the plane $k$ behind the one loaded holds a source or a sensor of the column
+**how?**
+- iteration $z$ loads plane $z$, then step $k$ updates plane $z-k$ from step $k-1$ on planes $z-k-1$ to $z-k+1$, the axis-0 taps from the thread's registers and the in-plane taps from the plane stored the iteration before, so one barrier per plane separates the steps
+- the cell stiffness toward $-1$ is the neighbour's toward $+1$: products and sums commute exactly, so each is formed once a launch and is still the mean `flux_divergence_axis` forms
+- an in-plane face ghost is refilled by its mirror's thread, which stores the signed value into the ghost's slot of the next plane and writes it back with the last step; an axis-0 face ghost is refilled in the column's queue, from plane 2 when it passes and from plane $N_0-3$ when the ghost is pushed; edges and corners, which the refill skips, keep their values, the two levels swapped with the parity of `STEPS`
+- the edge nodes of a tile read the guard ring and the first and last planes of a chunk lack their neighbours; both errors spread one node a step and stop short of the core
+- the laplacian and the update are rounded by `FMA_RN` and `MUL_RN` as nvcc contracts them in the 3D `fd_kernel`, axis 1 first, axis 0 fused onto it, then axis 2
 
 ### pml_kernel
 **parallelization**

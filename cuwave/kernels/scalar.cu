@@ -5,6 +5,7 @@
 //   USE_DOMAIN
 //   USE_STREAM, STREAM_TX
 //   STEPS, TILE0, TILE1, ROWS (2D)
+//   STEPS, TILE1, TILE2, PLANES (3D, order 2)
 
 // spatial finite difference stencil for Laplacian, `u(j)` the tap j nodes on
 template <class Taps>
@@ -417,6 +418,12 @@ __global__ void homogeneous_dirichlet_kernel(real_t *__restrict__ u,
 }
 
 #ifdef STEPS
+// the node whose tile writes `a` back: a ghost goes with its mirror
+__device__ __forceinline__ int owner(const int a, const int N) {
+  return a == 0 ? 2 : a == N - 1 ? N - 3 : a;
+}
+
+#if NDIM == 2
 // ------------------------------------------------------------------------------------
 // the core a tile writes back, its halo STEPS stencil radii wide
 #define HALO (STEPS * STENCIL_RADIUS)
@@ -426,11 +433,6 @@ __global__ void homogeneous_dirichlet_kernel(real_t *__restrict__ u,
 #define WIDE (TILE1 + 2 * STENCIL_RADIUS) // a tile row with its guard columns
 #define AREA ((TILE0 + 2 * STENCIL_RADIUS) * WIDE)
 #define AT(x, y) (((x) + STENCIL_RADIUS) * WIDE + (y) + STENCIL_RADIUS)
-
-// the node whose tile writes `a` back: a ghost goes with its mirror
-__device__ __forceinline__ int owner(const int a, const int N) {
-  return a == 0 ? 2 : a == N - 1 ? N - 3 : a;
-}
 
 // advance a tile STEPS steps between one load and one store: the step, the
 // excitation, the boundary refill and the record, bitwise the plain launches
@@ -621,6 +623,244 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
     }
   }
 }
+#elif NDIM == 3 && STENCIL_RADIUS == 1
+// ------------------------------------------------------------------------------------
+// the core a column of tiles writes back, its halo STEPS nodes wide
+#define HALO STEPS
+#define C1 (TILE1 - 2 * HALO)
+#define C2 (TILE2 - 2 * HALO)
+#define WIDE (TILE2 + 2) // a tile row with its guard columns
+#define AREA ((TILE1 + 2) * WIDE)
+#define AT(y, x) (((y) + 1) * WIDE + (x) + 1)
+
+// march a column of tiles along axis 0, step k k planes behind the one loaded:
+// the step, excitation, refill and record, bitwise the plain launches
+__global__ void __launch_bounds__(TILE1 *TILE2)
+    blocked_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
+                   real_t *__restrict__ v0, real_t *__restrict__ v1,
+                   const real_t *__restrict__ stiff,
+                   const real_t *__restrict__ minv, const int derive_inertia,
+                   const real_t *__restrict__ signal,
+                   const real_t *__restrict__ weights, const int num_sources,
+                   real_t *__restrict__ record, const int num_sensors,
+                   const int *__restrict__ source_starts,
+                   const int2 *__restrict__ source_entries,
+                   const int *__restrict__ sensor_starts,
+                   const int2 *__restrict__ sensor_entries, const int t0,
+                   const int dirichlet, const real_t f0, const int N0,
+                   const real_t f1, const int N1, const int s0, const real_t f2,
+                   const int N2, const int s1) {
+  // u of steps 0 .. STEPS - 1 twice, the stiffness twice and the in-plane cell
+  // means toward +1 on STEPS + 1 planes, each plane in a guard ring
+  extern __shared__ real_t shared[];
+  const int tx = threadIdx.x, ty = threadIdx.y, i = AT(ty, tx);
+  const int lo1 = 1 + blockIdx.y * C1, lo2 = 1 + blockIdx.x * C2;
+  const int a1 = lo1 - HALO + ty, a2 = lo2 - HALO + tx, c = a1 * s1 + a2;
+  const int first = 1 + blockIdx.z * PLANES, last = min(first + PLANES, N0 - 1);
+  const bool col = a1 >= 0 && a1 <= N1 - 1 && a2 >= 0 && a2 <= N2 - 1;
+  const bool inner = a1 > 0 && a1 < N1 - 1 && a2 > 0 && a2 < N2 - 1;
+  const bool side =
+      col && !inner && (a1 > 0 && a1 < N1 - 1 || a2 > 0 && a2 < N2 - 1);
+  const bool corner = col && !inner && !side;
+  const int k1 = owner(a1, N1), k2 = owner(a2, N2);
+  const bool owned =
+      col && k1 >= lo1 && k1 < lo1 + C1 && k2 >= lo2 && k2 < lo2 + C2;
+
+  // the face ghosts this column mirrors, -/+ axis 1 then -/+ axis 2, and which
+  // of them the tile holds
+  const unsigned faces = inner ? (a1 == 2) | (a1 == N1 - 3) << 1 |
+                                     (a2 == 2) << 2 | (a2 == N2 - 3) << 3
+                               : 0;
+  const unsigned within = (ty >= 2) | (ty + 2 < TILE1) << 1 | (tx >= 2) << 2 |
+                          (tx + 2 < TILE2) << 3;
+  const real_t low = dirichlet & 1 ? -1 : 1, high = dirichlet & 2 ? -1 : 1;
+
+  // the column's sources and sensors by plane, from the march's first: `se` the
+  // first a step still adds, `sz` the first past the plane loaded
+  const int key =
+      ((blockIdx.y * gridDim.x + blockIdx.x) * TILE1 + ty) * TILE2 + tx;
+  int se = source_starts[key], re = sensor_starts[key];
+  const int se_end = source_starts[key + 1], re_end = sensor_starts[key + 1];
+  while (se < se_end && source_entries[se].x < first - HALO)
+    ++se;
+  while (re < re_end && sensor_entries[re].x < first)
+    ++re;
+  int sz = se, rz = re;
+  unsigned sourced = 0, sensed = 0; // bit k: the plane k back holds one
+
+  real_t *sk = shared + 2 * STEPS * AREA, *means = sk + 2 * AREA;
+  for (int e = ty * TILE2 + tx; e < 2 * AREA; e += TILE1 * TILE2)
+    sk[e] = 1;
+  // u^k on planes z - k - 2 .. z - k, u^-1 on z - 1 and z, the axis-0 cell
+  // means from planes z - STEPS - 1, 1 / m from z - 1 on
+  real_t Q[STEPS][3], P[2], G[STEPS + 1], MI[STEPS];
+#pragma unroll
+  for (int k = 0; k < STEPS; ++k) {
+    Q[k][0] = Q[k][1] = Q[k][2] = 0;
+    MI[k] = 0;
+  }
+#pragma unroll
+  for (int k = 0; k <= STEPS; ++k)
+    G[k] = 1;
+  P[0] = P[1] = 0;
+  real_t sprev = 1;
+
+  const int end = last + HALO;
+  int z = first - HALO, slot = 0; // the plane's means at slot z mod STEPS + 1
+  bool load = col && z >= 0;
+  real_t nu0 = load ? u0[z * s0 + c] : 0, nu1 = load ? u1[z * s0 + c] : 0;
+  real_t ns = load ? stiff[z * s0 + c] : (real_t)1;
+  real_t nm = load && !derive_inertia ? minv[z * s0 + c] : 0;
+  for (; z < end; ++z) {
+    // this plane, the next one fetched behind it
+    const real_t lu0 = nu0, lu1 = nu1, ls = ns, lm = nm;
+    real_t *skz = sk + (z & 1) * AREA;
+    skz[i] = ls;
+    load = col && z + 1 >= 0 && z + 1 <= N0 - 1 && z + 1 < end;
+    const int ahead = (z + 1) * s0 + c;
+    nu0 = load ? u0[ahead] : 0;
+    nu1 = load ? u1[ahead] : 0;
+    ns = load ? stiff[ahead] : (real_t)1;
+    nm = load && !derive_inertia ? minv[ahead] : 0;
+    __syncthreads();
+
+    // what nothing steps keeps through the launch: an edge or a corner
+    const bool ends = z == 0 || z == N0 - 1;
+    if ((corner || side && ends) && owned && z >= 0 && z <= N0 - 1) {
+      const int kz = owner(z, N0);
+      if (kz >= first && kz < last) {
+        v0[z * s0 + c] = STEPS % 2 ? lu1 : lu0;
+        v1[z * s0 + c] = STEPS % 2 ? lu0 : lu1;
+      }
+    }
+    sourced <<= 1;
+    sensed <<= 1;
+    if (sz < se_end && source_entries[sz].x == z) {
+      sourced |= 1;
+      ++sz;
+    }
+    if (rz < re_end && sensor_entries[rz].x == z) {
+      sensed |= z < last;
+      ++rz;
+    }
+
+    // the plane's cell means toward +1, harmonic as flux_divergence_axis forms
+    // them, toward -1 the neighbour's
+    real_t *mz = means + slot * 2 * AREA;
+    mz[i] = ls * skz[i + WIDE] / (ls + skz[i + WIDE]);
+    mz[AREA + i] = ls * skz[i + 1] / (ls + skz[i + 1]);
+    Q[0][0] = Q[0][1];
+    Q[0][1] = Q[0][2];
+    Q[0][2] = lu1;
+    P[0] = P[1];
+    P[1] = lu0;
+#pragma unroll
+    for (int n = 0; n < STEPS; ++n)
+      G[n] = G[n + 1];
+    G[STEPS] = sprev * ls / (sprev + ls);
+    sprev = ls;
+
+    // level k on plane z - k from level k - 1 around it, the in-plane taps from
+    // the plane stored last iteration
+    const real_t *cur = shared + (z & 1) * STEPS * AREA;
+    real_t *nxt = shared + (~z & 1) * STEPS * AREA;
+    nxt[i] = lu1;
+#pragma unroll
+    for (int k = 1; k <= STEPS; ++k) {
+      const int q = z - k;
+      const real_t uc = Q[k - 1][1];
+      real_t u = k == 1 ? P[0] : Q[k - 2][0]; // held where nothing steps
+      if (inner && q > 0 && q < N0 - 1) {
+        const real_t *cu = cur + (k - 1) * AREA;
+        const real_t *g =
+            means + (slot + STEPS + 1 - k) % (STEPS + 1) * 2 * AREA;
+        const auto along0 = [&](const int j) {
+          return j > 0 ? Q[k - 1][2] : Q[k - 1][0];
+        };
+        const auto along1 = [&](const int j) { return cu[i + j * WIDE]; };
+        const auto along2 = [&](const int j) { return cu[i + j]; };
+        const real_t d0 = flux_divergence_taps(along0, uc, G[STEPS - k + 1],
+                                               G[STEPS - k], 1, 1);
+        const real_t d1 =
+            flux_divergence_taps(along1, uc, g[i], g[i - WIDE], 1, 1);
+        const real_t d2 = flux_divergence_taps(along2, uc, g[AREA + i],
+                                               g[AREA + i - 1], 1, 1);
+        // the axes and the leapfrog rounded as nvcc compiles fd_kernel's
+        const real_t laplacian = FMA_RN(f2, d2, FMA_RN(f0, d0, MUL_RN(f1, d1)));
+        u = FMA_RN(MI[k - 1], laplacian, 2.f * uc - u);
+        if (sourced >> k & 1) {
+          int e = se;
+          while (source_entries[e].x != q)
+            ++e;
+          const int j = source_entries[e].y;
+          u += MUL_RN(weights[j],
+                      signal[(size_t)(t0 + k - 1) * num_sources + j]);
+        }
+        if (sensed >> k & 1) {
+          int e = re;
+          while (sensor_entries[e].x != q)
+            ++e;
+          record[(size_t)(t0 + k - 1) * num_sensors + sensor_entries[e].y] = u;
+        }
+
+        // the face ghosts' refill: in the plane through the stored level, along
+        // axis 0 through the queue, and the last level written back
+        if (k < STEPS) {
+          if (faces & within)
+#pragma unroll
+            for (int m = 0; m < 4; ++m)
+              if ((faces & within) >> m & 1) {
+                const int reach = m < 2 ? (2 * m - 1) * 2 * WIDE : 4 * m - 10;
+                nxt[k * AREA + i + reach] = dirichlet >> (2 + m) & 1 ? -u : u;
+              }
+        } else if (owned && q >= first && q < last) {
+          const int idx = q * s0 + c;
+          const real_t w = Q[STEPS - 1][1];
+          v0[idx] = w;
+          v1[idx] = u;
+          if (faces)
+#pragma unroll
+            for (int m = 0; m < 4; ++m)
+              if (faces >> m & 1) {
+                const int reach = m < 2 ? (2 * m - 1) * 2 * s1 : 4 * m - 10;
+                const bool flip = dirichlet >> (2 + m) & 1;
+                v0[idx + reach] = flip ? -w : w;
+                v1[idx + reach] = flip ? -u : u;
+              }
+          if (q == 2) {
+            v0[c] = low * w;
+            v1[c] = low * u;
+          }
+          if (q == N0 - 3) {
+            v0[(N0 - 1) * s0 + c] = high * w;
+            v1[(N0 - 1) * s0 + c] = high * u;
+          }
+        }
+      }
+      if (k < STEPS) {
+        if (q == N0 - 1 && inner)
+          u = high * Q[k][1];
+        Q[k][0] = Q[k][1];
+        Q[k][1] = Q[k][2];
+        Q[k][2] = u;
+        if (q == 2 && inner)
+          Q[k][0] = low * u;
+        if (!side || q <= 0 || q >= N0 - 1)
+          nxt[k * AREA + i] = u;
+      }
+    }
+    while (se < sz && source_entries[se].x <= z - STEPS)
+      ++se;
+    while (re < rz && sensor_entries[re].x <= z - STEPS)
+      ++re;
+#pragma unroll
+    for (int n = STEPS - 1; n > 0; --n)
+      MI[n] = MI[n - 1];
+    MI[0] = derive_inertia ? 1.f / ls : lm;
+    slot = slot == STEPS ? 0 : slot + 1;
+  }
+}
+#endif
 #endif
 
 } // extern "C"

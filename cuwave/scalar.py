@@ -14,6 +14,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import cupy as cp
 import cupy.typing as cpt
@@ -45,6 +46,7 @@ SMALL_BLOCKS = (
     (((32, 64), 8, 4), ((32, 64), 8, 3), ((64, 64), 16, 6)),
 )
 LARGE_BLOCKS = (((64, 64), 16, 6), None)  # by radius, for fields spilling out of L2
+MARCHED_BLOCK = ((32, 32), 4, 64)  # 3D order 2: (tile in the plane, steps, planes)
 STREAM_ORDER = 6  # below it L1 serves the plain step as well as the stream would
 STREAM_BLOCKS = 8  # per multiprocessor the stream needs to fill the device
 
@@ -54,51 +56,133 @@ def _cores(Nx: tuple[int, ...], tile: tuple[int, int], halo: int) -> list[int]:
     return [-(-(n - 2) // (t - 2 * halo)) for n, t in zip(Nx, tile)]
 
 
-def _tile_lists(
+class _Hits(NamedTuple):
+    """The (tile, point) pairs a blocked step lists, over the two tiled axes."""
+
+    tiles: npt.NDArray[np.int64]  # (2, hits) the tile per axis
+    nodes: npt.NDArray[np.int64]  # (2, hits) the point's node per axis
+    j: npt.NDArray[np.int64]  # (hits,) the point's column among the points
+
+
+def _covering_hits(
     points: npt.NDArray[np.int64],
-    owners: npt.NDArray[np.int64],
     tile: tuple[int, int],
     core: list[int],
     halo: int,
     cores: list[int],
-    covering: bool,
-) -> list[cpt.NDArray]:
-    """The (2, num) `points` each blocked tile holds: CSR row starts, entries `local | j << 16`.
+) -> _Hits:
+    """Every tile whose nodes, halo included, take one of the (2, num) `points`.
 
     Args:
-        points: (2, num) grid indices of the sources or sensors, `j` their column.
-        owners: (2, num) node whose tile holds each point unless `covering`.
+        points: (2, num) grid indices on the tiled axes.
         tile: nodes of a tile per axis, halo included.
         core: nodes of a tile's core per axis.
         halo: nodes each side between a tile's edge and its core.
         cores: tiles per axis.
-        covering: every tile whose nodes, halo included, take a point holds it, else
-            the one tile whose core holds its `owners` node.
     """
     j = np.arange(points.shape[1])
+    # tiles starting at 1 + b C - halo hold rows up to tile - 1 past their start
+    low = [(points[d] - 1 + halo - tile[d]) // core[d] + 1 for d in (0, 1)]
+    high = [(points[d] - 1 + halo) // core[d] for d in (0, 1)]
+    spans = [-(-tile[d] // core[d]) for d in (0, 1)]
     hits = []
-    if covering:
-        # tiles starting at 1 + b C - halo hold rows up to tile - 1 past their start
-        low = [(points[d] - 1 + halo - tile[d]) // core[d] + 1 for d in (0, 1)]
-        high = [(points[d] - 1 + halo) // core[d] for d in (0, 1)]
-        spans = [-(-tile[d] // core[d]) for d in (0, 1)]
-        for o0, o1 in itertools.product(range(spans[0]), range(spans[1])):
-            b = (low[0] + o0, low[1] + o1)
-            ok = (b[0] <= high[0]) & (b[1] <= high[1]) & (b[0] >= 0) & (b[1] >= 0)
-            ok &= (b[0] < cores[0]) & (b[1] < cores[1])
-            hits.append((b[0][ok], b[1][ok], points[0][ok], points[1][ok], j[ok]))
-    else:
-        b = [(owners[d] - 1) // core[d] for d in (0, 1)]
-        hits.append((b[0], b[1], points[0], points[1], j))
+    for o0, o1 in itertools.product(range(spans[0]), range(spans[1])):
+        b = (low[0] + o0, low[1] + o1)
+        ok = (b[0] <= high[0]) & (b[1] <= high[1]) & (b[0] >= 0) & (b[1] >= 0)
+        ok &= (b[0] < cores[0]) & (b[1] < cores[1])
+        hits.append((np.stack([b[0][ok], b[1][ok]]), points[:, ok], j[ok]))
+    return _Hits(*(np.concatenate(h, axis=-1) for h in zip(*hits)))
 
-    # the entries sorted by tile, each row's start found by bisection
-    b0, b1, a0, a1, index = (np.concatenate(h) for h in zip(*hits))
+
+def _owner_hits(
+    points: npt.NDArray[np.int64], owners: npt.NDArray[np.int64], core: list[int]
+) -> _Hits:
+    """The one tile whose core holds each of the (2, num) `owners` nodes, for `points`."""
+    tiles = (owners - 1) // np.asarray(core)[:, None]
+    return _Hits(tiles, points, np.arange(points.shape[1]))
+
+
+def _column_keys(
+    hits: _Hits, tile: tuple[int, int], core: list[int], halo: int, cores: list[int]
+) -> npt.NDArray[np.int64]:
+    """Each hit's tile, row-major over `cores`, times the tile's nodes plus its node in it."""
+    (b0, b1), (a0, a1) = hits.tiles, hits.nodes
     local = (a0 - 1 - b0 * core[0] + halo) * tile[1] + a1 - 1 - b1 * core[1] + halo
-    ids = b0 * cores[1] + b1
+    return (b0 * cores[1] + b1) * (tile[0] * tile[1]) + local
+
+
+def _tile_lists(
+    hits: _Hits, tile: tuple[int, int], core: list[int], halo: int, cores: list[int]
+) -> list[cpt.NDArray]:
+    """The points each 2D blocked tile holds: CSR row starts, entries `local | j << 16`."""
+    keys = _column_keys(hits, tile, core, halo, cores)
+    ids, local = np.divmod(keys, tile[0] * tile[1])
     order = np.argsort(ids, kind="stable")
-    entries = (local | index << 16)[order].astype(np.uint32)
+    entries = (local | hits.j << 16)[order].astype(np.uint32)
     starts = np.searchsorted(ids[order], np.arange(cores[0] * cores[1] + 1))
     return [cp.asarray(starts, dtype=cp.int32), cp.asarray(entries)]
+
+
+def _column_lists(
+    hits: _Hits,
+    planes: npt.NDArray[np.int64],
+    tile: tuple[int, int],
+    core: list[int],
+    halo: int,
+    cores: list[int],
+) -> list[cpt.NDArray]:
+    """The points each column of a 3D blocked tile holds: CSR starts, (plane, j) entries by plane.
+
+    Args:
+        hits: the tiles holding each point, over axes 1 and 2.
+        planes: (num,) each point's axis-0 index.
+        tile: nodes of a tile per axis, halo included.
+        core: nodes of a tile's core per axis.
+        halo: nodes each side between a tile's edge and its core.
+        cores: tiles per axis.
+    """
+    keys = _column_keys(hits, tile, core, halo, cores)
+    plane = planes[hits.j]
+    order = np.lexsort((plane, keys))
+    entries = np.stack([plane[order], hits.j[order]], axis=1).astype(np.int32)
+    columns = cores[0] * cores[1] * tile[0] * tile[1]
+    starts = np.searchsorted(keys[order], np.arange(columns + 1))
+    return [cp.asarray(starts, dtype=cp.int32), cp.asarray(entries)]
+
+
+def _blocked(
+    steps: int,
+    kernel: cp.RawKernel,
+    grid: tuple[int, ...],
+    block: tuple[int, ...],
+    shared: int,
+    args: list,
+    slots: tuple[int, int, int],
+) -> Blocked:
+    """The launch of a blocked `kernel`, `step(U, V, t, signal, record)`.
+
+    Args:
+        steps: the steps one launch advances.
+        kernel: the blocked kernel, whose first four arguments are u0, u1, v0, v1.
+        grid: thread blocks per launch.
+        block: threads per block.
+        shared: dynamic shared memory per block in bytes.
+        args: the kernel's arguments, the fields and `slots` filled per call.
+        slots: the positions of the signal, the record and the first step in `args`.
+    """
+    at_signal, at_record, at_t = slots
+    dummy = cp.zeros(1, dtype=args[4].dtype)
+
+    def blocked_step(U, V, t, signal, record=None):
+        # U[t % 2] holds u^(t - 1) and U[1 - t % 2] u^t, as the plain rotation does
+        args[0], args[1] = U[t % 2], U[1 - t % 2]
+        args[2], args[3] = V[(t + steps) % 2], V[(t + steps - 1) % 2]
+        args[at_signal] = signal
+        args[at_record] = dummy if record is None else record
+        args[at_t] = np.int32(t)
+        kernel(grid, block, args, shared_mem=shared)
+
+    return Blocked(steps, blocked_step)
 
 
 def split_grid_block(sim: Simulation) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -283,20 +367,21 @@ class PressureWave(Simulation):
     def define_blocked_step(
         self, mat: dict, source: Source, sensors: cpt.NDArray[cp.int32] | None
     ) -> Blocked | None:
-        """The 2D step advancing several steps a launch, excitation and record included, else None.
+        """The step advancing several steps a launch, excitation and record included, else None.
 
-        Each thread block loads a tile with a halo of as many stencil radii as it takes
-        steps, steps it in shared memory, refills its ghosts there and writes back its
-        core: bitwise the step, excitation, refill and record launched one by one. Taken
-        where launches or DRAM bound the plain step (`SMALL_BLOCKS`, `LARGE_BLOCKS`), else
-        None, as in 3D, in float64, above order 4, with a pml, a domain mask, a condition
-        other than Neumann or Dirichlet, a source off the interior, two sources or
-        sensors on one node, or an axis of fewer than 4 nodes.
+        In 2D each thread block loads a tile with a halo of as many stencil radii as it
+        takes steps, steps it in shared memory, refills its ghosts there and writes back
+        its core: bitwise the step, excitation, refill and record launched one by one.
+        Taken where launches or DRAM bound the plain step (`SMALL_BLOCKS`,
+        `LARGE_BLOCKS`). In 3D see `_define_marched_step`. None in 1D, in float64, above
+        order 4, with a pml, a domain mask, a condition other than Neumann or Dirichlet,
+        a source off the interior, two sources or sensors on one node, or an axis of
+        fewer than 4 nodes.
         """
         conditions = {c for pair in self.boundary for c in pair}
         radius = self.space_order // 2
         if (
-            self.ndim != 2
+            self.ndim == 1
             or self.precision != "float32"
             or radius > len(SMALL_BLOCKS)
             or self.pml is not None
@@ -305,8 +390,9 @@ class PressureWave(Simulation):
             or min(self.Nx) < 4
         ):
             return None
-        # launches bound a grid of two waves of threads, DRAM one whose u twice,
-        # stiffness and inertia spill out of L2; the halo's recomputation costs elsewhere
+        if self.ndim == 3:
+            return self._define_marched_step(mat, source, sensors)
+        # launches bound a grid of two waves of threads, DRAM one whose fields pass L2
         device = cp.cuda.Device().attributes
         resident = device["MultiProcessorCount"] * device["MaxThreadsPerMultiProcessor"]
         nodes = math.prod(self.Nx)
@@ -348,10 +434,11 @@ class PressureWave(Simulation):
         # a sensor recorded by the tile whose core holds it, a ghost's by its mirror's
         owners = np.where(points[1] == 0, 2, points[1])
         owners = np.where(owners == upper + 1, upper - 1, owners)
-        lists = [
-            *_tile_lists(points[0], points[0], tile, core, halo, cores, covering=True),
-            *_tile_lists(points[1], owners, tile, core, halo, cores, covering=False),
+        hits = [
+            _covering_hits(points[0], tile, core, halo, cores),
+            _owner_hits(points[1], owners, core),
         ]
+        lists = [a for h in hits for a in _tile_lists(h, tile, core, halo, cores)]
 
         # the kernel and its arguments, the pointers swapped per launch
         flags = (f"-DSTEPS={steps}", f"-DTILE0={tile[0]}", f"-DTILE1={tile[1]}")
@@ -362,24 +449,74 @@ class PressureWave(Simulation):
         kernel.max_dynamic_shared_size_bytes = shared
         weights = self.excitation_weights(mat, sources)
         args = [None, None, None, None, *self.step_kernel_args(mat), None, weights]
-        at_signal = len(args) - 2
         args += [np.int32(len(sources)), None, np.int32(len(targets)), *lists, None]
-        at_record, at_t = len(args) - 7, len(args) - 1
+        slots = (len(args) - 10, len(args) - 7, len(args) - 1)
         args += [face_mask(self, Neumann), face_mask(self, Dirichlet)]
         args += axis_geometry(self, self.step_factors())
-        dummy = cp.zeros(1, dtype=self.dtype)
+        grid, block = tuple(cores[::-1]), (tile[1], rows)
+        return _blocked(steps, kernel, grid, block, shared, args, slots)
 
-        def blocked_step(U, V, t, signal, record=None):
-            # U[t % 2] holds u^(t - 1) and U[1 - t % 2] u^t, as the plain rotation does
-            s = steps
-            args[0], args[1] = U[t % 2], U[1 - t % 2]
-            args[2], args[3] = V[(t + s) % 2], V[(t + s - 1) % 2]
-            args[at_signal] = signal
-            args[at_record] = dummy if record is None else record
-            args[at_t] = np.int32(t)
-            kernel(tuple(cores[::-1]), (tile[1], rows), args, shared_mem=shared)
+    def _define_marched_step(
+        self, mat: dict, source: Source, sensors: cpt.NDArray[cp.int32] | None
+    ) -> Blocked | None:
+        """The 3D order-2 step advancing several steps a launch, excitation and record included, else None.
 
-        return Blocked(steps, blocked_step)
+        Each thread block marches a column of tiles along axis 0, a tile in the plane
+        with a halo as wide as the steps, each step a plane behind the one before, so u
+        of a plane is loaded and stored once a launch (`MARCHED_BLOCK`): bitwise the
+        step, excitation, refill and record launched one by one. Taken where the fields
+        spill well out of L2; None with damping, and on what `define_blocked_step`
+        refuses, or a sensor off the interior.
+        """
+        # L2 serves the plain step's fields up to about one and a half times its size
+        device = cp.cuda.Device().attributes
+        nodes = math.prod(self.Nx)
+        if (
+            self.space_order != 2
+            or self.damping is not None
+            or 16 * nodes <= 1.5 * device["L2CacheSize"]
+        ):
+            return None
+        tile, steps, planes = MARCHED_BLOCK
+        core = [t - 2 * steps for t in tile]
+        cores = _cores(self.Nx[1:], tile, steps)
+        # u of all steps but the last twice, the stiffness twice, two means on steps + 1
+        shared = (4 * steps + 4) * (tile[0] + 2) * (tile[1] + 2) * 4
+        if shared > device["MaxSharedMemoryPerBlockOptin"]:
+            return None
+
+        # sources and sensors in the interior, no node holding two of either
+        sources = flatten_indices(self, source.position)
+        targets = flatten_indices(self, sensors) if sensors is not None else sources[:0]
+        flat = [index.get() for index in (sources, targets)]
+        points = [np.stack(np.unravel_index(f, self.Nx_padded)) for f in flat]
+        upper = np.asarray(self.Nx)[:, None] - 2
+        for point, index in zip(points, flat):
+            inside = ((point >= 1) & (point <= upper)).all()
+            if not inside or len(np.unique(index)) != len(index):
+                return None
+
+        # a column's sources wherever its tile reaches, its sensors where its core does
+        hits = [
+            _covering_hits(points[0][1:], tile, core, steps, cores),
+            _owner_hits(points[1][1:], points[1][1:], core),
+        ]
+        lists = []
+        for hit, point in zip(hits, points):
+            lists += _column_lists(hit, point[0], tile, core, steps, cores)
+
+        # the kernel and its arguments, the pointers swapped per launch
+        flags = (f"-DSTEPS={steps}", f"-DTILE1={tile[0]}", f"-DTILE2={tile[1]}")
+        kernels = compile_kernels(self, flags=(*flags, f"-DPLANES={planes}"))
+        kernel = kernels.get_function("blocked_kernel")
+        kernel.max_dynamic_shared_size_bytes = shared
+        weights = self.excitation_weights(mat, sources)
+        args = [None, None, None, None, *self.step_kernel_args(mat), None, weights]
+        args += [np.int32(len(sources)), None, np.int32(len(targets)), *lists, None]
+        slots = (len(args) - 10, len(args) - 7, len(args) - 1)
+        args += [face_mask(self, Dirichlet), *axis_geometry(self, self.step_factors())]
+        grid = (cores[1], cores[0], -(-(self.Nx[0] - 2) // planes))
+        return _blocked(steps, kernel, grid, tile[::-1], shared, args, slots)
 
     def step_kernel_args(self, mat: dict) -> tuple:
         """Material and damping arguments for the finite-difference step kernel."""
