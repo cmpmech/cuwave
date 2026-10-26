@@ -920,16 +920,22 @@ def simulate(
         if um is not None:
             get_signal(u, um, t)
 
-    # several steps a launch where the simulation has a blocked step for this run
+    # several steps a launch where the simulation has a blocked step for this run and
+    # the memory for its second pair of fields
     blocked = None
     if record_every is None and not active():
         blocked = sim.define_blocked_step(mat, source, sensors)
+    if blocked is not None:
+        try:
+            spare = cp.zeros_like(U)
+        except cp.cuda.memory.OutOfMemoryError:
+            blocked = None
     if blocked is not None:
         # whole blocks alternate between U and a second pair, the rest step by step
         S = blocked.steps
         if CHUNK // 2 % S:
             raise ValueError(f"a blocked step of {S} steps must divide CHUNK / 2")
-        pairs = (U, cp.zeros_like(U))
+        pairs = (U, spare)
 
         def blocked_step(t, signal, um=None):
             if t % S == 0:

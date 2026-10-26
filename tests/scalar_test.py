@@ -323,6 +323,21 @@ class MarchedTest(unittest.TestCase):
                 with self.subTest(boundary=boundary, N=N):
                     self._assert_bitwise(*_runs3d(_scalar3d(boundary, N), 3))
 
+    def test_no_memory_for_the_second_pair_steps_plainly(self):
+        sim = _scalar3d(None, 9)
+        source, indicator, sensors = _shot3d(sim, 2)
+        plain = _runs3d(sim, 2)[1]
+        zeros_like = cp.zeros_like
+
+        def full(a, *args, **kwargs):
+            if a.shape == (2, *sim.Nx_padded):
+                raise cp.cuda.memory.OutOfMemoryError(a.nbytes, 0)
+            return zeros_like(a, *args, **kwargs)
+
+        with mock.patch.object(cp, "zeros_like", full):
+            starved = simulate(sim, source, indicator, sensors=sensors)
+        self._assert_bitwise(starved, plain)
+
     def test_a_formed_inertia(self):
         sim = AcousticWave(
             (259, 171, 171),

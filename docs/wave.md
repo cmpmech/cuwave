@@ -15,7 +15,7 @@ a wave simulation is set up as follows:
 	- `fd_step` (spatial discretization)
 	- `bc_step` (modification for boundary conditions)
 	- `excitation_step` (source contribution)
-2. unrolling of the time integration (where kernels are executed at each time step), handed to `march`, the launches of a blocked step included where `define_blocked_step` returns one
+2. unrolling of the time integration (where kernels are executed at each time step), handed to `march`, the launches of a blocked step included where `define_blocked_step` returns one and the second pair of fields it writes into fits in memory
 
 - the `Simulation`class (and its derived versions) collect the simulation setup
 - the `define_[kernel]` prepare the specific kernels
