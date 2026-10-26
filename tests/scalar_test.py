@@ -178,16 +178,17 @@ def _shot(sim, seed):
     return source, _random(sim, seed)[0], sensors
 
 
-def _runs(sim, seed, **blocks):
+def _runs(sim, seed, sensed=True, **blocks):
     """The (field, record) of a run blocked as `blocks` patch, then of the plain run."""
     source, indicator, sensors = _shot(sim, seed)
+    sensors = sensors if sensed else None
     with mock.patch.multiple(scalar, **{"SMALL_BLOCKS": scalar.SMALL_BLOCKS, **blocks}):
         mat = sim.build_materials(indicator)
         assert sim.define_blocked_step(mat, source, sensors) is not None
         blocked = simulate(sim, source, indicator, sensors=sensors)
     with mock.patch.object(type(sim), "define_blocked_step", lambda *a, **k: None):
         plain = simulate(sim, source, indicator, sensors=sensors)
-    return blocked, plain
+    return (blocked, plain) if sensed else ((blocked,), (plain,))
 
 
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
@@ -196,6 +197,10 @@ class BlockedTest(unittest.TestCase):
         self.assertGreater(float(cp.abs(plain[0]).max()), 0.0)
         for a, b in zip(blocked, plain):
             self.assertTrue(bool(cp.array_equal(a, b)))
+
+    def test_a_run_without_sensors(self):
+        sim = _scalar(2, "float32", Dirichlet, N=30)
+        self._assert_bitwise(*_runs(sim, 9, sensed=False))
 
     def test_a_blocked_run_is_the_plain_run_bit_for_bit(self):
         mixed = ((Neumann, Dirichlet), (Dirichlet, Neumann))
@@ -249,12 +254,11 @@ class BlockedTest(unittest.TestCase):
                 mat = each.build_materials(indicator.astype(each.dtype))
                 taken = twice if name == "sensor twice" else sensors
                 self.assertIsNone(each.define_blocked_step(mat, source, taken))
-        large = ScalarWave(
-            (4000, 4000), (0.1, 0.1), 6, 1e-3, (4, 32), wavespeed=1.0, density=1.0
+        # fields L2 serves, past two waves of threads: the plain step's ground
+        middle = ScalarWave(
+            (1024, 1024), (0.1, 0.1), 6, 1e-3, (4, 32), wavespeed=1.0, density=1.0
         )
-        self.assertIsNone(
-            replace(large, space_order=4).define_blocked_step(mat, source, None)
-        )
+        self.assertIsNone(middle.define_blocked_step(mat, source, None))
 
 
 if __name__ == "__main__":

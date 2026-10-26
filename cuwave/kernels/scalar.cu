@@ -6,20 +6,32 @@
 //   USE_STREAM, STREAM_TX
 //   STEPS, TILE0, TILE1, ROWS (2D)
 
-// spatial finite difference stencil for Laplacian, the cell stiffnesses given
-__device__ __forceinline__ real_t flux_divergence_means(
-    const real_t *__restrict__ u1, const int idx, const int s, const real_t uc,
-    const real_t gp, const real_t gm, const real_t factor, const int r) {
+// spatial finite difference stencil for Laplacian, `u(j)` the tap j nodes on
+template <class Taps>
+__device__ __forceinline__ real_t flux_divergence_taps(
+    const Taps &u, const real_t uc, const real_t gp, const real_t gm,
+    const real_t factor, const int r) {
   // rounded as nvcc contracts the plain sums, so every caller agrees bitwise
-  real_t Dp = MUL_RN(OP_W(r, 1), u1[idx + s] - uc); // inner grad
-  real_t Dm = MUL_RN(OP_W(r, 1), uc - u1[idx - s]); // inner grad
+  real_t Dp = u(1) - uc, Dm = uc - u(-1); // inner grad
+  if (STENCIL_RADIUS > 1) { // a weight of one is exact, and an intrinsic stays
+    Dp = MUL_RN(OP_W(r, 1), Dp);
+    Dm = MUL_RN(OP_W(r, 1), Dm);
+  }
 #pragma unroll
   for (int k = 2; k <= STENCIL_RADIUS; ++k)
     if (k <= r) {
-      Dp = FMA_RN(OP_W(r, k), u1[idx + k * s] - u1[idx - (k - 1) * s], Dp);
-      Dm = FMA_RN(OP_W(r, k), u1[idx + (k - 1) * s] - u1[idx - k * s], Dm);
+      Dp = FMA_RN(OP_W(r, k), u(k) - u(1 - k), Dp);
+      Dm = FMA_RN(OP_W(r, k), u(k - 1) - u(-k), Dm);
     }
   return factor * FMA_RN(Dp, gp, -MUL_RN(Dm, gm)); // outer grad
+}
+
+// the same with the taps strided `s` from `idx` in `u1`
+__device__ __forceinline__ real_t flux_divergence_means(
+    const real_t *__restrict__ u1, const int idx, const int s, const real_t uc,
+    const real_t gp, const real_t gm, const real_t factor, const int r) {
+  const auto u = [&](const int j) { return u1[idx + j * s]; };
+  return flux_divergence_taps(u, uc, gp, gm, factor, r);
 }
 
 // spatial finite difference stencil for Laplacian
@@ -410,7 +422,7 @@ __global__ void homogeneous_dirichlet_kernel(real_t *__restrict__ u,
 #define HALO (STEPS * STENCIL_RADIUS)
 #define C0 (TILE0 - 2 * HALO)
 #define C1 (TILE1 - 2 * HALO)
-#define NODES (TILE0 / ROWS) // a thread's nodes along axis 0, ROWS apart
+#define NODES (TILE0 / ROWS) // a thread's consecutive nodes along axis 0
 #define WIDE (TILE1 + 2 * STENCIL_RADIUS) // a tile row with its guard columns
 #define AREA ((TILE0 + 2 * STENCIL_RADIUS) * WIDE)
 #define AT(x, y) (((x) + STENCIL_RADIUS) * WIDE + (y) + STENCIL_RADIUS)
@@ -427,44 +439,42 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
 #endif
     const real_t *__restrict__ signal, const real_t *__restrict__ weights,
     const int num_sources, real_t *__restrict__ record, const int num_sensors,
-    const unsigned *__restrict__ tags, const int t0, const int neumann,
+    const int *__restrict__ source_starts,
+    const unsigned *__restrict__ source_entries,
+    const int *__restrict__ sensor_starts,
+    const unsigned *__restrict__ sensor_entries, const int t0, const int neumann,
     const int dirichlet, const real_t f0, const int N0, const real_t f1,
     const int N1, const int s0) {
-  // u of this step and the next, then the cell stiffness toward +0 and +1
+  // u of this step and the next, each in a guard ring a radius wide
   extern __shared__ real_t shared[];
-  real_t *g0 = shared + 2 * AREA, *g1 = shared + 3 * AREA;
-  const int ty = threadIdx.x, row = threadIdx.y;
+  const int ty = threadIdx.x, x0 = threadIdx.y * NODES;
+  const int tile = blockIdx.y * gridDim.x + blockIdx.x;
   const int lo0 = 1 + blockIdx.y * C0, lo1 = 1 + blockIdx.x * C1;
   const int a1 = lo1 - HALO + ty, k1 = min(max(a1, 1), N1 - 2);
   const bool col = a1 >= 0 && a1 <= N1 - 1;
   const bool core1 = k1 >= lo1 && k1 < lo1 + C1;
 
-  // the thread's nodes, loaded once; a tag holds source + 1 and sensor + 1
-  real_t up[NODES], uc[NODES], mi[NODES];
+  // the thread's nodes, loaded once
+  real_t up[NODES], uc[NODES], mi[NODES], sc[NODES];
 #ifdef USE_DAMPING
   real_t beta[NODES];
 #endif
-  unsigned tag[NODES], stepped = 0, ghost = 0;
+  unsigned stepped = 0, ghost = 0;
 #pragma unroll
   for (int k = 0; k < NODES; ++k) {
-    const int x = row + k * ROWS, a0 = lo0 - HALO + x;
+    const int x = x0 + k, a0 = lo0 - HALO + x;
     const bool inside = col && a0 >= 0 && a0 <= N0 - 1;
     const bool interior = a0 > 0 && a0 < N0 - 1 && a1 > 0 && a1 < N1 - 1;
-    const int idx = a0 * s0 + a1, k0 = min(max(a0, 1), N0 - 2);
+    const int idx = a0 * s0 + a1;
     up[k] = inside ? u0[idx] : 0;
     uc[k] = inside ? u1[idx] : 0;
+    sc[k] = inside ? stiff[idx] : (real_t)1;
     shared[AT(x, ty)] = uc[k];
-    shared[AREA + AT(x, ty)] = inside ? stiff[idx] : (real_t)1;
+    shared[AREA + AT(x, ty)] = sc[k];
     mi[k] = interior ? (derive_inertia ? 1.f / stiff[idx] : minv[idx]) : 0;
 #ifdef USE_DAMPING
     beta[k] = interior ? 0.5f * mi[k] * damping[idx] : 0; // over dt
 #endif
-    // a source acts on a stepped node, a sensor records where its node is core
-    tag[k] = inside ? tags[idx] : 0;
-    if (!interior)
-      tag[k] &= 0xffff0000u;
-    if (!(core1 && k0 >= lo0 && k0 < lo0 + C0))
-      tag[k] &= 0xffffu;
     stepped |= (unsigned)interior << k;
     // a ghost of a face the refill reaches, edges and corners excluded
     const bool along0 = a1 > 0 && a1 < N1 - 1, along1 = a0 > 0 && a0 < N0 - 1;
@@ -477,19 +487,50 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
   }
   const bool refill = __syncthreads_or(ghost);
 
-  // the harmonic means, from the stiffness staged in the second u buffer
+  // the harmonic cell stiffnesses: g0[k] between nodes k - 1 and k of the
+  // thread's run, gm1 and gp1 toward -1 and +1, from the staged stiffness
   const real_t *sk = shared + AREA;
+  real_t g0[NODES + 1], gm1[NODES], gp1[NODES];
+#pragma unroll
+  for (int k = 0; k <= NODES; ++k) {
+    const real_t a = k > 0 ? sc[k - 1] : sk[AT(x0 - 1, ty)];
+    const real_t b = k < NODES ? sc[k] : sk[AT(x0 + NODES, ty)];
+    g0[k] = a * b / (a + b);
+  }
 #pragma unroll
   for (int k = 0; k < NODES; ++k) {
-    const int i = AT(row + k * ROWS, ty);
-    const real_t sc = sk[i], s0p = sk[i + WIDE], s1p = sk[i + 1];
-    g0[i] = sc * s0p / (sc + s0p);
-    g1[i] = sc * s1p / (sc + s1p);
+    const real_t m = sk[AT(x0 + k, ty - 1)], p = sk[AT(x0 + k, ty + 1)];
+    gm1[k] = m * sc[k] / (m + sc[k]);
+    gp1[k] = sc[k] * p / (sc[k] + p);
   }
+  __syncthreads();
+
+  // the tile's sources and sensors as tags, source + 1 and sensor + 1 a half
+  unsigned *tags = (unsigned *)(shared + AREA);
+#pragma unroll
+  for (int k = 0; k < NODES; ++k)
+    tags[AT(x0 + k, ty)] = 0;
+  __syncthreads();
+  const int thread = threadIdx.y * TILE1 + ty;
+  for (int e = source_starts[tile] + thread; e < source_starts[tile + 1];
+       e += TILE1 * ROWS) {
+    const unsigned entry = source_entries[e], local = entry & 0xffff;
+    atomicOr(&tags[AT(local / TILE1, local % TILE1)], (entry >> 16) + 1);
+  }
+  for (int e = sensor_starts[tile] + thread; e < sensor_starts[tile + 1];
+       e += TILE1 * ROWS) {
+    const unsigned entry = sensor_entries[e], local = entry & 0xffff;
+    atomicOr(&tags[AT(local / TILE1, local % TILE1)], (entry >> 16) + 1 << 16);
+  }
+  __syncthreads();
+  unsigned tag[NODES];
+#pragma unroll
+  for (int k = 0; k < NODES; ++k)
+    tag[k] = tags[AT(x0 + k, ty)];
   __syncthreads();
 #pragma unroll
   for (int k = 0; k < NODES; ++k)
-    shared[AREA + AT(row + k * ROWS, ty)] = uc[k];
+    shared[AREA + AT(x0 + k, ty)] = uc[k];
   __syncthreads();
 
   for (int t = 0; t < STEPS; ++t) {
@@ -500,16 +541,21 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
     for (int k = 0; k < NODES; ++k) {
       if (!((stepped >> k) & 1))
         continue;
-      const int x = row + k * ROWS, a0 = lo0 - HALO + x, i = AT(x, ty);
-      const real_t x0 = flux_divergence_means(cu, i, WIDE, uc[k], g0[i],
-                                              g0[i - WIDE], 1, CLOSURE(a0, N0));
-      const real_t x1 = flux_divergence_means(cu, i, 1, uc[k], g1[i], g1[i - 1],
-                                              1, CLOSURE(a1, N1));
+      const int x = x0 + k, a0 = lo0 - HALO + x, i = AT(x, ty);
+      // axis 0 from the thread's own run, past its ends from the tile
+      const auto along0 = [&](const int j) {
+        return k + j >= 0 && k + j < NODES ? uc[k + j] : cu[i + j * WIDE];
+      };
+      const auto along1 = [&](const int j) { return cu[i + j]; };
+      const real_t d0 = flux_divergence_taps(along0, uc[k], g0[k + 1], g0[k],
+                                             1, CLOSURE(a0, N0));
+      const real_t d1 = flux_divergence_taps(along1, uc[k], gp1[k], gm1[k], 1,
+                                             CLOSURE(a1, N1));
       // one axis fused onto the other, as nvcc contracts fd_kernel's sum
 #if STENCIL_RADIUS == 1
-      const real_t laplacian = FMA_RN(f0, x0, MUL_RN(f1, x1));
+      const real_t laplacian = FMA_RN(f0, d0, MUL_RN(f1, d1));
 #else
-      const real_t laplacian = FMA_RN(f1, x1, MUL_RN(f0, x0));
+      const real_t laplacian = FMA_RN(f1, d1, MUL_RN(f0, d0));
 #endif
       // the leapfrog rounded as nvcc compiles fd_kernel's
 #ifdef USE_DAMPING
@@ -524,10 +570,16 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
       const int j = (tag[k] & 0xffffu) - 1;
       if (j >= 0)
         u2 += MUL_RN(weights[j], signal[(t0 + t) * num_sources + j]);
-      up[k] = uc[k];
-      uc[k] = u2;
+      up[k] = u2; // u^(t + 1) in the slot of u^(t - 1), swapped below
       nu[i] = u2;
     }
+#pragma unroll
+    for (int k = 0; k < NODES; ++k)
+      if ((stepped >> k) & 1) {
+        const real_t next = up[k];
+        up[k] = uc[k];
+        uc[k] = next;
+      }
 
     // the boundary refill: a ghost takes its mirror two nodes in, the sign held
     if (refill) {
@@ -535,7 +587,7 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
 #pragma unroll
       for (int k = 0; k < NODES; ++k)
         if ((ghost >> k) & 1) {
-          const int x = row + k * ROWS, a0 = lo0 - HALO + x;
+          const int x = x0 + k, a0 = lo0 - HALO + x;
           const int f = a0 == 0 ? 0 : a0 == N0 - 1 ? 1 : a1 == 0 ? 2 : 3;
           const real_t m = nu[AT(x + 2 * (f == 0) - 2 * (f == 1),
                                  ty + 2 * (f == 2) - 2 * (f == 3))];
@@ -556,7 +608,7 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
     return;
 #pragma unroll
   for (int k = 0; k < NODES; ++k) {
-    const int a0 = lo0 - HALO + row + k * ROWS;
+    const int a0 = lo0 - HALO + x0 + k;
     const int k0 = min(max(a0, 1), N0 - 2);
     if (a0 >= 0 && a0 <= N0 - 1 && k0 >= lo0 && k0 < lo0 + C0) {
       v0[a0 * s0 + a1] = up[k];

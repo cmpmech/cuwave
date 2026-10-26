@@ -37,8 +37,8 @@ contain the finite difference weights:
 ### CLOSURE
 computes the current stencil radius based on the distance `a` to the boundary in the axis direction
 - `a` and `N-1-a` are the distances to the two ghost nodes, so the radius grades **down** towards a wall: the first interior node gets radius 1 (order 2), the deep interior saturates at $R$
-### flux_divergence_means
-the cell-flux divergence of `flux_divergence_axis` along one axis with the two harmonic cell stiffnesses `gp, gm` given, so `blocked_kernel` can compute them once per launch; the cell differences and their difference are rounded by `MUL_RN` and `FMA_RN` exactly as nvcc contracts the plain sums in float32, which is what keeps every kernel inlining it bitwise alike
+### flux_divergence_taps, flux_divergence_means
+the cell-flux divergence of `flux_divergence_axis` along one axis with the two harmonic cell stiffnesses `gp, gm` given, so `blocked_kernel` can compute them once per launch; `flux_divergence_taps` takes the taps from an accessor `u(j)`, the node $j$ away, so they may come from registers, and `flux_divergence_means` reads them strided from an array. The cell differences and their difference are rounded by `MUL_RN` and `FMA_RN` exactly as nvcc contracts the plain sums in float32, which is what keeps every kernel inlining them bitwise alike
 ### flux_divergence_axis
 **aim**
 compute $\nabla\cdot(k\nabla u)$ at $i$  (`idx`)
@@ -153,17 +153,17 @@ as `fd_kernel` without `cells, tiles`, plus `chunk`: the rows of axis 0 a block 
 ### blocked_kernel
 `STEPS` steps of `fd_kernel` between one load and one store of a tile, the excitation, the ghost refill and the record included, bitwise the launches one at a time; 2D and float32 only
 **parallelization**
-a 2D launch of `(TILE1, ROWS)` threads per block, one block per tile of `TILE0` $\times$ `TILE1` nodes; a thread owns `NODES` $=$ `TILE0 / ROWS` nodes of its column, `ROWS` apart along axis 0. Tiles overlap by a halo of `HALO` $=$ `STEPS` $\cdot R$ nodes each side and write back only their core, `C0` $\times$ `C1`
+a 2D launch of `(TILE1, ROWS)` threads per block, one block per tile of `TILE0` $\times$ `TILE1` nodes; a thread owns `NODES` $=$ `TILE0 / ROWS` consecutive nodes of its column. Tiles overlap by a halo of `HALO` $=$ `STEPS` $\cdot R$ nodes each side and write back only their core, `C0` $\times$ `C1`
 **input args**
-`u0, u1`: $u^{t-1}, u^t$; `v0, v1`: the arrays receiving $u^{t+S-1}, u^{t+S}$, never `u0, u1` themselves, since a neighbouring tile still reads its halo there; `stiff, minv, derive_inertia` and under `-DUSE_DAMPING` `damping, dt`: as `fd_kernel`; `signal`: the `(N, num_sources)` record staged by `march`, row $t$ at `t0 + t`; `weights, num_sources`: as `excitation_kernel`; `record, num_sensors`: the `(N, num_sensors)` record; `tags`: per node, source $+1$ in the low 16 bits and sensor $+1$ in the high ones; `t0`: the step the launch starts at; `neumann, dirichlet`: face masks; `f0, N0, f1, N1, s0`: as `fd_kernel`
+`u0, u1`: $u^{t-1}, u^t$; `v0, v1`: the arrays receiving $u^{t+S-1}, u^{t+S}$, never `u0, u1` themselves, since a neighbouring tile still reads its halo there; `stiff, minv, derive_inertia` and under `-DUSE_DAMPING` `damping, dt`: as `fd_kernel`; `signal`: the `(N, num_sources)` record staged by `march`, row $t$ at `t0 + t`; `weights, num_sources`: as `excitation_kernel`; `record, num_sensors`: the `(N, num_sensors)` record; `source_starts, source_entries`: per tile the sources its nodes hold, halo included, as CSR rows of `local node | source << 16`; `sensor_starts, sensor_entries`: the same for the sensors its core records, a ghost sensor at the tile owning the node it clamps to; `t0`: the step the launch starts at; `neumann, dirichlet`: face masks; `f0, N0, f1, N1, s0`: as `fd_kernel`
 **internal args**
-`shared`: $u$ of this step and the next (`cu`, `nu`, swapped every step), then `g0, g1`: the harmonic cell stiffness toward $+$ along each axis, each array with a guard ring $R$ wide; `up, uc, mi, beta, tag`: per owned node in registers; `stepped, ghost`: bit masks of the owned interior and refilled ghost nodes; `refill`: whether the tile holds a ghost, uniform over the block
+`shared`: $u$ of this step and the next (`cu`, `nu`, swapped every step), each with a guard ring $R$ wide; `up, uc, mi, beta, tag`: per owned node in registers, `tag` the source $+1$ and the sensor $+1$ in its two halves; `g0, gm1, gp1`: the harmonic cell stiffnesses of the owned nodes in registers, `g0[k]` the cell between nodes $k-1$ and $k$ of the run; `stepped, ghost`: bit masks of the owned interior and refilled ghost nodes; `refill`: whether the tile holds a ghost, uniform over the block
 **how?**
-- the stiffness is staged in the second $u$ array, turned into `g0, g1` once, and the minus cell of a node read as the plus cell of its neighbour: products and sums commute exactly, so the means are those `flux_divergence_axis` forms
+- the stiffness is staged in the second $u$ array and turned into the cell stiffnesses once; products and sums commute exactly, so they are the means `flux_divergence_axis` forms. The tile's source and sensor lists are then scattered into the same array as tags, read once, and the array refilled with $u^t$
+- the axis-0 taps of a node come from the thread's own registers and only past the ends of its run from the tile, the axis-1 taps from the tile
 - each step reads `cu` and writes `nu`, so one barrier separates the steps; a tile holding a ghost takes a second one, for the ghost to read its mirror two nodes in, the sign held for Dirichlet
 - the edge nodes of a tile read the guard ring and go wrong, one radius deeper every step; after `STEPS` steps the error stops short of the core
-- the laplacian, the update and $eta$'s two divisors $1\mp\beta$ are rounded by `FMA_RN` and `MUL_RN` as nvcc contracts them in `fd_kernel` ($\Delta t\,d/2m$ fused into $1\mp\beta$, one axis fused onto the other), and the source term rounded apart as `excitation_kernel` adds it atomically
-- a sensor records at a node of the core, a ghost sensor at the tile owning the node it clamps to, so every record row is written once
+- the laplacian, the update and $\beta$'s two divisors $1\mp\beta$ are rounded by `FMA_RN` and `MUL_RN` as nvcc contracts them in `fd_kernel` ($\Delta t\,d/2m$ fused into $1\mp\beta$, one axis fused onto the other), and the source term rounded apart as `excitation_kernel` adds it atomically
 
 ### pml_kernel
 **parallelization**

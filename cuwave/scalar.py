@@ -9,6 +9,7 @@ inverse density and inverse bulk modulus between two phases for topology optimiz
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from pathlib import Path
 import cupy as cp
 import cupy.typing as cpt
 import numpy as np
+import numpy.typing as npt
 
 from .boundary import Dirichlet, Neumann, face_mask
 from .wave import (
@@ -37,10 +39,48 @@ from .wave import (
 KERNEL_PATH = Path(__file__).parent / "kernels" / "scalar.cu"
 SENSITIVITY_PATH = Path(__file__).parent / "kernels" / "scalar_sensitivity.cu"
 CHUNK_ROWS = 64  # axis-0 rows one streaming block marches
-SMALL_BLOCKS = (((32, 64), 8, 6), ((32, 64), 8, 3))  # by radius: tile, rows, steps
-LARGE_BLOCKS = (((64, 64), 8, 6), None)  # by radius, for fields spilling out of L2
+SMALL_BLOCKS = (((32, 64), 8, 6), ((32, 64), 8, 4))  # by radius: tile, rows, steps
+LARGE_BLOCKS = (((64, 64), 16, 6), None)  # by radius, for fields spilling out of L2
 STREAM_ORDER = 6  # below it L1 serves the plain step as well as the stream would
 STREAM_BLOCKS = 8  # per multiprocessor the stream needs to fill the device
+
+
+def _tile_lists(
+    points: npt.NDArray[np.int64],
+    owners: npt.NDArray[np.int64],
+    tile: tuple[int, int],
+    core: list[int],
+    halo: int,
+    cores: list[int],
+    covering: bool,
+) -> list[cpt.NDArray]:
+    """The (2, num) `points` each blocked tile holds: CSR row starts, entries `local | j << 16`.
+
+    With `covering` every tile whose nodes, halo included, take a point holds it, else
+    the one tile whose core holds its `owners` node.
+    """
+    j = np.arange(points.shape[1])
+    hits = []
+    if covering:
+        # tiles starting at 1 + b C - halo hold rows up to tile - 1 past their start
+        low = [(points[d] - 1 + halo - tile[d]) // core[d] + 1 for d in (0, 1)]
+        high = [(points[d] - 1 + halo) // core[d] for d in (0, 1)]
+        spans = [-(-tile[d] // core[d]) for d in (0, 1)]
+        for o0, o1 in itertools.product(range(spans[0]), range(spans[1])):
+            b = (low[0] + o0, low[1] + o1)
+            ok = (b[0] <= high[0]) & (b[1] <= high[1]) & (b[0] >= 0) & (b[1] >= 0)
+            ok &= (b[0] < cores[0]) & (b[1] < cores[1])
+            hits.append((b[0][ok], b[1][ok], points[0][ok], points[1][ok], j[ok]))
+    else:
+        b = [(owners[d] - 1) // core[d] for d in (0, 1)]
+        hits.append((b[0], b[1], points[0], points[1], j))
+    b0, b1, a0, a1, index = (np.concatenate(h) for h in zip(*hits))
+    local = (a0 - 1 - b0 * core[0] + halo) * tile[1] + a1 - 1 - b1 * core[1] + halo
+    ids = b0 * cores[1] + b1
+    order = np.argsort(ids, kind="stable")
+    entries = (local | index << 16)[order].astype(np.uint32)
+    starts = np.searchsorted(ids[order], np.arange(cores[0] * cores[1] + 1))
+    return [cp.asarray(starts, dtype=cp.int32), cp.asarray(entries)]
 
 
 def split_grid_block(sim: Simulation) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -232,7 +272,8 @@ class PressureWave(Simulation):
         core: bitwise the step, excitation, refill and record launched one by one. Taken
         where launches or DRAM bound the plain step (`SMALL_BLOCKS`, `LARGE_BLOCKS`), else
         None, as in 3D, in float64, above order 4, with a pml, a domain mask, a condition
-        other than Neumann or Dirichlet, or two sources or sensors on one node.
+        other than Neumann or Dirichlet, a source off the interior, or two sources or
+        sensors on one node.
         """
         conditions = {c for pair in self.boundary for c in pair}
         radius = self.space_order // 2
@@ -258,28 +299,37 @@ class PressureWave(Simulation):
             block = None
         if block is None:
             return None
+        tile, rows, steps = block
+        halo = steps * radius
+        core = [t - 2 * halo for t in tile]
+        cores = [-(-(n - 2) // c) for n, c in zip(self.Nx, core)]
         sources = flatten_indices(self, source.position)
         targets = flatten_indices(self, sensors) if sensors is not None else sources[:0]
-        # a tag holds source + 1 in its low half and sensor + 1 in its high half
-        tags = cp.zeros(math.prod(self.Nx_padded), dtype=cp.uint32)
-        for index, shift in ((sources, 0), (targets, 16)):
-            if len(index) >= 2**16 or len(cp.unique(index)) != len(index):
+        flat = [index.get() for index in (sources, targets)]
+        points = [np.stack(np.divmod(index, self.Nx_padded[1])) for index in flat]
+        upper = np.asarray(self.Nx)[:, None] - 2
+        if not ((points[0] >= 1) & (points[0] <= upper)).all():
+            return None
+        for index in flat:
+            if len(index) >= 2**16 or len(np.unique(index)) != len(index):
                 return None
-            tags[index] |= cp.arange(1, len(index) + 1, dtype=cp.uint32) << shift
-        tile, rows, steps = block
+        # a sensor recorded by the tile whose core holds the node a ghost clamps to
+        clamped = np.clip(points[1], 1, upper)
+        lists = [
+            *_tile_lists(points[0], points[0], tile, core, halo, cores, covering=True),
+            *_tile_lists(points[1], clamped, tile, core, halo, cores, covering=False),
+        ]
         flags = (f"-DSTEPS={steps}", f"-DTILE0={tile[0]}", f"-DTILE1={tile[1]}")
         kernels = compile_kernels(self, flags=(*flags, f"-DROWS={rows}"))
         kernel = kernels.get_function("blocked_kernel")
-        # u twice and two cell stiffnesses of the tile, each in a guard ring a radius wide
-        shared = 4 * (tile[0] + 2 * radius) * (tile[1] + 2 * radius) * 4
+        # u twice, each in a guard ring a radius wide
+        shared = 2 * (tile[0] + 2 * radius) * (tile[1] + 2 * radius) * 4
         kernel.max_dynamic_shared_size_bytes = shared
-        halo = steps * radius
-        cores = [-(-(n - 2) // (t - 2 * halo)) for n, t in zip(self.Nx, tile)]
         weights = self.excitation_weights(mat, sources)
         args = [None, None, None, None, *self.step_kernel_args(mat), None, weights]
         at_signal = len(args) - 2
-        args += [np.int32(len(sources)), None, np.int32(len(targets)), tags, None]
-        at_record, at_t = len(args) - 4, len(args) - 1
+        args += [np.int32(len(sources)), None, np.int32(len(targets)), *lists, None]
+        at_record, at_t = len(args) - 7, len(args) - 1
         args += [face_mask(self, Neumann), face_mask(self, Dirichlet)]
         args += axis_geometry(self, self.step_factors())
         dummy = cp.zeros(1, dtype=self.dtype)
