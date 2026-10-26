@@ -450,8 +450,6 @@ class VariantTest(unittest.TestCase):
 # ------------------------------- transducers and validation --------------------------
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class PmlTest(unittest.TestCase):
-    FREE_TOP = ((Clamped, Clamped), (Traction, Clamped))
-
     def test_a_long_run_decays_with_a_free_surface_crossing_the_layer(self):
         dx = (1.0 / 100,) * 2
         sim = ElasticWave(
@@ -463,7 +461,7 @@ class PmlTest(unittest.TestCase):
             density=1.0,
             wavespeed_p=1.0,
             wavespeed_s=0.6,
-            boundary=self.FREE_TOP,
+            boundary=((Clamped, Clamped), (Traction, Clamped)),
             pml=Pml(14, 1.0, frequency=8.0, faces=(0, 1, 3)),
         )
         t = np.arange(sim.N) * sim.dt
@@ -485,7 +483,8 @@ class PmlTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _sim((40, 40), pml=Pml(6, CP, frequency=2.0))
         layer = Pml(6, CP, frequency=2.0, faces=(0, 1, 3))
-        _sim((40, 40), boundary=self.FREE_TOP, pml=layer)
+        free_top = ((Clamped, Clamped), (Traction, Clamped))
+        _sim((40, 40), boundary=free_top, pml=layer)
 
 
 @unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")

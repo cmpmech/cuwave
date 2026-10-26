@@ -457,8 +457,6 @@ class ValidationTest(unittest.TestCase):
 
 @unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class PmlTest(unittest.TestCase):
-    FREE_TOP = ((Clamped, Clamped), (Traction, Clamped))
-
     def test_a_long_run_decays_through_an_orthotropic_layer_and_a_free_surface(self):
         dx = (1.0 / 100,) * 2
         speed = np.sqrt(20.0)
@@ -472,7 +470,7 @@ class PmlTest(unittest.TestCase):
             wavespeed_p=1.0,
             wavespeed_s=0.6,
             C=ORTHOTROPIC,
-            boundary=self.FREE_TOP,
+            boundary=((Clamped, Clamped), (Traction, Clamped)),
             pml=Pml(14, speed, frequency=2.0, faces=(0, 1, 3)),
         )
         t = np.arange(sim.N) * sim.dt
@@ -494,7 +492,8 @@ class PmlTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _sim((40, 40), pml=Pml(6, CP, frequency=2.0))
         layer = Pml(6, CP, frequency=2.0, faces=(0, 1, 3))
-        _sim((40, 40), boundary=self.FREE_TOP, pml=layer)
+        free_top = ((Clamped, Clamped), (Traction, Clamped))
+        _sim((40, 40), boundary=free_top, pml=layer)
 
     def test_a_backward_wave_is_refused_only_along_its_axis(self):
         layer = dict(boundary=Clamped, C=BACKWARD)

@@ -65,6 +65,8 @@ from dataclasses import replace
 
 import numpy as np
 
+from cuwave.sensitivity import checkpoint_schedule
+
 try:
     import cupy as cp
 
@@ -88,7 +90,6 @@ if HAS_CUDA:
     from cuwave.maxwell import DielectricWave
     from cuwave.scalar import AcousticWave, ScalarWave
     from cuwave.sensitivity import (
-        checkpoint_schedule,
         l2_misfit,
         reconstruction_nodes,
         reconstruction_sensitivity,
@@ -533,8 +534,6 @@ class GradientTest(unittest.TestCase):
 
 @unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class PmlTest(unittest.TestCase):
-    MIXED = ((Dirichlet, Neumann), (Neumann, Dirichlet))
-
     def _rows(self, sim, rows):
         # a vector unknown takes the component row first, one per column
         if sim.ncomp > 1:
@@ -566,7 +565,8 @@ class PmlTest(unittest.TestCase):
 
     def _cases(self):
         yield "order 2", _matched()
-        yield "order 4 mixed", _matched(4, boundary=self.MIXED, faces=(0, 3))
+        mixed = ((Dirichlet, Neumann), (Neumann, Dirichlet))
+        yield "order 4 mixed", _matched(4, boundary=mixed, faces=(0, 3))
         yield "order 8 Dirichlet", _matched(8, boundary=Dirichlet)
         yield "acoustic order 4", _matched(4, kind="acoustic")
         yield "3D order 4", _matched(4, boundary=Dirichlet, ndim=3, N=100)
