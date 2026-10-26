@@ -54,6 +54,12 @@ __device__ __forceinline__ int rad_half(const int a, const int N) {
   return min(STENCIL_RADIUS, min(a, N - 2 - a));
 }
 
+// the node whose tile writes `a` back in a blocked step: a ghost goes with its
+// mirror, the one tile where the mirror stays valid
+__device__ __forceinline__ int owner(const int a, const int N) {
+  return a == 0 ? 2 : a == N - 1 ? N - 3 : a;
+}
+
 __device__ __forceinline__ bool clamped_face(const int clamped, const int d,
                                              const int side) {
   return (clamped >> (2 * d + side)) & 1;

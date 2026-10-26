@@ -13,6 +13,7 @@ The forward kernels of the staggered [elastic](elastic.md) equation: one pass fo
 | `STENCIL_RADIUS` | `space_order // 2` | taps per staggered difference, prepended by [stencils](stencils.md) |
 | `STAG_COEFFS` | `staggered_weights` | the graded coefficient table, prepended alongside |
 | `TILE0`, `TILE1`, `TILE2` | `FUSED_TILE`, by `ElasticWave.define_step` without a pml where the fields spill out of L2 and the ring at most doubles the tile | compiles `fused_kernel`, the tile one block steps |
+| `STEPS`, `TILE0`, `TILE1`, `ROWS` | `BLOCKED`, by `ElasticWave.define_blocked_step` in 2D without a pml on a small grid | compiles `blocked_kernel` instead of `fused_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
 
 `NPAIRS` is $\textrm{ndim}\left(\textrm{ndim}-1\right)/2$ and `NVOIGT` is `NDIM + NPAIRS`, the stress components held back to back in the `sigma` scratch. `SG_W(r, k)` reads coefficient $k$ of the radius-$r$ row from `__constant__` memory, collapsing to 1 at `STENCIL_RADIUS` 1. `PAIR_ROW(k, l)` maps an axis pair onto its Voigt row, `NDIM + 3 - k - l` in 3D and 2 in 2D
 
@@ -207,6 +208,20 @@ one block per tile of `TILE0` $\times$ `TILE1` ($\times$ `TILE2`) nodes, a threa
 **how?**
 - the ring holds every stress the divergence of a tile node reaches, so a block needs nothing another block forms; the ring's stresses are formed twice, once by each block that reads them
 - the stresses never travel through memory: a step reads $u^{t-1}$, $u^{t-2}$ and the design and writes $u^t$, against the pair's extra write and read of every stress, which halves the traffic where DRAM bounds the step. While the scratch fits in L2 the pair stays as fast or faster, and where the ring more than doubles the stresses a block forms (3D above order 2) their recomputation costs more than the traffic saved, so `define_step` keeps the pair there
+
+### blocked_kernel
+`STEPS` steps of `stress_kernel`, `fd_kernel`, the excitation and the record between one load and one store of a tile, bitwise the launches one at a time; 2D, float32, without a pml
+**parallelization**
+a 2D launch of `(TILE1, ROWS)` threads per block, one block per tile of `TILE0` $\times$ `TILE1` nodes; a thread owns `NODES` $=$ `TILE0 / ROWS` consecutive nodes of its column. Tiles overlap by a halo of `HALO` $=$ `STEPS` $\cdot(2R-1)$ nodes each side, the reach of a strain and a divergence, and write back only their core, `C0` $\times$ `C1`
+**input args**
+`u0, u1`: $u^{t-1}, u^t$, both components; `v0, v1`: the arrays receiving $u^{t+S-1}, u^{t+S}$; `gamma, lam, mu`: as `stress_kernel`; `rho` and under `-DUSE_DAMPING` `damping, dt`: as `fd_kernel`; `signal, weights, num_sources, record, num_sensors, t0`: as the scalar `blocked_kernel`; `source_starts, source_entries`, `sensor_starts, sensor_entries`: per tile the sources its nodes hold, halo included, and the sensors its core records, as CSR rows of `component node | point << 16`, the node counted once per component before it; `clamped, cs`: as `fd_kernel`; `e0, e1`: $1/\Delta x_d$; `f0, N0, f1, N1, s0`: as `fd_kernel`
+**internal args**
+`su, ss, sg`: both components of $u$, the three stresses and the design in shared memory, each with a guard ring $R$ wide, read by `stress_point`, `nodal_force` and `point_minv` through the tile strides `T` exactly as they read the global arrays; `up, uc, mi, beta, tag`: per owned node and component in registers; `inner, moving`: bit masks of the owned interior nodes and of the components the update moves
+**how?**
+- per step the stresses of the tile go to shared memory, a barrier, then the update of both components, a barrier; a component the update skips (its own axis' staggered ghost) and every non-interior node keep their value of two steps back, as the plain buffers do
+- the edge nodes of a tile read the guard ring and go wrong, one reach deeper every step; after `STEPS` steps the error stops short of the core
+- the damped update is rounded as nvcc compiles `fd_kernel`'s, $\Delta t\,\beta$ fused into $1\mp\beta$ with $\beta$ held over $\Delta t$, and the source term rounded apart as `excitation_kernel` adds it
+- a block steps a node a thread: on the small grids it serves, a step is bound by the latency of one tile's stresses and update, which several nodes a thread would serialize
 
 ### excitation_kernel
 From the shared prelude, so this file does not carry it; see [cuda_scalar](cuda_scalar.md). A vector source is `NDIM` entries of `lin_index`, one per component, at `d * cs + idx`, so the `atomicAdd` covers a source and a sensor landing on the same point and component

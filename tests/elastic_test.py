@@ -12,6 +12,10 @@ couple diagonal neighbours, so the strip of a layer lining both axes needs its c
 pair bit for bit: it recomputes the stresses of a ring around each tile, so a ring too
 narrow or a wall term read off the wrong tile would show at once.
 
+`BlockedTest` pins the 2D step a small grid advances several steps a launch to the pair,
+the excitation and the record launched one by one, bit for bit, over orders, walls,
+damping, step counts and a grid whose last tile core holds one node.
+
 `PmlTest` pins the two conditions the elastic pml is only stable under, both refused
 when broken: the CFS shift, without which the cross terms grow a static mode, and a
 clamped wall behind the layer, since a traction wall there holds a growing surface wave.
@@ -21,6 +25,7 @@ layer has to decay rather than grow.
 
 import unittest
 from dataclasses import replace
+from unittest import mock
 
 import numpy as np
 
@@ -32,6 +37,7 @@ except Exception:
     HAS_CUDA = False
 
 if HAS_CUDA:
+    from cuwave import elastic
     from cuwave.boundary import Clamped, Pml, Traction, pad_for_sponge, sponge
     from cuwave.elastic import ElasticWave
     from cuwave.scalar import ScalarWave
@@ -487,6 +493,67 @@ class FusedTest(unittest.TestCase):
                 b = fused(u0, u1, cp.zeros_like(u0))
                 self.assertGreater(float(cp.abs(a).max()), 0.0)
                 self.assertTrue(bool(cp.array_equal(a, b)))
+
+
+def _blocked_runs(sim, seed, blocks=None):
+    """The (field, record) of a run blocked as `blocks` patch, then of the pair's run."""
+    rng = np.random.default_rng(seed)
+    gamma = cp.asarray(0.25 + 0.5 * rng.random(sim.Nx_padded), dtype=sim.dtype)
+    coords = [[0.3, 0.4], [0.05, 0.9], [0.9, 0.06]]
+    signal = rng.standard_normal((sim.N, 3))
+    source = point_source(sim, coords, signal, direction=[0.6, 0.8])
+    n = sim.Nx
+    rows = [[0, 1, 1], [1, 2, 3], [0, n[0] - 3, 5], [1, 9, n[1] - 2], [0, 21, 22]]
+    rows += [[1, 22, 23]]
+    sensors = cp.array(np.array(rows).T, dtype=cp.int32)
+    candidates = elastic.BLOCKED if blocks is None else blocks
+    with mock.patch.multiple(elastic, BLOCKED=candidates, BLOCKED_WAVES=(99, 99)):
+        mat = sim.build_materials(gamma)
+        assert sim.define_blocked_step(mat, source, sensors) is not None
+        blocked = simulate(sim, source, gamma, sensors=sensors)
+    with mock.patch.object(ElasticWave, "define_blocked_step", lambda *a, **k: None):
+        plain = simulate(sim, source, gamma, sensors=sensors)
+    return blocked, plain
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class BlockedTest(unittest.TestCase):
+    def _assert_bitwise(self, blocked, plain):
+        self.assertGreater(float(cp.abs(plain[0]).max()), 0.0)
+        for a, b in zip(blocked, plain):
+            self.assertTrue(bool(cp.array_equal(a, b)))
+
+    def test_a_blocked_run_is_the_pair_bit_for_bit(self):
+        mixed = ((Traction, Clamped), (Clamped, Traction))
+        for order in (2, 4):
+            for boundary in (None, Clamped, mixed):
+                for damped in (False, True):
+                    for N in (3, 40):
+                        with self.subTest(order=order, b=boundary, damped=damped, N=N):
+                            sim = _sim((70, 57), N, "float32", order, boundary=boundary)
+                            if damped:
+                                rho = cp.ones(sim.Nx_padded, dtype=sim.dtype)
+                                sim = replace(sim, damping=sponge(sim, rho, 9, 0.3))
+                            self._assert_bitwise(*_blocked_runs(sim, order))
+
+    def test_every_tile_and_step_count(self):
+        blocks = (
+            ((32, 32), 32, 6),
+            ((32, 32), 32, 3),
+            ((32, 64), 8, 4),
+            ((32, 32), 16, 2),
+        )
+        for order, block in [(o, b) for o in (2, 4) for b in blocks]:
+            if min(block[0]) - 2 * block[2] * (order - 1) < 8:
+                continue
+            with self.subTest(order=order, block=block):
+                sim = _sim((70, 57), 30, "float32", order, boundary=Clamped)
+                self._assert_bitwise(*_blocked_runs(sim, 1, ((block,),) * 2))
+
+    def test_a_last_core_of_one_node(self):
+        # cores of 24: each axis's last core holds the node beside the ghost alone
+        sim = _sim((99, 51), 30, "float32", 2)
+        self._assert_bitwise(*_blocked_runs(sim, 2, ((((32, 32), 32, 4),),) * 2))
 
 
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")

@@ -4,6 +4,7 @@
 //   USE_DAMPING
 //   USE_PML
 //   TILE0, TILE1, TILE2 (no pml): the fused step's tile
+//   STEPS, TILE0, TILE1, ROWS (2D, no pml): the blocked step's
 
 #ifdef USE_PML
 // the slowest axis' blocks alternately from either end, so the slabs there run
@@ -665,7 +666,7 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
 #endif
 }
 
-#if NDIM >= 2 && defined(TILE0) && !defined(USE_PML)
+#if NDIM >= 2 && defined(TILE0) && !defined(USE_PML) && !defined(STEPS)
 // ------------------------------------------------------------------------------------
 // the stresses of the block's tile and a ring a stencil radius wide around it
 #define WIDE (TILE1 + 2 * STENCIL_RADIUS)
@@ -766,6 +767,194 @@ __global__ void __launch_bounds__(THREADS)
 #else
     u2[n] = -u0[n] + 2.f * u1[n] + mi * force;
 #endif
+  }
+}
+#endif
+
+#if NDIM == 2 && defined(STEPS) && !defined(USE_PML)
+// ------------------------------------------------------------------------------------
+// the core a tile writes back, its halo STEPS strain-divergence reaches wide
+#define HALO (STEPS * (2 * STENCIL_RADIUS - 1))
+#define C0 (TILE0 - 2 * HALO)
+#define C1 (TILE1 - 2 * HALO)
+#define NODES (TILE0 / ROWS) // a thread's consecutive nodes along axis 0
+#define WIDE (TILE1 + 2 * STENCIL_RADIUS) // a tile row with its guard columns
+#define AREA ((TILE0 + 2 * STENCIL_RADIUS) * WIDE)
+#define AT(x, y) (((x) + STENCIL_RADIUS) * WIDE + (y) + STENCIL_RADIUS)
+
+// advance a tile STEPS steps between one load and one store: the stresses, the
+// update, the excitation and the record, bitwise the plain launches
+__global__ void __launch_bounds__(TILE1 *ROWS)
+    blocked_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
+                   real_t *__restrict__ v0, real_t *__restrict__ v1,
+                   const real_t *__restrict__ gamma, const real_t lam,
+                   const real_t mu, const real_t rho,
+#ifdef USE_DAMPING
+                   const real_t *__restrict__ damping, const real_t dt,
+#endif
+                   const real_t *__restrict__ signal,
+                   const real_t *__restrict__ weights, const int num_sources,
+                   real_t *__restrict__ record, const int num_sensors,
+                   const int *__restrict__ source_starts,
+                   const unsigned *__restrict__ source_entries,
+                   const int *__restrict__ sensor_starts,
+                   const unsigned *__restrict__ sensor_entries, const int t0,
+                   const int clamped, const int cs, const real_t e0,
+                   const real_t e1, const real_t f0, const int N0,
+                   const real_t f1, const int N1, const int s0) {
+  // both components of u, the stresses and the design, each in a guard ring
+  extern __shared__ real_t shared[];
+  real_t *su = shared, *ss = shared + 2 * AREA, *sg = shared + 5 * AREA;
+  const int ty = threadIdx.x, x0 = threadIdx.y * NODES;
+  const int thread = threadIdx.y * TILE1 + ty;
+  const int tile = blockIdx.y * gridDim.x + blockIdx.x;
+  const int lo0 = 1 + blockIdx.y * C0, lo1 = 1 + blockIdx.x * C1;
+  const int a1 = lo1 - HALO + ty, k1 = owner(a1, N1);
+  const bool col = a1 >= 0 && a1 <= N1 - 1;
+  const bool core1 = k1 >= lo1 && k1 < lo1 + C1;
+  const real_t E[2] = {e0, e1}, F[2] = {f0, f1};
+  const int T[2] = {WIDE, 1}, GS[2] = {s0, 1}, NN[2] = {N0, N1};
+  for (int e = thread; e < 6 * AREA; e += TILE1 * ROWS)
+    shared[e] = 0;
+  __syncthreads();
+
+  // the thread's nodes, loaded once: u twice, 1 / m and beta per component
+  real_t up[NODES][2], uc[NODES][2], mi[NODES][2];
+#ifdef USE_DAMPING
+  real_t beta[NODES][2];
+#endif
+  unsigned inner = 0, moving = 0; // bit k: an interior node; 2 k + c: c steps
+#pragma unroll
+  for (int k = 0; k < NODES; ++k) {
+    const int x = x0 + k, a0 = lo0 - HALO + x, idx = a0 * s0 + a1;
+    const bool inside = col && a0 >= 0 && a0 <= N0 - 1;
+    const bool interior = a0 > 0 && a0 < N0 - 1 && a1 > 0 && a1 < N1 - 1;
+    const int A[2] = {a0, a1};
+    const bool deep = deep_node(A, NN);
+    sg[AT(x, ty)] = inside ? gamma[idx] : (real_t)1;
+    inner |= (unsigned)interior << k;
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+      up[k][c] = inside ? u0[c * cs + idx] : 0;
+      uc[k][c] = inside ? u1[c * cs + idx] : 0;
+      su[c * AREA + AT(x, ty)] = uc[k][c];
+      const bool steps = interior && A[c] <= NN[c] - 3;
+      moving |= (unsigned)steps << (2 * k + c);
+      mi[k][c] = !steps ? (real_t)0
+                 : deep
+                     ? point_minv<true>(gamma, idx, c, A, GS, NN, rho, clamped)
+                     : point_minv(gamma, idx, c, A, GS, NN, rho, clamped);
+#ifdef USE_DAMPING
+      beta[k][c] = steps ? 0.5f * mi[k][c] * damping[idx] : 0; // over dt
+#endif
+    }
+  }
+  __syncthreads();
+
+  // the tile's sources and sensors as tags in the stress planes, source + 1 and
+  // sensor + 1 a half, the component in the entry's local node
+  unsigned *tags = (unsigned *)ss;
+  for (int e = source_starts[tile] + thread; e < source_starts[tile + 1];
+       e += TILE1 * ROWS) {
+    const unsigned entry = source_entries[e], local = entry & 0xffff;
+    const int c = local / (TILE0 * TILE1), at = local % (TILE0 * TILE1);
+    atomicOr(&tags[c * AREA + AT(at / TILE1, at % TILE1)], (entry >> 16) + 1);
+  }
+  for (int e = sensor_starts[tile] + thread; e < sensor_starts[tile + 1];
+       e += TILE1 * ROWS) {
+    const unsigned entry = sensor_entries[e], local = entry & 0xffff;
+    const int c = local / (TILE0 * TILE1), at = local % (TILE0 * TILE1);
+    atomicOr(&tags[c * AREA + AT(at / TILE1, at % TILE1)],
+             (entry >> 16) + 1 << 16);
+  }
+  __syncthreads();
+  unsigned tag[NODES][2];
+#pragma unroll
+  for (int k = 0; k < NODES; ++k) {
+    tag[k][0] = tags[AT(x0 + k, ty)];
+    tag[k][1] = tags[AREA + AT(x0 + k, ty)];
+  }
+  __syncthreads();
+
+  for (int t = 0; t < STEPS; ++t) {
+    // stress_kernel's nodes, the tile edge forming garbage that never reaches
+    // the core
+#pragma unroll
+    for (int k = 0; k < NODES; ++k) {
+      const int x = x0 + k, a0 = lo0 - HALO + x;
+      const int A[2] = {a0, a1};
+      real_t sig[NVOIGT];
+      if ((inner >> k) & 1) {
+        if (deep_node(A, NN))
+          stress_point<true>(su, sg, AT(x, ty), AREA, A, T, NN, E, lam, mu,
+                             clamped, sig);
+        else
+          stress_point(su, sg, AT(x, ty), AREA, A, T, NN, E, lam, mu, clamped,
+                       sig);
+      } else {
+#pragma unroll
+        for (int v = 0; v < NVOIGT; ++v)
+          sig[v] = (real_t)0;
+      }
+#pragma unroll
+      for (int v = 0; v < NVOIGT; ++v)
+        ss[v * AREA + AT(x, ty)] = sig[v];
+    }
+    __syncthreads();
+
+    // fd_kernel's update and the excitation; what nothing steps keeps its
+    // value of two steps back, as the plain buffers do
+#pragma unroll
+    for (int k = 0; k < NODES; ++k) {
+      const int x = x0 + k, a0 = lo0 - HALO + x;
+      const int A[2] = {a0, a1};
+      const bool deep = deep_node(A, NN);
+#pragma unroll
+      for (int c = 0; c < 2; ++c) {
+        real_t next = up[k][c];
+        if ((moving >> (2 * k + c)) & 1) {
+          const real_t force =
+              deep ? nodal_force<true>(ss, AT(x, ty), AREA, T, c, A, NN, F,
+                                       clamped)
+                   : nodal_force(ss, AT(x, ty), AREA, T, c, A, NN, F, clamped);
+#ifdef USE_DAMPING
+          // rounded as nvcc compiles fd_kernel's, dt beta fused into 1 -+ beta
+          next = FMA_RN(mi[k][c], force,
+                        FMA_RN(-up[k][c], FMA_RN(-dt, beta[k][c], 1.f),
+                               2.f * uc[k][c])) /
+                 FMA_RN(dt, beta[k][c], 1.f);
+#else
+          next = -up[k][c] + 2.f * uc[k][c] + mi[k][c] * force;
+#endif
+          const int j = (tag[k][c] & 0xffffu) - 1;
+          if (j >= 0)
+            next +=
+                MUL_RN(weights[j], signal[(size_t)(t0 + t) * num_sources + j]);
+        }
+        up[k][c] = uc[k][c];
+        uc[k][c] = next;
+        su[c * AREA + AT(x, ty)] = next;
+        if (tag[k][c] >> 16)
+          record[(size_t)(t0 + t) * num_sensors + (tag[k][c] >> 16) - 1] = next;
+      }
+    }
+    __syncthreads();
+  }
+
+  // write back the core, each ghost with its mirror's tile
+  if (!col || !core1)
+    return;
+#pragma unroll
+  for (int k = 0; k < NODES; ++k) {
+    const int a0 = lo0 - HALO + x0 + k;
+    const int k0 = owner(a0, N0);
+    if (a0 >= 0 && a0 <= N0 - 1 && k0 >= lo0 && k0 < lo0 + C0) {
+#pragma unroll
+      for (int c = 0; c < 2; ++c) {
+        v0[c * cs + a0 * s0 + a1] = up[k][c];
+        v1[c * cs + a0 * s0 + a1] = uc[k][c];
+      }
+    }
   }
 }
 #endif

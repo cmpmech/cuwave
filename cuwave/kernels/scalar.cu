@@ -418,11 +418,6 @@ __global__ void homogeneous_dirichlet_kernel(real_t *__restrict__ u,
 }
 
 #ifdef STEPS
-// the node whose tile writes `a` back: a ghost goes with its mirror
-__device__ __forceinline__ int owner(const int a, const int N) {
-  return a == 0 ? 2 : a == N - 1 ? N - 3 : a;
-}
-
 #if NDIM == 2
 // ------------------------------------------------------------------------------------
 // the core a tile writes back, its halo STEPS stencil radii wide

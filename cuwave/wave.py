@@ -151,6 +151,141 @@ class Blocked(NamedTuple):
     step: Callable
 
 
+def tile_counts(Nx: tuple[int, ...], tile: tuple[int, int], halo: int) -> list[int]:
+    """Tiles per axis whose cores, `tile` less `halo` each side, cover the interior."""
+    return [-(-(n - 2) // (t - 2 * halo)) for n, t in zip(Nx, tile)]
+
+
+class TileHits(NamedTuple):
+    """The (tile, point) pairs a blocked step lists, over the two tiled axes."""
+
+    tiles: npt.NDArray[np.int64]  # (2, hits) the tile per axis
+    nodes: npt.NDArray[np.int64]  # (2, hits) the point's node per axis
+    j: npt.NDArray[np.int64]  # (hits,) the point's column among the points
+
+
+def covering_hits(
+    points: npt.NDArray[np.int64],
+    tile: tuple[int, int],
+    core: list[int],
+    halo: int,
+    cores: list[int],
+) -> TileHits:
+    """Every tile whose nodes, halo included, take one of the (2, num) `points`.
+
+    Args:
+        points: (2, num) grid indices on the tiled axes.
+        tile: nodes of a tile per axis, halo included.
+        core: nodes of a tile's core per axis.
+        halo: nodes each side between a tile's edge and its core.
+        cores: tiles per axis.
+    """
+    j = np.arange(points.shape[1])
+    # tiles starting at 1 + b C - halo hold rows up to tile - 1 past their start
+    low = [(points[d] - 1 + halo - tile[d]) // core[d] + 1 for d in (0, 1)]
+    high = [(points[d] - 1 + halo) // core[d] for d in (0, 1)]
+    spans = [-(-tile[d] // core[d]) for d in (0, 1)]
+    hits = []
+    for o0, o1 in itertools.product(range(spans[0]), range(spans[1])):
+        b = (low[0] + o0, low[1] + o1)
+        ok = (b[0] <= high[0]) & (b[1] <= high[1]) & (b[0] >= 0) & (b[1] >= 0)
+        ok &= (b[0] < cores[0]) & (b[1] < cores[1])
+        hits.append((np.stack([b[0][ok], b[1][ok]]), points[:, ok], j[ok]))
+    return TileHits(*(np.concatenate(h, axis=-1) for h in zip(*hits)))
+
+
+def owner_hits(
+    points: npt.NDArray[np.int64], owners: npt.NDArray[np.int64], core: list[int]
+) -> TileHits:
+    """The one tile whose core holds each of the (2, num) `owners` nodes, for `points`."""
+    tiles = (owners - 1) // np.asarray(core)[:, None]
+    return TileHits(tiles, points, np.arange(points.shape[1]))
+
+
+def column_keys(
+    hits: TileHits, tile: tuple[int, int], core: list[int], halo: int, cores: list[int]
+) -> npt.NDArray[np.int64]:
+    """Each hit's tile, row-major over `cores`, times the tile's nodes plus its node in it."""
+    (b0, b1), (a0, a1) = hits.tiles, hits.nodes
+    local = (a0 - 1 - b0 * core[0] + halo) * tile[1] + a1 - 1 - b1 * core[1] + halo
+    return (b0 * cores[1] + b1) * (tile[0] * tile[1]) + local
+
+
+def tile_lists(
+    hits: TileHits,
+    tile: tuple[int, int],
+    core: list[int],
+    halo: int,
+    cores: list[int],
+    layers: npt.NDArray[np.int64] | None = None,
+) -> list[cpt.NDArray]:
+    """The points each 2D blocked tile holds: CSR row starts, entries `local | j << 16`.
+
+    Args:
+        hits: the tiles holding each point.
+        tile: nodes of a tile per axis, halo included.
+        core: nodes of a tile's core per axis.
+        halo: nodes each side between a tile's edge and its core.
+        cores: tiles per axis.
+        layers: (num,) a component per point, `local` counting the tile's nodes
+            once per component before it, or None for one component.
+    """
+    keys = column_keys(hits, tile, core, halo, cores)
+    ids, local = np.divmod(keys, tile[0] * tile[1])
+    if layers is not None:
+        local = local + layers[hits.j] * (tile[0] * tile[1])
+    order = np.argsort(ids, kind="stable")
+    entries = (local | hits.j << 16)[order].astype(np.uint32)
+    starts = np.searchsorted(ids[order], np.arange(cores[0] * cores[1] + 1))
+    return [cp.asarray(starts, dtype=cp.int32), cp.asarray(entries)]
+
+
+class LaunchSlots(NamedTuple):
+    """The positions in a blocked kernel's argument list a call fills in."""
+
+    signal: int  # the (N, num_sources) source record
+    record: int  # the (N, num_sensors) sensor record, or a dummy
+    step: int  # the first step the call advances
+    blocks: int | None  # the list a kernel decodes its thread block from, if any
+
+
+def blocked_launches(
+    steps: int,
+    launches: list[tuple[cp.RawKernel, tuple[int, ...], cpt.NDArray | None]],
+    block: tuple[int, ...],
+    shared: int,
+    args: list,
+    slots: LaunchSlots,
+) -> Blocked:
+    """The launches of a blocked kernel, `step(U, V, t, signal, record)`.
+
+    Args:
+        steps: the steps one call advances.
+        launches: (kernel, grid, blocks) each, `blocks` the list the kernel decodes
+            its thread block from, or None; every kernel takes u0, u1, v0, v1 first.
+        block: threads per block.
+        shared: dynamic shared memory per block in bytes.
+        args: the kernels' arguments, the fields and `slots` filled per call.
+        slots: where in `args` the call puts what changes per call.
+    """
+    at_signal, at_record, at_t, at_blocks = slots
+    dummy = cp.zeros(1, dtype=args[4].dtype)
+
+    def blocked_step(U, V, t, signal, record=None):
+        # U[t % 2] holds u^(t - 1) and U[1 - t % 2] u^t, as the plain rotation does
+        args[0], args[1] = U[t % 2], U[1 - t % 2]
+        args[2], args[3] = V[(t + steps) % 2], V[(t + steps - 1) % 2]
+        args[at_signal] = signal
+        args[at_record] = dummy if record is None else record
+        args[at_t] = np.int32(t)
+        for kernel, grid, blocks in launches:
+            if blocks is not None:
+                args[at_blocks] = blocks
+            kernel(grid, block, args, shared_mem=shared)
+
+    return Blocked(steps, blocked_step)
+
+
 @dataclass
 class Source:
     position: cpt.NDArray[cp.int32]  # (ndim, num_sources) grid indices

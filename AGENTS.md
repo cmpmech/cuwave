@@ -110,7 +110,9 @@ sensors) the same call returns a marched step (`MARCHED_BLOCK`: columns of tiles
 axis 0, step k k planes behind) where the fields pass 1.5 times L2. Ghosts are written
 back by the tile whose core holds their mirror. The elastic stress and update pair
 becomes one `fused_kernel` (stresses of a tile and its ring in shared memory) where the
-fields spill out of L2 and the ring at most doubles the tile (2D, and 3D at order 2).
+fields spill out of L2 and the ring at most doubles the tile (2D, and 3D at order 2). A
+small 2D elastic grid (`BLOCKED_WAVES`) takes `ElasticWave.define_blocked_step`, the
+stresses and update of several steps in shared memory, a node a thread.
 
 **2D Maxwell needs none of that.** Out of plane one component survives and the curl-curl
 collapses to a flux divergence, so `maxwell.ElectricWave` (E_z, permittivity as inertia)
