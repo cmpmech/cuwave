@@ -640,6 +640,9 @@ __global__ void __launch_bounds__(TILE1 *TILE2)
                    real_t *__restrict__ v0, real_t *__restrict__ v1,
                    const real_t *__restrict__ stiff,
                    const real_t *__restrict__ minv, const int derive_inertia,
+#ifdef USE_DAMPING
+                   const real_t *__restrict__ damping, const real_t dt,
+#endif
                    const real_t *__restrict__ signal,
                    const real_t *__restrict__ weights, const int num_sources,
                    real_t *__restrict__ record, const int num_sensors,
@@ -787,7 +790,15 @@ __global__ void __launch_bounds__(TILE1 *TILE2)
                                                g[AREA + i - 1], 1, 1);
         // the axes and the leapfrog rounded as nvcc compiles fd_kernel's
         const real_t laplacian = FMA_RN(f2, d2, FMA_RN(f0, d0, MUL_RN(f1, d1)));
+#ifdef USE_DAMPING
+        // beta over dt, read through L1 where the plane passed k planes ago
+        const real_t beta = 0.5f * MI[k - 1] * damping[q * s0 + c];
+        u = FMA_RN(MI[k - 1], laplacian,
+                   FMA_RN(-u, FMA_RN(-dt, beta, 1.f), 2.f * uc)) /
+            FMA_RN(dt, beta, 1.f);
+#else
         u = FMA_RN(MI[k - 1], laplacian, 2.f * uc - u);
+#endif
         if (sourced >> k & 1) {
           int e = se;
           while (source_entries[e].x != q)

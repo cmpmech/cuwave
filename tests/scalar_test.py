@@ -276,7 +276,7 @@ class BlockedTest(unittest.TestCase):
         self.assertIsNone(middle.define_blocked_step(mat, source, None))
 
 
-def _scalar3d(boundary, N, Nx=(259, 171, 171)):
+def _scalar3d(boundary, N, Nx=(259, 243, 243)):
     # cores (24, 24) and 64 planes: the last of each holds the node beside the ghost
     dx = (0.1, 0.1, 0.1)
     dt = 0.5 * stable_dt(dx, 1.0, 2)
@@ -338,9 +338,14 @@ class MarchedTest(unittest.TestCase):
             starved = simulate(sim, source, indicator, sensors=sensors)
         self._assert_bitwise(starved, plain)
 
+    def test_the_damped_update(self):
+        sim = _scalar3d(Dirichlet, 10)
+        damped = replace(sim, damping=sponge(sim, _random(sim, 7)[0], 12, 0.1))
+        self._assert_bitwise(*_runs3d(damped, 5))
+
     def test_a_formed_inertia(self):
         sim = AcousticWave(
-            (259, 171, 171),
+            (259, 243, 243),
             (0.1, 0.1, 0.1),
             10,
             1e-5,
@@ -358,7 +363,6 @@ class MarchedTest(unittest.TestCase):
         sim = _scalar3d(None, 4)
         source, indicator, sensors = _shot3d(sim, 8)
         refused = {
-            "damping": replace(sim, damping=sponge(sim, indicator, 10, 0.1)),
             "order 4": replace(sim, space_order=4),
             "in L2": _scalar3d(None, 4, (40, 40, 40)),
             "a sensor on a ghost": sim,

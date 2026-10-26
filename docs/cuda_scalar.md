@@ -168,11 +168,11 @@ a 2D launch of `(TILE1, ROWS)` threads per block, one block per tile of `TILE0` 
 - a ghost is written back by the tile whose core holds its mirror, the one tile where the mirror is valid after the last step; a core of one node beside the ghost would leave it to a tile that reads the mirror past its valid region, so the halo is at least 2
 
 ### blocked_kernel (3D)
-`STEPS` steps of the order-2 `fd_kernel` between one load and one store of every plane, the excitation, the ghost refill and the record included, bitwise the launches one at a time; float32 only, no damping
+`STEPS` steps of the order-2 `fd_kernel` between one load and one store of every plane, the excitation, the ghost refill and the record included, bitwise the launches one at a time; float32 only
 **parallelization**
 a 2D block of `(TILE2, TILE1)` threads per column of tiles, one thread per node of the tile in the plane; the grid is the tiles in the plane times the chunks of `PLANES` planes along axis 0. Tiles overlap by a halo of `HALO` $=$ `STEPS` nodes each side in the plane and write back their core, `C1` $\times$ `C2`; a chunk marches `HALO` planes past each of its ends
 **input args**
-`u0, u1, v0, v1, stiff, minv, derive_inertia, signal, weights, num_sources, record, num_sensors, t0`: as the 2D `blocked_kernel`; `source_starts, source_entries`: per thread column of every tile the sources it holds, halo included, as CSR rows of `(plane, source)` pairs sorted by plane; `sensor_starts, sensor_entries`: the same for the sensors its core records, interior only; `dirichlet`: face mask, every other face Neumann; `f0, N0, f1, N1, s0, f2, N2, s1`: as `fd_kernel`
+`u0, u1, v0, v1, stiff, minv, derive_inertia`, under `-DUSE_DAMPING` `damping, dt`, and `signal, weights, num_sources, record, num_sensors, t0`: as the 2D `blocked_kernel`; `source_starts, source_entries`: per thread column of every tile the sources it holds, halo included, as CSR rows of `(plane, source)` pairs sorted by plane; `sensor_starts, sensor_entries`: the same for the sensors its core records, interior only; `dirichlet`: face mask, every other face Neumann; `f0, N0, f1, N1, s0, f2, N2, s1`: as `fd_kernel`
 **internal args**
 `shared`: $u$ of steps $0$ to `STEPS` $-1$ on the plane each reads in the plane (`cur`, `nxt`, swapped every plane), the stiffness of the plane loaded (twice), and the cell stiffnesses toward $+1$ of axes 1 and 2 on the last `STEPS` $+1$ planes, each plane with a guard ring of one node; `Q`: $u^k$ of the thread's column on the three planes around the one step $k+1$ updates; `P`: $u^{-1}$ on the last two planes; `G`: the axis-0 cell stiffnesses between the last `STEPS` $+2$ planes; `MI`: $1/m$ on the last `STEPS` planes; `sourced, sensed`: bit $k$ set where the plane $k$ behind the one loaded holds a source or a sensor of the column
 **how?**
@@ -180,7 +180,7 @@ a 2D block of `(TILE2, TILE1)` threads per column of tiles, one thread per node 
 - the cell stiffness toward $-1$ is the neighbour's toward $+1$: products and sums commute exactly, so each is formed once a launch and is still the mean `flux_divergence_axis` forms
 - an in-plane face ghost is refilled by its mirror's thread, which stores the signed value into the ghost's slot of the next plane and writes it back with the last step; an axis-0 face ghost is refilled in the column's queue, from plane 2 when it passes and from plane $N_0-3$ when the ghost is pushed; edges and corners, which the refill skips, keep their values, the two levels swapped with the parity of `STEPS`
 - the edge nodes of a tile read the guard ring and the first and last planes of a chunk lack their neighbours; both errors spread one node a step and stop short of the core
-- the laplacian and the update are rounded by `FMA_RN` and `MUL_RN` as nvcc contracts them in the 3D `fd_kernel`, axis 1 first, axis 0 fused onto it, then axis 2
+- the laplacian and the update are rounded by `FMA_RN` and `MUL_RN` as nvcc contracts them in the 3D `fd_kernel`, axis 1 first, axis 0 fused onto it, then axis 2, the damped update as in 2D; $\beta$ is formed per step from `damping` read again through L1, which held the plane a few iterations before, so it costs no register queue
 
 ### pml_kernel
 **parallelization**

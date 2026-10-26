@@ -465,17 +465,13 @@ class PressureWave(Simulation):
         with a halo as wide as the steps, each step a plane behind the one before, so u
         of a plane is loaded and stored once a launch (`MARCHED_BLOCK`): bitwise the
         step, excitation, refill and record launched one by one. Taken where the fields
-        spill well out of L2; None with damping, and on what `define_blocked_step`
-        refuses, or a sensor off the interior.
+        spill well out of L2; None on what `define_blocked_step` refuses, or a sensor
+        off the interior.
         """
         # L2 serves the plain step's fields up to about one and a half times its size
         device = cp.cuda.Device().attributes
         nodes = math.prod(self.Nx)
-        if (
-            self.space_order != 2
-            or self.damping is not None
-            or 16 * nodes <= 1.5 * device["L2CacheSize"]
-        ):
+        if self.space_order != 2 or 16 * nodes <= 1.5 * device["L2CacheSize"]:
             return None
         tile, steps, planes = MARCHED_BLOCK
         core = [t - 2 * steps for t in tile]
