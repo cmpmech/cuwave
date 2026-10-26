@@ -427,6 +427,11 @@ __global__ void homogeneous_dirichlet_kernel(real_t *__restrict__ u,
 #define AREA ((TILE0 + 2 * STENCIL_RADIUS) * WIDE)
 #define AT(x, y) (((x) + STENCIL_RADIUS) * WIDE + (y) + STENCIL_RADIUS)
 
+// the node whose tile writes `a` back: a ghost goes with its mirror
+__device__ __forceinline__ int owner(const int a, const int N) {
+  return a == 0 ? 2 : a == N - 1 ? N - 3 : a;
+}
+
 // advance a tile STEPS steps between one load and one store: the step, the
 // excitation, the boundary refill and the record, bitwise the plain launches
 __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
@@ -450,7 +455,7 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
   const int ty = threadIdx.x, x0 = threadIdx.y * NODES;
   const int tile = blockIdx.y * gridDim.x + blockIdx.x;
   const int lo0 = 1 + blockIdx.y * C0, lo1 = 1 + blockIdx.x * C1;
-  const int a1 = lo1 - HALO + ty, k1 = min(max(a1, 1), N1 - 2);
+  const int a1 = lo1 - HALO + ty, k1 = owner(a1, N1);
   const bool col = a1 >= 0 && a1 <= N1 - 1;
   const bool core1 = k1 >= lo1 && k1 < lo1 + C1;
 
@@ -569,7 +574,7 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
       // the product rounded apart, as excitation_kernel adds it atomically
       const int j = (tag[k] & 0xffffu) - 1;
       if (j >= 0)
-        u2 += MUL_RN(weights[j], signal[(t0 + t) * num_sources + j]);
+        u2 += MUL_RN(weights[j], signal[(size_t)(t0 + t) * num_sources + j]);
       up[k] = u2; // u^(t + 1) in the slot of u^(t - 1), swapped below
       nu[i] = u2;
     }
@@ -599,17 +604,17 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
 #pragma unroll
     for (int k = 0; k < NODES; ++k)
       if (tag[k] >> 16)
-        record[(t0 + t) * num_sensors + (tag[k] >> 16) - 1] = uc[k];
+        record[(size_t)(t0 + t) * num_sensors + (tag[k] >> 16) - 1] = uc[k];
     __syncthreads();
   }
 
-  // write back the core, each ghost with the interior node it clamps to
+  // write back the core, each ghost with its mirror
   if (!col || !core1)
     return;
 #pragma unroll
   for (int k = 0; k < NODES; ++k) {
     const int a0 = lo0 - HALO + x0 + k;
-    const int k0 = min(max(a0, 1), N0 - 2);
+    const int k0 = owner(a0, N0);
     if (a0 >= 0 && a0 <= N0 - 1 && k0 >= lo0 && k0 < lo0 + C0) {
       v0[a0 * s0 + a1] = up[k];
       v1[a0 * s0 + a1] = uc[k];

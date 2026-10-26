@@ -445,7 +445,7 @@ COMMON_PATH = Path(__file__).parent / "kernels" / "common.cuh"
 
 
 def compile_kernels(
-    sim: Simulation, path: Path | None = None, flags: tuple[str, ...] = ()
+    sim: Simulation, path: Path | None = None, *, flags: tuple[str, ...] = ()
 ) -> cp.RawModule:
     """Compile `path` for `sim` and the extra `-D` `flags`, defaulting to its own source, stencil table injected."""
     path = sim.kernel_path if path is None else path
@@ -927,6 +927,8 @@ def simulate(
     if blocked is not None:
         # whole blocks alternate between U and a second pair, the rest step by step
         S = blocked.steps
+        if CHUNK // 2 % S:
+            raise ValueError(f"a blocked step of {S} steps must divide CHUNK / 2")
         pairs = (U, cp.zeros_like(U))
 
         def blocked_step(t, signal, um=None):

@@ -40,10 +40,10 @@ NX = (150, 77)  # three chunks of axis 0, and a width no tile divides
 
 
 # -------------------------------------- helpers --------------------------------------
-def _scalar(order, precision="float64", boundary=None, threads=(4, 32), N=1):
+def _scalar(order, precision="float64", boundary=None, threads=(4, 32), N=1, Nx=NX):
     dx = (0.1, 0.1)
     return ScalarWave(
-        NX,
+        Nx,
         dx,
         N,
         0.5 * stable_dt(dx, 1.0, order),
@@ -167,12 +167,16 @@ class StreamingTest(unittest.TestCase):
 
 # ------------------------------------ blocked steps -----------------------------------
 def _shot(sim, seed):
-    """Two sources, one beside a wall, and sensors in the interior, on a wall and in ghosts."""
+    """Three sources, two beside a wall, and sensors in the interior, on a wall and in ghosts."""
     t = np.arange(sim.N) * sim.dt
-    signal = np.stack([ricker(t, 1.0, 2.0), -ricker(t, 0.7, 2.5)], 1)
-    position = cp.array([[NX[0] // 3, 2 * NX[0] // 3], [NX[1] // 2, 1]], dtype=cp.int32)
+    signal = np.stack(
+        [ricker(t, 1.0, 2.0), -ricker(t, 0.7, 2.5), ricker(t, 1.3, 1.0)], 1
+    )
+    n = sim.Nx
+    position = [[n[0] // 3, 2 * n[0] // 3, n[0] - 3], [n[1] // 2, 1, n[1] - 3]]
+    position = cp.array(position, dtype=cp.int32)
     sensors = cp.array(
-        [[1, 2, NX[0] - 2, 0, 5, 70], [1, NX[1] - 2, 3, 4, NX[1] - 1, 40]],
+        [[1, 2, n[0] - 2, 0, 5, 70, n[0] - 1], [1, n[1] - 2, 3, 4, n[1] - 1, 40, 9]],
         dtype=cp.int32,
     )
     source = Source(position, cp.asarray(signal, dtype=sim.dtype))
@@ -215,12 +219,18 @@ class BlockedTest(unittest.TestCase):
     def test_every_tile_and_step_count(self):
         tiles = (((32, 64), 8), ((32, 64), 4), ((64, 64), 16), ((32, 96), 8))
         for order, tile, steps in itertools.product((2, 4), tiles, (1, 2, 3, 4, 6, 12)):
-            if min(tile[0]) - 2 * steps * order // 2 < 8:
+            if min(tile[0]) - 2 * steps * order // 2 < 8 or steps * order // 2 < 2:
                 continue
             with self.subTest(order=order, tile=tile, steps=steps):
                 sim = _scalar(order, "float32", Dirichlet, N=50)
                 blocks = (((tile[0], tile[1], steps),),) * 2
                 self._assert_bitwise(*_runs(sim, 6, SMALL_BLOCKS=blocks))
+
+    def test_a_last_core_of_one_node(self):
+        # cores (24, 56): each axis's last core holds the node beside the ghost alone
+        sim = _scalar(2, "float32", Dirichlet, N=24, Nx=(147, 115))
+        blocks = ((((32, 64), 8, 4),),) * 2
+        self._assert_bitwise(*_runs(sim, 5, SMALL_BLOCKS=blocks))
 
     def test_the_damped_update_and_a_formed_inertia(self):
         sim = AcousticWave(

@@ -65,8 +65,15 @@ def _tile_lists(
 ) -> list[cpt.NDArray]:
     """The (2, num) `points` each blocked tile holds: CSR row starts, entries `local | j << 16`.
 
-    With `covering` every tile whose nodes, halo included, take a point holds it, else
-    the one tile whose core holds its `owners` node.
+    Args:
+        points: (2, num) grid indices of the sources or sensors, `j` their column.
+        owners: (2, num) node whose tile holds each point unless `covering`.
+        tile: nodes of a tile per axis, halo included.
+        core: nodes of a tile's core per axis.
+        halo: nodes each side between a tile's edge and its core.
+        cores: tiles per axis.
+        covering: every tile whose nodes, halo included, take a point holds it, else
+            the one tile whose core holds its `owners` node.
     """
     j = np.arange(points.shape[1])
     hits = []
@@ -283,8 +290,8 @@ class PressureWave(Simulation):
         core: bitwise the step, excitation, refill and record launched one by one. Taken
         where launches or DRAM bound the plain step (`SMALL_BLOCKS`, `LARGE_BLOCKS`), else
         None, as in 3D, in float64, above order 4, with a pml, a domain mask, a condition
-        other than Neumann or Dirichlet, a source off the interior, or two sources or
-        sensors on one node.
+        other than Neumann or Dirichlet, a source off the interior, two sources or
+        sensors on one node, or an axis of fewer than 4 nodes.
         """
         conditions = {c for pair in self.boundary for c in pair}
         radius = self.space_order // 2
@@ -295,6 +302,7 @@ class PressureWave(Simulation):
             or self.pml is not None
             or self.masked
             or not conditions <= {Neumann, Dirichlet}
+            or min(self.Nx) < 4
         ):
             return None
         # launches bound a grid of two waves of threads, DRAM one whose u twice,
@@ -321,6 +329,8 @@ class PressureWave(Simulation):
         # the tiles: a core and a halo as wide as the steps reach
         tile, rows, steps = block
         halo = steps * radius
+        if halo < 2:
+            return None  # a ghost's tile holds its mirror two nodes in from a halo of 2
         core = [t - 2 * halo for t in tile]
         cores = _cores(self.Nx, tile, halo)
 
@@ -335,11 +345,12 @@ class PressureWave(Simulation):
         for index in flat:
             if len(index) >= 2**16 or len(np.unique(index)) != len(index):
                 return None
-        # a sensor recorded by the tile whose core holds the node a ghost clamps to
-        clamped = np.clip(points[1], 1, upper)
+        # a sensor recorded by the tile whose core holds it, a ghost's by its mirror's
+        owners = np.where(points[1] == 0, 2, points[1])
+        owners = np.where(owners == upper + 1, upper - 1, owners)
         lists = [
             *_tile_lists(points[0], points[0], tile, core, halo, cores, covering=True),
-            *_tile_lists(points[1], clamped, tile, core, halo, cores, covering=False),
+            *_tile_lists(points[1], owners, tile, core, halo, cores, covering=False),
         ]
 
         # the kernel and its arguments, the pointers swapped per launch
