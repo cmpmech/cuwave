@@ -221,6 +221,8 @@ class ElasticWave(Simulation):
             and self._fused_shared() <= device["MaxSharedMemoryPerBlockOptin"]
         ):
             return self._define_fused(mat)
+
+        # the pair, a pml folded into both
         grid, block = grid_block(self)
         stress_kernel = kernels.get_function("stress_kernel")
         fd_kernel = kernels.get_function("fd_kernel")

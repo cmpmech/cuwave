@@ -74,6 +74,8 @@ def _tile_lists(
     else:
         b = [(owners[d] - 1) // core[d] for d in (0, 1)]
         hits.append((b[0], b[1], points[0], points[1], j))
+
+    # the entries sorted by tile, each row's start found by bisection
     b0, b1, a0, a1, index = (np.concatenate(h) for h in zip(*hits))
     local = (a0 - 1 - b0 * core[0] + halo) * tile[1] + a1 - 1 - b1 * core[1] + halo
     ids = b0 * cores[1] + b1
@@ -299,10 +301,14 @@ class PressureWave(Simulation):
             block = None
         if block is None:
             return None
+
+        # the tiles: a core and a halo as wide as the steps reach
         tile, rows, steps = block
         halo = steps * radius
         core = [t - 2 * halo for t in tile]
         cores = [-(-(n - 2) // c) for n, c in zip(self.Nx, core)]
+
+        # sources in the interior, no node holding two sources or two sensors
         sources = flatten_indices(self, source.position)
         targets = flatten_indices(self, sensors) if sensors is not None else sources[:0]
         flat = [index.get() for index in (sources, targets)]
@@ -319,6 +325,8 @@ class PressureWave(Simulation):
             *_tile_lists(points[0], points[0], tile, core, halo, cores, covering=True),
             *_tile_lists(points[1], clamped, tile, core, halo, cores, covering=False),
         ]
+
+        # the kernel and its arguments, the pointers swapped per launch
         flags = (f"-DSTEPS={steps}", f"-DTILE0={tile[0]}", f"-DTILE1={tile[1]}")
         kernels = compile_kernels(self, flags=(*flags, f"-DROWS={rows}"))
         kernel = kernels.get_function("blocked_kernel")

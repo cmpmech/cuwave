@@ -920,6 +920,7 @@ def simulate(
         if um is not None:
             get_signal(u, um, t)
 
+    # several steps a launch where the simulation has a blocked step for this run
     blocked = None
     if record_every is None and not active():
         blocked = sim.define_blocked_step(mat, source, sensors)
@@ -933,12 +934,14 @@ def simulate(
                 launch = t // S % 2
                 blocked.step(pairs[launch], pairs[1 - launch], t, signal, um)
 
+        # the launches through the graphs, then the steps left over
         full = sim.N - sim.N % S
         if full:
             march(full, blocked_step, windows)
         U = pairs[full // S % 2]
         for t in range(full, sim.N):
             step(t, *(w.record for w in windows))
+    # else every step through the graphs, or one by one for the snapshots
     elif record_every is None:
         march(sim.N, step, windows, [U, *getattr(fd_step, "memory", [])])
     else:
