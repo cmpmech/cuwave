@@ -15,7 +15,7 @@ a wave simulation is set up as follows:
 	- `fd_step` (spatial discretization)
 	- `bc_step` (modification for boundary conditions)
 	- `excitation_step` (source contribution)
-2. unrolling of the time integration (where kernels are executed at each time step), handed to `march`
+2. unrolling of the time integration (where kernels are executed at each time step), handed to `march`, the launches of a blocked step included where `define_blocked_step` returns one
 
 - the `Simulation`class (and its derived versions) collect the simulation setup
 - the `define_[kernel]` prepare the specific kernels
@@ -30,6 +30,7 @@ From those it derives everything the kernels are launched and compiled with: so 
 | stencil | `stencil="optimized"` | the full-radius coefficient row the kernels compile against: the dispersion-fitted one of [stencils](stencils.md) by default, `"taylor"` for the formal-order one |
 | kernel options | `compile_flags`   | extra `nvcc -D` flags, empty here and extended by the derived classes                                                                                       |
 | step | `define_step(kernels, mat)` | the step closure, one `fd_kernel` launch here; a scheme needing several launches per step overrides it, which is how the staggered [elastic](elastic.md) exists without touching `simulate` |
+| blocked step | `define_blocked_step(mat, source, sensors)` | a `Blocked` closure advancing several steps a launch, the excitation, the ghost refill and the record inside it: `None` here, and overridden by [scalar](scalar.md) `PressureWave` |
 | adjoint step | `define_adjoint_step(kernels, sens_kernels, mat)` | the closure stepping the adjoint field by the transpose of the step's operator under the cell weights: `define_step` itself here, for an operator that is its own transpose, and overridden by [scalar](scalar.md) `PressureWave`, whose operator is not above order 2 |
 | staggering | `component_offsets` | `(ncomp, ndim)` grid offsets of each component, `None` for a nodal unknown; what [distribute](utils.md) shifts by |
 | domain | `domain` | a nodal mask of the physical domain, `None` for the whole box: its tiles alone are stepped and its wall is a zero-flux staircase, see [scalar](scalar.md), the one family that takes it |
@@ -158,7 +159,7 @@ equations hold in common is the lattice, and their material models, `build_mater
 `compile_kernels` prepends two source blocks to every `.cu` before handing it to
 `RawModule`: the coefficient tables from [stencils](stencils.md) `preamble`, then
 `kernels/common.cuh`. The prelude carries what every equation repeats, so a `.cu` holds
-only its own operator: the `real_t` typedef, the `OP_W` / `CLOSURE` and `SG_W` accessors
+only its own operator: the `real_t` typedef with its rounded `MUL_RN` and `FMA_RN` (which nvcc never contracts, so two kernels inlining one formula round alike), the `OP_W` / `CLOSURE` and `SG_W` accessors
 with their `__constant__ tables`, `NPAIRS` / `PAIR_ROW`, `rad_node` / `rad_half`,
 `clamped_face`, and the byte-identical `excitation_kernel`, `get_signal_kernel` and
 `set_signal_kernel`

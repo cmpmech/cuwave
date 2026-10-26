@@ -4,27 +4,33 @@
 //   USE_DAMPING
 //   USE_DOMAIN
 //   USE_STREAM, STREAM_TX
+//   STEPS, TILE0, TILE1, ROWS (2D)
+
+// spatial finite difference stencil for Laplacian, the cell stiffnesses given
+__device__ __forceinline__ real_t flux_divergence_means(
+    const real_t *__restrict__ u1, const int idx, const int s, const real_t uc,
+    const real_t gp, const real_t gm, const real_t factor, const int r) {
+  // rounded as nvcc contracts the plain sums, so every caller agrees bitwise
+  real_t Dp = MUL_RN(OP_W(r, 1), u1[idx + s] - uc); // inner grad
+  real_t Dm = MUL_RN(OP_W(r, 1), uc - u1[idx - s]); // inner grad
+#pragma unroll
+  for (int k = 2; k <= STENCIL_RADIUS; ++k)
+    if (k <= r) {
+      Dp = FMA_RN(OP_W(r, k), u1[idx + k * s] - u1[idx - (k - 1) * s], Dp);
+      Dm = FMA_RN(OP_W(r, k), u1[idx + (k - 1) * s] - u1[idx - k * s], Dm);
+    }
+  return factor * FMA_RN(Dp, gp, -MUL_RN(Dm, gm)); // outer grad
+}
 
 // spatial finite difference stencil for Laplacian
 __device__ __forceinline__ real_t flux_divergence_axis(
     const real_t *__restrict__ u1, const real_t *__restrict__ stiff,
     const int idx, const int s, const real_t uc, const real_t sc,
     const real_t factor, const int r) {
-  const real_t sp = stiff[idx + s];            // plus of sc
-  const real_t sm = stiff[idx - s];            // minus of sc
-  const real_t gp = sc * sp / (sc + sp);       // harmonic mean
-  const real_t gm = sc * sm / (sc + sm);       // harmonic mean
-  real_t Dp = OP_W(r, 1) * (u1[idx + s] - uc); // initialization: inner grad
-  real_t Dm = OP_W(r, 1) * (uc - u1[idx - s]); // initialization: inner grad
-#pragma unroll
-  for (int k = 2; k <= STENCIL_RADIUS; ++k)
-    if (k <= r) {
-      Dp +=
-          OP_W(r, k) * (u1[idx + k * s] - u1[idx - (k - 1) * s]); // inner grad
-      Dm +=
-          OP_W(r, k) * (u1[idx + (k - 1) * s] - u1[idx - k * s]); // inner grad
-    }
-  return factor * (Dp * gp - Dm * gm); // outer grad (incl. inner grad)
+  const real_t sp = stiff[idx + s]; // plus of sc
+  const real_t sm = stiff[idx - s]; // minus of sc
+  return flux_divergence_means(u1, idx, s, uc, sc * sp / (sc + sp),
+                               sc * sm / (sc + sm), factor, r);
 }
 
 // ------------------------------------- pml helpers
@@ -398,5 +404,166 @@ __global__ void homogeneous_dirichlet_kernel(real_t *__restrict__ u,
   u[ghost] = -u[ghost + 2 * normal];
 }
 
+#ifdef STEPS
+// ------------------------------------------------------------------------------------
+// the core a tile writes back, its halo STEPS stencil radii wide
+#define HALO (STEPS * STENCIL_RADIUS)
+#define C0 (TILE0 - 2 * HALO)
+#define C1 (TILE1 - 2 * HALO)
+#define NODES (TILE0 / ROWS) // a thread's nodes along axis 0, ROWS apart
+#define WIDE (TILE1 + 2 * STENCIL_RADIUS) // a tile row with its guard columns
+#define AREA ((TILE0 + 2 * STENCIL_RADIUS) * WIDE)
+#define AT(x, y) (((x) + STENCIL_RADIUS) * WIDE + (y) + STENCIL_RADIUS)
+
+// advance a tile STEPS steps between one load and one store: the step, the
+// excitation, the boundary refill and the record, bitwise the plain launches
+__global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
+    const real_t *__restrict__ u0, const real_t *__restrict__ u1,
+    real_t *__restrict__ v0, real_t *__restrict__ v1,
+    const real_t *__restrict__ stiff, const real_t *__restrict__ minv,
+    const int derive_inertia,
+#ifdef USE_DAMPING
+    const real_t *__restrict__ damping, const real_t dt,
+#endif
+    const real_t *__restrict__ signal, const real_t *__restrict__ weights,
+    const int num_sources, real_t *__restrict__ record, const int num_sensors,
+    const unsigned *__restrict__ tags, const int t0, const int neumann,
+    const int dirichlet, const real_t f0, const int N0, const real_t f1,
+    const int N1, const int s0) {
+  // u of this step and the next, then the cell stiffness toward +0 and +1
+  extern __shared__ real_t shared[];
+  real_t *g0 = shared + 2 * AREA, *g1 = shared + 3 * AREA;
+  const int ty = threadIdx.x, row = threadIdx.y;
+  const int lo0 = 1 + blockIdx.y * C0, lo1 = 1 + blockIdx.x * C1;
+  const int a1 = lo1 - HALO + ty, k1 = min(max(a1, 1), N1 - 2);
+  const bool col = a1 >= 0 && a1 <= N1 - 1;
+  const bool core1 = k1 >= lo1 && k1 < lo1 + C1;
+
+  // the thread's nodes, loaded once; a tag holds source + 1 and sensor + 1
+  real_t up[NODES], uc[NODES], mi[NODES];
+#ifdef USE_DAMPING
+  real_t beta[NODES];
+#endif
+  unsigned tag[NODES], stepped = 0, ghost = 0;
+#pragma unroll
+  for (int k = 0; k < NODES; ++k) {
+    const int x = row + k * ROWS, a0 = lo0 - HALO + x;
+    const bool inside = col && a0 >= 0 && a0 <= N0 - 1;
+    const bool interior = a0 > 0 && a0 < N0 - 1 && a1 > 0 && a1 < N1 - 1;
+    const int idx = a0 * s0 + a1, k0 = min(max(a0, 1), N0 - 2);
+    up[k] = inside ? u0[idx] : 0;
+    uc[k] = inside ? u1[idx] : 0;
+    shared[AT(x, ty)] = uc[k];
+    shared[AREA + AT(x, ty)] = inside ? stiff[idx] : (real_t)1;
+    mi[k] = interior ? (derive_inertia ? 1.f / stiff[idx] : minv[idx]) : 0;
+#ifdef USE_DAMPING
+    beta[k] = interior ? 0.5f * mi[k] * damping[idx] : 0; // over dt
+#endif
+    // a source acts on a stepped node, a sensor records where its node is core
+    tag[k] = inside ? tags[idx] : 0;
+    if (!interior)
+      tag[k] &= 0xffff0000u;
+    if (!(core1 && k0 >= lo0 && k0 < lo0 + C0))
+      tag[k] &= 0xffffu;
+    stepped |= (unsigned)interior << k;
+    // a ghost of a face the refill reaches, edges and corners excluded
+    const bool along0 = a1 > 0 && a1 < N1 - 1, along1 = a0 > 0 && a0 < N0 - 1;
+    const int f = along0 && a0 == 0        ? 0
+                  : along0 && a0 == N0 - 1 ? 1
+                  : along1 && a1 == 0      ? 2
+                  : along1 && a1 == N1 - 1 ? 3
+                                           : -1;
+    ghost |= (unsigned)(f >= 0 && (((neumann | dirichlet) >> f) & 1)) << k;
+  }
+  const bool refill = __syncthreads_or(ghost);
+
+  // the harmonic means, from the stiffness staged in the second u buffer
+  const real_t *sk = shared + AREA;
+#pragma unroll
+  for (int k = 0; k < NODES; ++k) {
+    const int i = AT(row + k * ROWS, ty);
+    const real_t sc = sk[i], s0p = sk[i + WIDE], s1p = sk[i + 1];
+    g0[i] = sc * s0p / (sc + s0p);
+    g1[i] = sc * s1p / (sc + s1p);
+  }
+  __syncthreads();
+#pragma unroll
+  for (int k = 0; k < NODES; ++k)
+    shared[AREA + AT(row + k * ROWS, ty)] = uc[k];
+  __syncthreads();
+
+  for (int t = 0; t < STEPS; ++t) {
+    // the tile edge reads garbage, which never reaches the core
+    const real_t *cu = shared + (t & 1) * AREA;
+    real_t *nu = shared + (~t & 1) * AREA;
+#pragma unroll
+    for (int k = 0; k < NODES; ++k) {
+      if (!((stepped >> k) & 1))
+        continue;
+      const int x = row + k * ROWS, a0 = lo0 - HALO + x, i = AT(x, ty);
+      const real_t x0 = flux_divergence_means(cu, i, WIDE, uc[k], g0[i],
+                                              g0[i - WIDE], 1, CLOSURE(a0, N0));
+      const real_t x1 = flux_divergence_means(cu, i, 1, uc[k], g1[i], g1[i - 1],
+                                              1, CLOSURE(a1, N1));
+      // one axis fused onto the other, as nvcc contracts fd_kernel's sum
+#if STENCIL_RADIUS == 1
+      const real_t laplacian = FMA_RN(f0, x0, MUL_RN(f1, x1));
+#else
+      const real_t laplacian = FMA_RN(f1, x1, MUL_RN(f0, x0));
+#endif
+      // the leapfrog rounded as nvcc compiles fd_kernel's
+#ifdef USE_DAMPING
+      real_t u2 =
+          FMA_RN(mi[k], laplacian,
+                 FMA_RN(-up[k], FMA_RN(-dt, beta[k], 1.f), 2.f * uc[k])) /
+          FMA_RN(dt, beta[k], 1.f);
+#else
+      real_t u2 = FMA_RN(mi[k], laplacian, 2.f * uc[k] - up[k]);
+#endif
+      // the product rounded apart, as excitation_kernel adds it atomically
+      const int j = (tag[k] & 0xffffu) - 1;
+      if (j >= 0)
+        u2 += MUL_RN(weights[j], signal[(t0 + t) * num_sources + j]);
+      up[k] = uc[k];
+      uc[k] = u2;
+      nu[i] = u2;
+    }
+
+    // the boundary refill: a ghost takes its mirror two nodes in, the sign held
+    if (refill) {
+      __syncthreads();
+#pragma unroll
+      for (int k = 0; k < NODES; ++k)
+        if ((ghost >> k) & 1) {
+          const int x = row + k * ROWS, a0 = lo0 - HALO + x;
+          const int f = a0 == 0 ? 0 : a0 == N0 - 1 ? 1 : a1 == 0 ? 2 : 3;
+          const real_t m = nu[AT(x + 2 * (f == 0) - 2 * (f == 1),
+                                 ty + 2 * (f == 2) - 2 * (f == 3))];
+          up[k] = uc[k];
+          uc[k] = (dirichlet >> f) & 1 ? -m : m;
+          nu[AT(x, ty)] = uc[k];
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < NODES; ++k)
+      if (tag[k] >> 16)
+        record[(t0 + t) * num_sensors + (tag[k] >> 16) - 1] = uc[k];
+    __syncthreads();
+  }
+
+  // write back the core, each ghost with the interior node it clamps to
+  if (!col || !core1)
+    return;
+#pragma unroll
+  for (int k = 0; k < NODES; ++k) {
+    const int a0 = lo0 - HALO + row + k * ROWS;
+    const int k0 = min(max(a0, 1), N0 - 2);
+    if (a0 >= 0 && a0 <= N0 - 1 && k0 >= lo0 && k0 < lo0 + C0) {
+      v0[a0 * s0 + a1] = up[k];
+      v1[a0 * s0 + a1] = uc[k];
+    }
+  }
+}
+#endif
 
 } // extern "C"

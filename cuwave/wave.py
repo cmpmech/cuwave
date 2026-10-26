@@ -13,6 +13,7 @@ import itertools
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import NamedTuple
 
 import cupy as cp
 import cupy.typing as cpt
@@ -141,6 +142,13 @@ def grid_coords(
     # indices 0 and -1 are ghost nodes outside the domain
     axes = [(cp.arange(n, dtype=dtype) - 1) * d for n, d in zip(padded_shape(Nx), dx)]
     return cp.meshgrid(*axes, indexing="ij")
+
+
+class Blocked(NamedTuple):
+    """A step closure advancing several steps a launch, `step(U, V, t, signal, record)`."""
+
+    steps: int  # the steps one call advances, a divisor of CHUNK / 2
+    step: Callable
 
 
 @dataclass
@@ -425,15 +433,23 @@ class Simulation:
         """Closure stepping the adjoint field: `define_step`, wherever that is its own transpose."""
         return self.define_step(kernels, mat)
 
+    def define_blocked_step(
+        self, mat: dict, source: Source, sensors: cpt.NDArray[cp.int32] | None
+    ) -> Blocked | None:
+        """The step advancing several steps a launch, None for a class without one."""
+        return None
+
 
 # ----------------------------------- kernel helpers ----------------------------------
 COMMON_PATH = Path(__file__).parent / "kernels" / "common.cuh"
 
 
-def compile_kernels(sim: Simulation, path: Path | None = None) -> cp.RawModule:
-    """Compile `path` for `sim`, defaulting to its own source, stencil table injected."""
+def compile_kernels(
+    sim: Simulation, path: Path | None = None, flags: tuple[str, ...] = ()
+) -> cp.RawModule:
+    """Compile `path` for `sim` and the extra `-D` `flags`, defaulting to its own source, stencil table injected."""
     path = sim.kernel_path if path is None else path
-    options = ["--use_fast_math", f"-DNDIM={sim.ndim}", *sim.compile_flags]
+    options = ["--use_fast_math", f"-DNDIM={sim.ndim}", *sim.compile_flags, *flags]
     if sim.precision == "float32":
         options.append("-DUSE_FLOAT")
     # injected as source, so the module cache keys on the order without a -D flag
@@ -904,7 +920,26 @@ def simulate(
         if um is not None:
             get_signal(u, um, t)
 
-    if record_every is None:
+    blocked = None
+    if record_every is None and not active():
+        blocked = sim.define_blocked_step(mat, source, sensors)
+    if blocked is not None:
+        # whole blocks alternate between U and a second pair, the rest step by step
+        S = blocked.steps
+        pairs = (U, cp.zeros_like(U))
+
+        def blocked_step(t, signal, um=None):
+            if t % S == 0:
+                launch = t // S % 2
+                blocked.step(pairs[launch], pairs[1 - launch], t, signal, um)
+
+        full = sim.N - sim.N % S
+        if full:
+            march(full, blocked_step, windows)
+        U = pairs[full // S % 2]
+        for t in range(full, sim.N):
+            step(t, *(w.record for w in windows))
+    elif record_every is None:
         march(sim.N, step, windows, [U, *getattr(fd_step, "memory", [])])
     else:
         snapshots = []

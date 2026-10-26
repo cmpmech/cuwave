@@ -8,8 +8,12 @@
 
 #ifdef USE_FLOAT
 typedef float real_t;
+#define MUL_RN __fmul_rn // a product nvcc never fuses into a sum
+#define FMA_RN __fmaf_rn
 #else
 typedef double real_t;
+#define MUL_RN(a, b) ((a) * (b)) // left to nvcc, as only float32 blocks steps
+#define FMA_RN(a, b, c) ((a) * (b) + (c))
 #endif
 
 // ----------------------------- finite difference helpers

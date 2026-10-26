@@ -7,6 +7,11 @@ bit at order 2 and to the last bit of a contracted fma above it. What can break 
 queue across chunk boundaries, the tile halo across block boundaries and past a narrow
 tile, the ghost rows the queue reads, and the damping and inertia paths, each pinned here
 against the per-thread kernel.
+
+A 2D float32 run on a small or a DRAM-bound grid advances several steps a launch
+(`define_blocked_step`), the excitation, the ghost refill and the record inside the tile.
+It claims the plain run bit for bit, so it is compared with `array_equal` over orders,
+boundaries, damping, inertia, tiles, step counts and sources and sensors on the wall.
 """
 
 import unittest
@@ -23,11 +28,12 @@ except Exception:  # cupy missing or no GPU
     HAS_CUDA = False
 
 if HAS_CUDA:
-    from cuwave.boundary import Dirichlet, sponge
+    from cuwave import scalar
+    from cuwave.boundary import Dirichlet, Neumann, Pml, sponge
     from cuwave.scalar import AcousticWave, ScalarWave
     from cuwave.signals import ricker
     from cuwave.utils import point_source
-    from cuwave.wave import compile_kernels, simulate, stable_dt
+    from cuwave.wave import Source, compile_kernels, simulate, stable_dt
 
 NX = (150, 77)  # three chunks of axis 0, and a width no tile divides
 
@@ -156,6 +162,99 @@ class StreamingTest(unittest.TestCase):
         scale = float(cp.abs(per_thread).max())
         self.assertGreater(scale, 0.0)
         self.assertLess(float(cp.abs(streamed - per_thread).max()), 1e-12 * scale)
+
+
+# ------------------------------------ blocked steps -----------------------------------
+def _shot(sim, seed):
+    """Two sources, one beside a wall, and sensors in the interior, on a wall and in ghosts."""
+    t = np.arange(sim.N) * sim.dt
+    signal = np.stack([ricker(t, 1.0, 2.0), -ricker(t, 0.7, 2.5)], 1)
+    position = cp.array([[NX[0] // 3, 2 * NX[0] // 3], [NX[1] // 2, 1]], dtype=cp.int32)
+    sensors = cp.array(
+        [[1, 2, NX[0] - 2, 0, 5, 70], [1, NX[1] - 2, 3, 4, NX[1] - 1, 40]],
+        dtype=cp.int32,
+    )
+    source = Source(position, cp.asarray(signal, dtype=sim.dtype))
+    return source, _random(sim, seed)[0], sensors
+
+
+def _runs(sim, seed, **blocks):
+    """The (field, record) of a run blocked as `blocks` patch, then of the plain run."""
+    source, indicator, sensors = _shot(sim, seed)
+    with mock.patch.multiple(scalar, **{"SMALL_BLOCKS": scalar.SMALL_BLOCKS, **blocks}):
+        mat = sim.build_materials(indicator)
+        assert sim.define_blocked_step(mat, source, sensors) is not None
+        blocked = simulate(sim, source, indicator, sensors=sensors)
+    with mock.patch.object(type(sim), "define_blocked_step", lambda *a, **k: None):
+        plain = simulate(sim, source, indicator, sensors=sensors)
+    return blocked, plain
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class BlockedTest(unittest.TestCase):
+    def _assert_bitwise(self, blocked, plain):
+        self.assertGreater(float(cp.abs(plain[0]).max()), 0.0)
+        for a, b in zip(blocked, plain):
+            self.assertTrue(bool(cp.array_equal(a, b)))
+
+    def test_a_blocked_run_is_the_plain_run_bit_for_bit(self):
+        mixed = ((Neumann, Dirichlet), (Dirichlet, Neumann))
+        for order in (2, 4):
+            for boundary in (None, Dirichlet, mixed):
+                for N in (1, 5, 61):
+                    with self.subTest(order=order, boundary=boundary, N=N):
+                        sim = _scalar(order, "float32", boundary, N=N)
+                        self._assert_bitwise(*_runs(sim, order))
+
+    def test_every_tile_and_step_count(self):
+        sim = _scalar(4, "float32", Dirichlet, N=50)
+        for tile, rows in (((32, 64), 8), ((32, 64), 4), ((64, 64), 16), ((32, 96), 8)):
+            for steps in (1, 2, 3, 4):
+                with self.subTest(tile=tile, rows=rows, steps=steps):
+                    blocks = ((tile, rows, steps),) * 2
+                    self._assert_bitwise(*_runs(sim, 6, SMALL_BLOCKS=blocks))
+
+    def test_the_damped_update_and_a_formed_inertia(self):
+        sim = AcousticWave(
+            NX,
+            (0.1, 0.1),
+            40,
+            1e-5,
+            (4, 32),
+            space_order=2,
+            rho1=1.2,
+            rho2=2600.0,
+            kappa1=1.4e5,
+            kappa2=6.9e8,
+        )
+        damped = replace(sim, damping=sponge(sim, _random(sim, 7)[0], 10, 0.1))
+        for each in (sim, damped):
+            with self.subTest(damped=each.damping is not None):
+                self._assert_bitwise(*_runs(each, 7))
+
+    def test_what_the_plain_step_keeps(self):
+        sim = _scalar(2, "float32", N=6)
+        source, indicator, sensors = _shot(sim, 8)
+        mat = sim.build_materials(indicator)
+        self.assertIsNotNone(sim.define_blocked_step(mat, source, sensors))
+        refused = {
+            "float64": _scalar(2, "float64", N=6),
+            "order 8": _scalar(8, "float32", N=6),
+            "pml": replace(sim, pml=Pml(5, 1.0)),
+            "sensor twice": sim,
+        }
+        twice = cp.concatenate([sensors, sensors[:, :1]], axis=1)
+        for name, each in refused.items():
+            with self.subTest(name=name):
+                mat = each.build_materials(indicator.astype(each.dtype))
+                taken = twice if name == "sensor twice" else sensors
+                self.assertIsNone(each.define_blocked_step(mat, source, taken))
+        large = ScalarWave(
+            (4000, 4000), (0.1, 0.1), 6, 1e-3, (4, 32), wavespeed=1.0, density=1.0
+        )
+        self.assertIsNone(
+            replace(large, space_order=4).define_blocked_step(mat, source, None)
+        )
 
 
 if __name__ == "__main__":

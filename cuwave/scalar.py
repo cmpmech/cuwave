@@ -9,6 +9,7 @@ inverse density and inverse bulk modulus between two phases for topology optimiz
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,9 +21,13 @@ import numpy as np
 from .boundary import Dirichlet, Neumann, face_mask
 from .wave import (
     PML_THREADS,
+    Blocked,
     Simulation,
+    Source,
     apply_cell_weights,
     axis_geometry,
+    compile_kernels,
+    flatten_indices,
     grid_block,
     mirror_ghosts,
     sensor_cell_weights,
@@ -32,6 +37,8 @@ from .wave import (
 KERNEL_PATH = Path(__file__).parent / "kernels" / "scalar.cu"
 SENSITIVITY_PATH = Path(__file__).parent / "kernels" / "scalar_sensitivity.cu"
 CHUNK_ROWS = 64  # axis-0 rows one streaming block marches
+SMALL_BLOCKS = (((32, 64), 8, 6), ((32, 64), 8, 3))  # by radius: tile, rows, steps
+LARGE_BLOCKS = (((64, 64), 8, 6), None)  # by radius, for fields spilling out of L2
 STREAM_ORDER = 6  # below it L1 serves the plain step as well as the stream would
 STREAM_BLOCKS = 8  # per multiprocessor the stream needs to fill the device
 
@@ -214,6 +221,80 @@ class PressureWave(Simulation):
         """Nodal `1 / m` for `indicator`, derived from the stiffness where `m == k`."""
         stiff, minv = self.parametrization(indicator)
         return 1.0 / stiff if minv is None else minv
+
+    def define_blocked_step(
+        self, mat: dict, source: Source, sensors: cpt.NDArray[cp.int32] | None
+    ) -> Blocked | None:
+        """The 2D step advancing several steps a launch, excitation and record included, else None.
+
+        Each thread block loads a tile with a halo of as many stencil radii as it takes
+        steps, steps it in shared memory, refills its ghosts there and writes back its
+        core: bitwise the step, excitation, refill and record launched one by one. Taken
+        where launches or DRAM bound the plain step (`SMALL_BLOCKS`, `LARGE_BLOCKS`), else
+        None, as in 3D, in float64, above order 4, with a pml, a domain mask, a condition
+        other than Neumann or Dirichlet, or two sources or sensors on one node.
+        """
+        conditions = {c for pair in self.boundary for c in pair}
+        radius = self.space_order // 2
+        if (
+            self.ndim != 2
+            or self.precision != "float32"
+            or radius > len(SMALL_BLOCKS)
+            or self.pml is not None
+            or self.masked
+            or not conditions <= {Neumann, Dirichlet}
+        ):
+            return None
+        # launches bound a grid of two waves of threads, DRAM one whose u twice,
+        # stiffness and inertia spill out of L2; the halo's recomputation costs elsewhere
+        device = cp.cuda.Device().attributes
+        resident = device["MultiProcessorCount"] * device["MaxThreadsPerMultiProcessor"]
+        nodes = math.prod(self.Nx)
+        if nodes <= 2 * resident:
+            block = SMALL_BLOCKS[radius - 1]
+        elif 16 * nodes > device["L2CacheSize"]:
+            block = LARGE_BLOCKS[radius - 1]
+        else:
+            block = None
+        if block is None:
+            return None
+        sources = flatten_indices(self, source.position)
+        targets = flatten_indices(self, sensors) if sensors is not None else sources[:0]
+        # a tag holds source + 1 in its low half and sensor + 1 in its high half
+        tags = cp.zeros(math.prod(self.Nx_padded), dtype=cp.uint32)
+        for index, shift in ((sources, 0), (targets, 16)):
+            if len(index) >= 2**16 or len(cp.unique(index)) != len(index):
+                return None
+            tags[index] |= cp.arange(1, len(index) + 1, dtype=cp.uint32) << shift
+        tile, rows, steps = block
+        flags = (f"-DSTEPS={steps}", f"-DTILE0={tile[0]}", f"-DTILE1={tile[1]}")
+        kernels = compile_kernels(self, flags=(*flags, f"-DROWS={rows}"))
+        kernel = kernels.get_function("blocked_kernel")
+        # u twice and two cell stiffnesses of the tile, each in a guard ring a radius wide
+        shared = 4 * (tile[0] + 2 * radius) * (tile[1] + 2 * radius) * 4
+        kernel.max_dynamic_shared_size_bytes = shared
+        halo = steps * radius
+        cores = [-(-(n - 2) // (t - 2 * halo)) for n, t in zip(self.Nx, tile)]
+        weights = self.excitation_weights(mat, sources)
+        args = [None, None, None, None, *self.step_kernel_args(mat), None, weights]
+        at_signal = len(args) - 2
+        args += [np.int32(len(sources)), None, np.int32(len(targets)), tags, None]
+        at_record, at_t = len(args) - 4, len(args) - 1
+        args += [face_mask(self, Neumann), face_mask(self, Dirichlet)]
+        args += axis_geometry(self, self.step_factors())
+        dummy = cp.zeros(1, dtype=self.dtype)
+
+        def blocked_step(U, V, t, signal, record=None):
+            # U[t % 2] holds u^(t - 1) and U[1 - t % 2] u^t, as the plain rotation does
+            s = steps
+            args[0], args[1] = U[t % 2], U[1 - t % 2]
+            args[2], args[3] = V[(t + s) % 2], V[(t + s - 1) % 2]
+            args[at_signal] = signal
+            args[at_record] = dummy if record is None else record
+            args[at_t] = np.int32(t)
+            kernel(tuple(cores[::-1]), (tile[1], rows), args, shared_mem=shared)
+
+        return Blocked(steps, blocked_step)
 
     def step_kernel_args(self, mat: dict) -> tuple:
         """Material and damping arguments for the finite-difference step kernel."""
