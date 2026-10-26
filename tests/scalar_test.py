@@ -269,7 +269,7 @@ class BlockedTest(unittest.TestCase):
                 mat = each.build_materials(indicator.astype(each.dtype))
                 taken = twice if name == "sensor twice" else sensors
                 self.assertIsNone(each.define_blocked_step(mat, source, taken))
-        # fields L2 serves, past two waves of threads: the plain step's ground
+        # fields L2 serves, past the waves launches bound: the plain step's ground
         middle = ScalarWave(
             (1024, 1024), (0.1, 0.1), 6, 1e-3, (4, 32), wavespeed=1.0, density=1.0
         )

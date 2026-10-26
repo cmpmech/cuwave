@@ -46,6 +46,7 @@ SMALL_BLOCKS = (
     (((32, 64), 8, 4), ((32, 64), 8, 3), ((64, 64), 16, 6)),
 )
 LARGE_BLOCKS = (((64, 64), 16, 6), None)  # by radius, for fields spilling out of L2
+SMALL_WAVES = (2, 1.25)  # by radius, the waves of resident threads launches bound
 MARCHED_BLOCK = ((32, 32), 4, 64)  # 3D order 2: (tile in the plane, steps, planes)
 STREAM_ORDER = 6  # below it L1 serves the plain step as well as the stream would
 STREAM_BLOCKS = 8  # per multiprocessor the stream needs to fill the device
@@ -392,11 +393,11 @@ class PressureWave(Simulation):
             return None
         if self.ndim == 3:
             return self._define_marched_step(mat, source, sensors)
-        # launches bound a grid of two waves of threads, DRAM one whose fields pass L2
+        # launches bound a grid of a wave or two of threads, DRAM one whose fields pass L2
         device = cp.cuda.Device().attributes
         resident = device["MultiProcessorCount"] * device["MaxThreadsPerMultiProcessor"]
         nodes = math.prod(self.Nx)
-        if nodes <= 2 * resident:
+        if nodes <= SMALL_WAVES[radius - 1] * resident:
             # one tile a multiprocessor at a time: the candidate with the fewest waves
             sms = device["MultiProcessorCount"]
             block = min(
