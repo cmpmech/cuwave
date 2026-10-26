@@ -36,7 +36,7 @@ from .wave import (
 
 KERNEL_PATH = Path(__file__).parent / "kernels" / "elastic.cu"
 SENSITIVITY_PATH = Path(__file__).parent / "kernels" / "elastic_sensitivity.cu"
-FUSED_TILE = (16, 32)  # nodes of the fused 2D step's tile, a thread each
+FUSED_TILE = ((16, 32), (4, 8, 32))  # in 2D, 3D: the fused step's tile, a thread each
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -205,12 +205,21 @@ class ElasticWave(Simulation):
         return self._define_pair(kernels, mat, adjoint=self.pml is not None)
 
     def _define_pair(self, kernels: cp.RawModule, mat: dict, adjoint: bool) -> Callable:
-        """The stress and update launches, a pml folded into both; fused in 2D past L2."""
-        # one launch where DRAM bounds the pair: u three times, the stresses, the design
+        """The stress and update launches, a pml folded into both; fused past L2 without one."""
+        # one launch where DRAM bounds the pair (u three times, the stresses, the
+        # design) and the ring at most doubles the stresses formed
+        device = cp.cuda.Device().attributes
         nodes = math.prod(self.Nx)
         fields = (3 * self.ndim + self.nvoigt + 1) * nodes * self.dtype().itemsize
-        spills = fields > cp.cuda.Device().attributes["L2CacheSize"]
-        if self.ndim == 2 and self.pml is None and spills:
+        tile = FUSED_TILE[self.ndim - 2] if self.ndim >= 2 else ()
+        ring = math.prod(t + self.space_order for t in tile)
+        if (
+            self.ndim >= 2
+            and self.pml is None
+            and fields > device["L2CacheSize"]
+            and ring <= 2 * math.prod(tile)
+            and self._fused_shared() <= device["MaxSharedMemoryPerBlockOptin"]
+        ):
             return self._define_fused(mat)
         grid, block = grid_block(self)
         stress_kernel = kernels.get_function("stress_kernel")
@@ -235,11 +244,13 @@ class ElasticWave(Simulation):
         return fd_step
 
     def _define_fused(self, mat: dict) -> Callable:
-        """The 2D step as one launch, each block's stresses in shared memory, ring included."""
-        tile = FUSED_TILE
-        flags = (f"-DTILE0={tile[0]}", f"-DTILE1={tile[1]}")
+        """The step as one launch, each block's stresses in shared memory, ring included."""
+        tile = FUSED_TILE[self.ndim - 2]
+        flags = tuple(f"-DTILE{d}={t}" for d, t in enumerate(tile))
         kernel = compile_kernels(self, flags=flags).get_function("fused_kernel")
-        grid = (-(-self.Nx_padded[1] // tile[1]), -(-self.Nx[0] // tile[0]))
+        grid = tuple(-(-n // t) for n, t in zip(self.Nx_padded, tile))[::-1]
+        shared = self._fused_shared()
+        kernel.max_dynamic_shared_size_bytes = shared
         args = [None, None, None, *self.stress_material(mat)]
         args += [self.dtype(self.density), *self.damping_args(mat)]
         args += [face_mask(self, Clamped), np.int32(self.comp_stride)]
@@ -248,11 +259,16 @@ class ElasticWave(Simulation):
 
         def fd_step(u0, u1, u2):
             args[0], args[1], args[2] = u0, u1, u2
-            kernel(grid, tile[::-1], args)
+            kernel(grid, tile[::-1], args, shared_mem=shared)
             return u2
 
         fd_step.memory = []
         return fd_step
+
+    def _fused_shared(self) -> int:
+        """Bytes of the fused step's stresses: its tile and a ring a radius wide."""
+        ring = math.prod(t + self.space_order for t in FUSED_TILE[self.ndim - 2])
+        return self.nvoigt * ring * self.dtype().itemsize
 
     def _pml_fold(self, adjoint: bool) -> tuple[list, list]:
         """The step kernels' pml arguments and the memory per lined axis."""

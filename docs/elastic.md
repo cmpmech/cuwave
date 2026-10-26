@@ -56,7 +56,7 @@ The reconstruction strip of [sensitivity](sensitivity.md) follows `reach` $=2r-1
 | strip radius | `reach` | $2r-1$, the nodes one step reads past a point |
 | materials | `build_materials(indicator)` | the design field alone, and `damping`: the kernels average $\gamma$ onto the stress and component points themselves, so no material grid is stored beside it |
 | point inertia | `point_inverse_inertia(gamma, lin_index)` | $1/\left(\rho_0W\bar{\gamma}\right)$ on the component points `lin_index`, zero where a clamped wall holds them, the value the kernels form, for the excitation weights |
-| step | `define_step(kernels, mat)` | the two-launch closure: the stress kernel, then the update, each followed by its [pml](boundary.md) terms when `pml` is set; in 2D without a pml, where the fields spill out of L2, one fused launch instead (`FUSED_TILE`) |
+| step | `define_step(kernels, mat)` | the two-launch closure: the stress kernel, then the update, each followed by its [pml](boundary.md) terms when `pml` is set; without a pml, where the fields spill out of L2 and the stencil is narrow enough for the tile (2D, and order 2 in 3D), one fused launch instead (`FUSED_TILE`) |
 | adjoint step | `define_adjoint_step(kernels, sens_kernels, mat)` | the step itself, or with a pml its transpose, which pushes each memory back through the other pass |
 | pml margin | `pml_margin` | $r-1$, the undamped layer nodes before the front, since a corrected strain is read that far |
 | pml arguments | `step_args(mat)`, `stress_material(mat)` | the stress scratch and the argument lists the stress and update kernels, and their pml terms, share |

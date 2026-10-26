@@ -3,7 +3,7 @@
 //   NDIM = 1 | 2 | 3
 //   USE_DAMPING
 //   USE_PML
-//   TILE0, TILE1 (2D, no pml): the fused step's tile
+//   TILE0, TILE1, TILE2 (no pml): the fused step's tile
 
 #ifdef USE_PML
 // the slowest axis' blocks alternately from either end, so the slabs there run
@@ -665,12 +665,19 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
 #endif
 }
 
-#if NDIM == 2 && defined(TILE0) && !defined(USE_PML)
+#if NDIM >= 2 && defined(TILE0) && !defined(USE_PML)
 // ------------------------------------------------------------------------------------
 // the stresses of the block's tile and a ring a stencil radius wide around it
-#define RING (TILE0 + 2 * STENCIL_RADIUS)
 #define WIDE (TILE1 + 2 * STENCIL_RADIUS)
-__global__ void __launch_bounds__(TILE0 *TILE1)
+#if NDIM == 2
+#define RING ((TILE0 + 2 * STENCIL_RADIUS) * WIDE)
+#define THREADS (TILE0 * TILE1)
+#else
+#define DEEP_ (TILE2 + 2 * STENCIL_RADIUS)
+#define RING ((TILE0 + 2 * STENCIL_RADIUS) * WIDE * DEEP_)
+#define THREADS (TILE0 * TILE1 * TILE2)
+#endif
+__global__ void __launch_bounds__(THREADS)
     fused_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
                  real_t *__restrict__ u2, const real_t *__restrict__ gamma,
                  const real_t lam, const real_t mu, const real_t rho,
@@ -678,19 +685,38 @@ __global__ void __launch_bounds__(TILE0 *TILE1)
                  const real_t *__restrict__ damping, const real_t dt,
 #endif
                  const int clamped, const int cs, const real_t e0,
-                 const real_t e1, AXIS_PARAMS) {
-  __shared__ real_t ss[NVOIGT * RING * WIDE];
+                 const real_t e1,
+#if NDIM == 3
+                 const real_t e2,
+#endif
+                 AXIS_PARAMS) {
+  extern __shared__ real_t ss[]; // NVOIGT * RING
+#if NDIM == 2
   const int b0 = blockIdx.y * TILE0 - STENCIL_RADIUS;
   const int b1 = blockIdx.x * TILE1 - STENCIL_RADIUS;
   const real_t E[2] = {e0, e1};
-  for (int t = threadIdx.y * TILE1 + threadIdx.x; t < RING * WIDE;
-       t += TILE0 * TILE1) {
+  for (int t = threadIdx.y * TILE1 + threadIdx.x; t < RING; t += THREADS) {
     const int g0 = b0 + t / WIDE, g1 = b1 + t % WIDE;
+    const bool inner = g0 > 0 && g0 < N0 - 1 && g1 > 0 && g1 < N1 - 1;
+    const int G[2] = {g0, g1}, GS[2] = {s0, 1}, GN[2] = {N0, N1};
+    const int at = g0 * s0 + g1;
+#else
+  const int b0 = blockIdx.z * TILE0 - STENCIL_RADIUS;
+  const int b1 = blockIdx.y * TILE1 - STENCIL_RADIUS;
+  const int b2 = blockIdx.x * TILE2 - STENCIL_RADIUS;
+  const real_t E[3] = {e0, e1, e2};
+  for (int t = (threadIdx.z * TILE1 + threadIdx.y) * TILE2 + threadIdx.x;
+       t < RING; t += THREADS) {
+    const int g0 = b0 + t / (WIDE * DEEP_), g1 = b1 + t / DEEP_ % WIDE;
+    const int g2 = b2 + t % DEEP_;
+    const bool inner = g0 > 0 && g0 < N0 - 1 && g1 > 0 && g1 < N1 - 1 &&
+                       g2 > 0 && g2 < N2 - 1;
+    const int G[3] = {g0, g1, g2}, GS[3] = {s0, s1, 1}, GN[3] = {N0, N1, N2};
+    const int at = g0 * s0 + g1 * s1 + g2;
+#endif
     real_t sig[NVOIGT];
     // stress_kernel's nodes; the scratch it writes is zero elsewhere
-    if (g0 > 0 && g0 < N0 - 1 && g1 > 0 && g1 < N1 - 1) {
-      const int G[2] = {g0, g1}, GS[2] = {s0, 1}, GN[2] = {N0, N1};
-      const int at = g0 * s0 + g1;
+    if (inner) {
       if (deep_node(G, GN))
         stress_point<true>(u1, gamma, at, cs, G, GS, GN, E, lam, mu, clamped,
                            sig);
@@ -703,7 +729,7 @@ __global__ void __launch_bounds__(TILE0 *TILE1)
     }
 #pragma unroll
     for (int v = 0; v < NVOIGT; ++v)
-      ss[v * RING * WIDE + t] = sig[v];
+      ss[v * RING + t] = sig[v];
   }
   __syncthreads();
 
@@ -711,18 +737,25 @@ __global__ void __launch_bounds__(TILE0 *TILE1)
   INTERIOR_OR_RETURN;
   AXIS_GEOM;
   AXIS_FACTORS;
+#if NDIM == 2
   const int local = (threadIdx.y + STENCIL_RADIUS) * WIDE + threadIdx.x +
                     STENCIL_RADIUS;
   const int T[2] = {WIDE, 1};
+#else
+  const int local =
+      ((threadIdx.z + STENCIL_RADIUS) * WIDE + threadIdx.y + STENCIL_RADIUS) *
+          DEEP_ +
+      threadIdx.x + STENCIL_RADIUS;
+  const int T[3] = {WIDE * DEEP_, DEEP_, 1};
+#endif
   const bool deep = deep_node(A, NN);
 #pragma unroll
   for (int c = 0; c < NDIM; ++c) {
     if (A[c] > NN[c] - 3)
       continue; // no unknown on the staggered ghost of its own axis
     const real_t force =
-        deep ? nodal_force<true>(ss, local, RING * WIDE, T, c, A, NN, F,
-                                 clamped)
-             : nodal_force(ss, local, RING * WIDE, T, c, A, NN, F, clamped);
+        deep ? nodal_force<true>(ss, local, RING, T, c, A, NN, F, clamped)
+             : nodal_force(ss, local, RING, T, c, A, NN, F, clamped);
     const int n = c * cs + idx;
     const real_t mi =
         deep ? point_minv<true>(gamma, idx, c, A, S, NN, rho, clamped)

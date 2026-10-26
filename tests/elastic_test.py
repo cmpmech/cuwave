@@ -457,19 +457,23 @@ class FusedTest(unittest.TestCase):
     def test_the_fused_step_is_the_pair_bit_for_bit(self):
         rng = np.random.default_rng(5)
         mixed = ((Traction, Clamped), (Clamped, Traction))
+        mixed3 = (*mixed, (Traction, Traction))
         cases = (
-            (2, None, "float32", False),
-            (4, Clamped, "float32", False),
-            (4, mixed, "float32", True),
-            (8, None, "float32", False),
-            (4, mixed, "float64", False),
+            ((37, 70), 2, None, "float32", False),
+            ((37, 70), 4, Clamped, "float32", False),
+            ((37, 70), 4, mixed, "float32", True),
+            ((37, 70), 8, None, "float32", False),
+            ((37, 70), 4, mixed, "float64", False),
+            ((13, 21, 40), 2, Clamped, "float32", False),
+            ((13, 21, 40), 4, mixed3, "float32", True),
+            ((13, 21, 40), 2, None, "float64", False),
         )
-        for order, boundary, precision, damped in cases:
-            with self.subTest(order=order, b=boundary, p=precision, damped=damped):
-                sim = _sim((37, 70), 1, precision, order, boundary=boundary)
+        for Nx, order, boundary, precision, damped in cases:
+            with self.subTest(Nx=Nx, order=order, b=boundary, damped=damped):
+                sim = _sim(Nx, 1, precision, order, boundary=boundary)
                 gamma = cp.asarray(0.4 + rng.random(sim.Nx_padded), dtype=sim.dtype)
                 if damped:
-                    sim = replace(sim, damping=sponge(sim, gamma, 6, 0.3))
+                    sim = replace(sim, damping=sponge(sim, gamma, 3, 0.3))
                 mat = sim.build_materials(gamma)
                 # a grid this small takes the pair
                 pair = sim._define_pair(compile_kernels(sim), mat, adjoint=False)
