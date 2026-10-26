@@ -11,6 +11,7 @@ transpose at every order.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ from .wave import (
     Simulation,
     apply_cell_weights,
     axis_geometry,
+    compile_kernels,
     grid_block,
     pair_average_adjoint,
     point_average_adjoint,
@@ -34,6 +36,7 @@ from .wave import (
 
 KERNEL_PATH = Path(__file__).parent / "kernels" / "elastic.cu"
 SENSITIVITY_PATH = Path(__file__).parent / "kernels" / "elastic_sensitivity.cu"
+FUSED_TILE = (16, 32)  # nodes of the fused 2D step's tile, a thread each
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -202,7 +205,13 @@ class ElasticWave(Simulation):
         return self._define_pair(kernels, mat, adjoint=self.pml is not None)
 
     def _define_pair(self, kernels: cp.RawModule, mat: dict, adjoint: bool) -> Callable:
-        """The stress and update launches, a pml folded into both."""
+        """The stress and update launches, a pml folded into both; fused in 2D past L2."""
+        # one launch where DRAM bounds the pair: u three times, the stresses, the design
+        nodes = math.prod(self.Nx)
+        fields = (3 * self.ndim + self.nvoigt + 1) * nodes * self.dtype().itemsize
+        spills = fields > cp.cuda.Device().attributes["L2CacheSize"]
+        if self.ndim == 2 and self.pml is None and spills:
+            return self._define_fused(mat)
         grid, block = grid_block(self)
         stress_kernel = kernels.get_function("stress_kernel")
         fd_kernel = kernels.get_function("fd_kernel")
@@ -223,6 +232,26 @@ class ElasticWave(Simulation):
             return u2
 
         fd_step.memory = memory
+        return fd_step
+
+    def _define_fused(self, mat: dict) -> Callable:
+        """The 2D step as one launch, each block's stresses in shared memory, ring included."""
+        tile = FUSED_TILE
+        flags = (f"-DTILE0={tile[0]}", f"-DTILE1={tile[1]}")
+        kernel = compile_kernels(self, flags=flags).get_function("fused_kernel")
+        grid = (-(-self.Nx_padded[1] // tile[1]), -(-self.Nx[0] // tile[0]))
+        args = [None, None, None, *self.stress_material(mat)]
+        args += [self.dtype(self.density), *self.damping_args(mat)]
+        args += [face_mask(self, Clamped), np.int32(self.comp_stride)]
+        args += [self.dtype(1.0 / d) for d in self.dx]
+        args += axis_geometry(self, self.step_factors())
+
+        def fd_step(u0, u1, u2):
+            args[0], args[1], args[2] = u0, u1, u2
+            kernel(grid, tile[::-1], args)
+            return u2
+
+        fd_step.memory = []
         return fd_step
 
     def _pml_fold(self, adjoint: bool) -> tuple[list, list]:

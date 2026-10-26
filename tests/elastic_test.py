@@ -8,6 +8,10 @@ rest on. And the staggering shifts every component off the nodes, so sources, se
 and the reconstruction strip must all honour the half-node offsets. The shear terms
 couple diagonal neighbours, so the strip of a layer lining both axes needs its corners.
 
+`FusedTest` pins the one-launch 2D step a grid past L2 takes to the stress and update
+pair bit for bit: it recomputes the stresses of a ring around each tile, so a ring too
+narrow or a wall term read off the wrong tile would show at once.
+
 `PmlTest` pins the two conditions the elastic pml is only stable under, both refused
 when broken: the CFS shift, without which the cross terms grow a static mode, and a
 clamped wall behind the layer, since a traction wall there holds a growing surface wave.
@@ -448,6 +452,39 @@ class VariantTest(unittest.TestCase):
 
 
 # ------------------------------- transducers and validation --------------------------
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class FusedTest(unittest.TestCase):
+    def test_the_fused_step_is_the_pair_bit_for_bit(self):
+        rng = np.random.default_rng(5)
+        mixed = ((Traction, Clamped), (Clamped, Traction))
+        cases = (
+            (2, None, "float32", False),
+            (4, Clamped, "float32", False),
+            (4, mixed, "float32", True),
+            (8, None, "float32", False),
+            (4, mixed, "float64", False),
+        )
+        for order, boundary, precision, damped in cases:
+            with self.subTest(order=order, b=boundary, p=precision, damped=damped):
+                sim = _sim((37, 70), 1, precision, order, boundary=boundary)
+                gamma = cp.asarray(0.4 + rng.random(sim.Nx_padded), dtype=sim.dtype)
+                if damped:
+                    sim = replace(sim, damping=sponge(sim, gamma, 6, 0.3))
+                mat = sim.build_materials(gamma)
+                # a grid this small takes the pair
+                pair = sim._define_pair(compile_kernels(sim), mat, adjoint=False)
+                fused = sim._define_fused(mat)
+                shape = (sim.ncomp, *sim.Nx_padded)
+                u0, u1 = (
+                    cp.asarray(rng.standard_normal(shape), dtype=sim.dtype)
+                    for _ in range(2)
+                )
+                a = pair(u0, u1, cp.zeros_like(u0))
+                b = fused(u0, u1, cp.zeros_like(u0))
+                self.assertGreater(float(cp.abs(a).max()), 0.0)
+                self.assertTrue(bool(cp.array_equal(a, b)))
+
+
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class PmlTest(unittest.TestCase):
     def test_a_long_run_decays_with_a_free_surface_crossing_the_layer(self):

@@ -12,6 +12,7 @@ The forward kernels of the staggered [elastic](elastic.md) equation: one pass fo
 | `USE_PML` | `pml is not None` | folds the pml memory terms into both step kernels, adds their per-axis arguments and the `phase`, and orders the blocks along axis 0 by `BLOCK_ROW` |
 | `STENCIL_RADIUS` | `space_order // 2` | taps per staggered difference, prepended by [stencils](stencils.md) |
 | `STAG_COEFFS` | `staggered_weights` | the graded coefficient table, prepended alongside |
+| `TILE0`, `TILE1` | `FUSED_TILE`, by `ElasticWave.define_step` in 2D without a pml where the fields spill out of L2 | compiles `fused_kernel`, the tile one block steps |
 
 `NPAIRS` is $\textrm{ndim}\left(\textrm{ndim}-1\right)/2$ and `NVOIGT` is `NDIM + NPAIRS`, the stress components held back to back in the `sigma` scratch. `SG_W(r, k)` reads coefficient $k$ of the radius-$r$ row from `__constant__` memory, collapsing to 1 at `STENCIL_RADIUS` 1. `PAIR_ROW(k, l)` maps an axis pair onto its Voigt row, `NDIM + 3 - k - l` in 3D and 2 in 2D
 
@@ -194,6 +195,18 @@ one thread per grid point, updating every component whose unknown it carries
 $$f_c=\frac{1}{\Delta x_c}\sum_k c_k^{\left(r\left(a\right)\right)}\left(\sigma_{cc}^{i+k}-\sigma_{cc}^{i-k+1}\right)+\sum_{l\ne c}\frac{1}{\Delta x_l}\sum_j c_j^{\left(r\left(a\right)\right)}\left(\sigma_{cl}^{i+j-1}-\sigma_{cl}^{i-j}\right)$$
 - the march is the three-term recursion of [cuda_scalar](cuda_scalar.md), component by component, `USE_DAMPING` dividing by $1+\beta$ with one damping field serving every component
 - under `USE_PML`, `force_memory` of every lined axis adds onto the update, $u_c^t\mathrel{+}=m_c^{-1}\zeta_c$, and the adjoint then settles its strain memories with `settle_memory`
+
+### fused_kernel
+`stress_kernel` and `fd_kernel` in one launch, bitwise the pair; 2D without a pml
+**parallelization**
+one block per tile of `TILE0` $\times$ `TILE1` nodes, a thread each; the block first forms the stresses of the tile and of a ring `STENCIL_RADIUS` wide around it, then updates its own nodes
+**input args**
+`u0`, `u1`, `u2`, `gamma`, `rho`, `damping`, `dt`, `clamped`, `cs`, `f0`, `f1`: as `fd_kernel`; `lam`, `mu`: as `stress_kernel`; `e0`, `e1`: $1/\Delta x_d$, the factors `stress_kernel` takes
+**internal args**
+`ss`: the `NVOIGT` stresses of the tile and its ring in shared memory, zero where `stress_kernel` writes nothing (off the interior); `local`, `T`: the node's place and strides in it, which `nodal_force` reads through as it would the `sigma` scratch
+**how?**
+- the ring holds every stress the divergence of a tile node reaches, so a block needs nothing another block forms; the ring's stresses are formed twice, once by each block that reads them
+- the stresses never travel through memory: a step reads $u^{t-1}$, $u^{t-2}$ and the design and writes $u^t$, against the pair's extra write and read of every stress, which halves the traffic where DRAM bounds the step. While the scratch fits in L2 the pair stays as fast or faster, so `define_step` keeps it there
 
 ### excitation_kernel
 From the shared prelude, so this file does not carry it; see [cuda_scalar](cuda_scalar.md). A vector source is `NDIM` entries of `lin_index`, one per component, at `d * cs + idx`, so the `atomicAdd` covers a source and a sensor landing on the same point and component
