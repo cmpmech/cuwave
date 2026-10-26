@@ -522,7 +522,7 @@ class PressureWave(Simulation):
             clear[chunk, hit.tiles[0][h], hit.tiles[1][h]] = False
         packed = b0 << 20 | b1 << 10 | b2
 
-        # the two kernels and their arguments, the pointers swapped per launch
+        # each kind of block its kernel and its list
         flags = (f"-DSTEPS={steps}", f"-DTILE1={tile[0]}", f"-DTILE2={tile[1]}")
         flags += (f"-DPLANES={planes}",)
         launches = []
@@ -535,6 +535,8 @@ class PressureWave(Simulation):
             kernel.max_dynamic_shared_size_bytes = shared
             blocks = cp.asarray(packed[clear == kind], dtype=cp.int32)
             launches.append((kernel, (len(blocks),), blocks))
+
+        # the arguments both share, the pointers swapped per launch
         weights = self.excitation_weights(mat, sources)
         args = [None, None, None, None, *self.step_kernel_args(mat), None, weights]
         args += [np.int32(len(sources)), None, np.int32(len(targets)), *lists, None]
