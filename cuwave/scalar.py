@@ -153,25 +153,25 @@ def _column_lists(
 
 def _blocked(
     steps: int,
-    kernel: cp.RawKernel,
-    grid: tuple[int, ...],
+    launches: list[tuple[cp.RawKernel, tuple[int, ...], cpt.NDArray | None]],
     block: tuple[int, ...],
     shared: int,
     args: list,
-    slots: tuple[int, int, int],
+    slots: tuple[int, int, int, int | None],
 ) -> Blocked:
-    """The launch of a blocked `kernel`, `step(U, V, t, signal, record)`.
+    """The launches of a blocked kernel, `step(U, V, t, signal, record)`.
 
     Args:
-        steps: the steps one launch advances.
-        kernel: the blocked kernel, whose first four arguments are u0, u1, v0, v1.
-        grid: thread blocks per launch.
+        steps: the steps one call advances.
+        launches: (kernel, grid, blocks) each, `blocks` the list the kernel decodes
+            its thread block from, or None; every kernel takes u0, u1, v0, v1 first.
         block: threads per block.
         shared: dynamic shared memory per block in bytes.
-        args: the kernel's arguments, the fields and `slots` filled per call.
-        slots: the positions of the signal, the record and the first step in `args`.
+        args: the kernels' arguments, the fields and `slots` filled per call.
+        slots: the positions of the signal, the record, the first step and the block
+            list in `args`, the last None without one.
     """
-    at_signal, at_record, at_t = slots
+    at_signal, at_record, at_t, at_blocks = slots
     dummy = cp.zeros(1, dtype=args[4].dtype)
 
     def blocked_step(U, V, t, signal, record=None):
@@ -181,7 +181,10 @@ def _blocked(
         args[at_signal] = signal
         args[at_record] = dummy if record is None else record
         args[at_t] = np.int32(t)
-        kernel(grid, block, args, shared_mem=shared)
+        for kernel, grid, blocks in launches:
+            if blocks is not None:
+                args[at_blocks] = blocks
+            kernel(grid, block, args, shared_mem=shared)
 
     return Blocked(steps, blocked_step)
 
@@ -451,11 +454,11 @@ class PressureWave(Simulation):
         weights = self.excitation_weights(mat, sources)
         args = [None, None, None, None, *self.step_kernel_args(mat), None, weights]
         args += [np.int32(len(sources)), None, np.int32(len(targets)), *lists, None]
-        slots = (len(args) - 10, len(args) - 7, len(args) - 1)
+        slots = (len(args) - 10, len(args) - 7, len(args) - 1, None)
         args += [face_mask(self, Neumann), face_mask(self, Dirichlet)]
         args += axis_geometry(self, self.step_factors())
-        grid, block = tuple(cores[::-1]), (tile[1], rows)
-        return _blocked(steps, kernel, grid, block, shared, args, slots)
+        launches = [(kernel, tuple(cores[::-1]), None)]
+        return _blocked(steps, launches, (tile[1], rows), shared, args, slots)
 
     def _define_marched_step(
         self, mat: dict, source: Source, sensors: cpt.NDArray[cp.int32] | None
@@ -477,6 +480,9 @@ class PressureWave(Simulation):
         tile, steps, planes = MARCHED_BLOCK
         core = [t - 2 * steps for t in tile]
         cores = _cores(self.Nx[1:], tile, steps)
+        chunks = -(-(self.Nx[0] - 2) // planes)
+        if max(cores) >= 1024 or chunks >= 2048:
+            return None  # the block list packs 10 bits a tile axis and 11 a chunk
         # u of all steps but the last twice, the stiffness twice, two means on steps + 1
         shared = (4 * steps + 4) * (tile[0] + 2) * (tile[1] + 2) * 4
         if shared > device["MaxSharedMemoryPerBlockOptin"]:
@@ -502,18 +508,40 @@ class PressureWave(Simulation):
         for hit, point in zip(hits, points):
             lists += _column_lists(hit, point[0], tile, core, steps, cores)
 
-        # the kernel and its arguments, the pointers swapped per launch
+        # blocks whose march stays clear of the walls, a source's reach and a sensor
+        b0, b1, b2 = np.meshgrid(*map(np.arange, (chunks, *cores)), indexing="ij")
+        first = 1 + np.arange(chunks) * planes
+        last = np.minimum(first + planes, self.Nx[0] - 1)
+        clear = ((first - 2 * steps >= 1) & (last + steps <= self.Nx[0] - 3))[b0]
+        for b, n, t, c in zip((b1, b2), self.Nx[1:], tile, core):
+            clear &= (b * c + 1 - steps >= 1) & (b * c - steps + t <= n - 2)
+        for hit, point, reach in zip(hits, points, ((2 * steps, steps), (0, 0))):
+            plane = point[0][hit.j][:, None]
+            touched = (first - reach[0] <= plane) & (plane < last + reach[1])
+            h, chunk = np.nonzero(touched)
+            clear[chunk, hit.tiles[0][h], hit.tiles[1][h]] = False
+        packed = b0 << 20 | b1 << 10 | b2
+
+        # the two kernels and their arguments, the pointers swapped per launch
         flags = (f"-DSTEPS={steps}", f"-DTILE1={tile[0]}", f"-DTILE2={tile[1]}")
-        kernels = compile_kernels(self, flags=(*flags, f"-DPLANES={planes}"))
-        kernel = kernels.get_function("blocked_kernel")
-        kernel.max_dynamic_shared_size_bytes = shared
+        flags += (f"-DPLANES={planes}",)
+        launches = []
+        for kind in (True, False):
+            if not (clear == kind).any():
+                continue
+            extra = ("-DINTERIOR",) if kind else ()
+            kernels = compile_kernels(self, flags=flags + extra)
+            kernel = kernels.get_function("blocked_kernel")
+            kernel.max_dynamic_shared_size_bytes = shared
+            blocks = cp.asarray(packed[clear == kind], dtype=cp.int32)
+            launches.append((kernel, (len(blocks),), blocks))
         weights = self.excitation_weights(mat, sources)
         args = [None, None, None, None, *self.step_kernel_args(mat), None, weights]
         args += [np.int32(len(sources)), None, np.int32(len(targets)), *lists, None]
-        slots = (len(args) - 10, len(args) - 7, len(args) - 1)
+        slots = (len(args) - 10, len(args) - 7, len(args) - 1, len(args) + 9)
         args += [face_mask(self, Dirichlet), *axis_geometry(self, self.step_factors())]
-        grid = (cores[1], cores[0], -(-(self.Nx[0] - 2) // planes))
-        return _blocked(steps, kernel, grid, tile[::-1], shared, args, slots)
+        args += [None, np.int32(cores[1])]
+        return _blocked(steps, launches, tile[::-1], shared, args, slots)
 
     def step_kernel_args(self, mat: dict) -> tuple:
         """Material and damping arguments for the finite-difference step kernel."""

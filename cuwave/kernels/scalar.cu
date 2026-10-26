@@ -5,7 +5,7 @@
 //   USE_DOMAIN
 //   USE_STREAM, STREAM_TX
 //   STEPS, TILE0, TILE1, ROWS (2D)
-//   STEPS, TILE1, TILE2, PLANES (3D, order 2)
+//   STEPS, TILE1, TILE2, PLANES, INTERIOR (3D, order 2)
 
 // spatial finite difference stencil for Laplacian, `u(j)` the tap j nodes on
 template <class Taps>
@@ -632,6 +632,11 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
 #define WIDE (TILE2 + 2) // a tile row with its guard columns
 #define AREA ((TILE1 + 2) * WIDE)
 #define AT(y, x) (((y) + 1) * WIDE + (x) + 1)
+#ifdef INTERIOR
+#define WALLS 0 // a march clear of the walls, the sources and the sensors
+#else
+#define WALLS 1
+#endif
 
 // march a column of tiles along axis 0, step k k planes behind the one loaded:
 // the step, excitation, refill and record, bitwise the plain launches
@@ -652,38 +657,43 @@ __global__ void __launch_bounds__(TILE1 *TILE2)
                    const int2 *__restrict__ sensor_entries, const int t0,
                    const int dirichlet, const real_t f0, const int N0,
                    const real_t f1, const int N1, const int s0, const real_t f2,
-                   const int N2, const int s1) {
+                   const int N2, const int s1, const int *__restrict__ blocks,
+                   const int columns) {
   // u of steps 0 .. STEPS - 1 twice, the stiffness twice and the in-plane cell
   // means toward +1 on STEPS + 1 planes, each plane in a guard ring
   extern __shared__ real_t shared[];
   const int tx = threadIdx.x, ty = threadIdx.y, i = AT(ty, tx);
-  const int lo1 = 1 + blockIdx.y * C1, lo2 = 1 + blockIdx.x * C2;
+  const int block = blocks[blockIdx.x]; // chunk << 20 | tile row << 10 | column
+  const int b1 = block >> 10 & 1023, b2 = block & 1023;
+  const int lo1 = 1 + b1 * C1, lo2 = 1 + b2 * C2;
   const int a1 = lo1 - HALO + ty, a2 = lo2 - HALO + tx, c = a1 * s1 + a2;
-  const int first = 1 + blockIdx.z * PLANES, last = min(first + PLANES, N0 - 1);
-  const bool col = a1 >= 0 && a1 <= N1 - 1 && a2 >= 0 && a2 <= N2 - 1;
-  const bool inner = a1 > 0 && a1 < N1 - 1 && a2 > 0 && a2 < N2 - 1;
-  const bool side =
-      col && !inner && (a1 > 0 && a1 < N1 - 1 || a2 > 0 && a2 < N2 - 1);
-  const bool corner = col && !inner && !side;
+  const int first = 1 + (block >> 20) * PLANES;
+  const int last = min(first + PLANES, N0 - 1);
+  const bool col = !WALLS || a1 >= 0 && a1 <= N1 - 1 && a2 >= 0 && a2 <= N2 - 1;
+  const bool inner = !WALLS || a1 > 0 && a1 < N1 - 1 && a2 > 0 && a2 < N2 - 1;
+  const bool side = WALLS && col && !inner &&
+                    (a1 > 0 && a1 < N1 - 1 || a2 > 0 && a2 < N2 - 1);
+  const bool corner = WALLS && col && !inner && !side;
   const int k1 = owner(a1, N1), k2 = owner(a2, N2);
   const bool owned =
       col && k1 >= lo1 && k1 < lo1 + C1 && k2 >= lo2 && k2 < lo2 + C2;
 
   // the face ghosts this column mirrors, -/+ axis 1 then -/+ axis 2, and which
   // of them the tile holds
-  const unsigned faces = inner ? (a1 == 2) | (a1 == N1 - 3) << 1 |
-                                     (a2 == 2) << 2 | (a2 == N2 - 3) << 3
-                               : 0;
+  const unsigned faces = WALLS && inner
+                             ? (a1 == 2) | (a1 == N1 - 3) << 1 |
+                                   (a2 == 2) << 2 | (a2 == N2 - 3) << 3
+                             : 0;
   const unsigned within = (ty >= 2) | (ty + 2 < TILE1) << 1 | (tx >= 2) << 2 |
                           (tx + 2 < TILE2) << 3;
   const real_t low = dirichlet & 1 ? -1 : 1, high = dirichlet & 2 ? -1 : 1;
 
   // the column's sources and sensors by plane, from the march's first: `se` the
   // first a step still adds, `sz` the first past the plane loaded
-  const int key =
-      ((blockIdx.y * gridDim.x + blockIdx.x) * TILE1 + ty) * TILE2 + tx;
-  int se = source_starts[key], re = sensor_starts[key];
-  const int se_end = source_starts[key + 1], re_end = sensor_starts[key + 1];
+  const int key = ((b1 * columns + b2) * TILE1 + ty) * TILE2 + tx;
+  int se = WALLS ? source_starts[key] : 0, re = WALLS ? sensor_starts[key] : 0;
+  const int se_end = WALLS ? source_starts[key + 1] : 0;
+  const int re_end = WALLS ? sensor_starts[key + 1] : 0;
   while (se < se_end && source_entries[se].x < first - HALO)
     ++se;
   while (re < re_end && sensor_entries[re].x < first)
@@ -719,7 +729,7 @@ __global__ void __launch_bounds__(TILE1 *TILE2)
     const real_t lu0 = nu0, lu1 = nu1, ls = ns, lm = nm;
     real_t *skz = sk + (z & 1) * AREA;
     skz[i] = ls;
-    load = col && z + 1 >= 0 && z + 1 <= N0 - 1 && z + 1 < end;
+    load = col && (!WALLS || z + 1 >= 0 && z + 1 <= N0 - 1) && z + 1 < end;
     const int ahead = (z + 1) * s0 + c;
     nu0 = load ? u0[ahead] : 0;
     nu1 = load ? u1[ahead] : 0;
@@ -729,7 +739,7 @@ __global__ void __launch_bounds__(TILE1 *TILE2)
 
     // what nothing steps keeps through the launch: an edge or a corner
     const bool ends = z == 0 || z == N0 - 1;
-    if ((corner || side && ends) && owned && z >= 0 && z <= N0 - 1) {
+    if (WALLS && (corner || side && ends) && owned && z >= 0 && z <= N0 - 1) {
       const int kz = owner(z, N0);
       if (kz >= first && kz < last) {
         v0[z * s0 + c] = STEPS % 2 ? lu1 : lu0;
@@ -773,7 +783,7 @@ __global__ void __launch_bounds__(TILE1 *TILE2)
       const int q = z - k;
       const real_t uc = Q[k - 1][1];
       real_t u = k == 1 ? P[0] : Q[k - 2][0]; // held where nothing steps
-      if (inner && q > 0 && q < N0 - 1) {
+      if (inner && (!WALLS || q > 0 && q < N0 - 1)) {
         const real_t *cu = cur + (k - 1) * AREA;
         const real_t *g =
             means + (slot + STEPS + 1 - k) % (STEPS + 1) * 2 * AREA;
@@ -817,7 +827,7 @@ __global__ void __launch_bounds__(TILE1 *TILE2)
         // the face ghosts' refill: in the plane through the stored level, along
         // axis 0 through the queue, and the last level written back
         if (k < STEPS) {
-          if (faces & within)
+          if (WALLS && faces & within)
 #pragma unroll
             for (int m = 0; m < 4; ++m)
               if ((faces & within) >> m & 1) {
@@ -829,7 +839,7 @@ __global__ void __launch_bounds__(TILE1 *TILE2)
           const real_t w = Q[STEPS - 1][1];
           v0[idx] = w;
           v1[idx] = u;
-          if (faces)
+          if (WALLS && faces)
 #pragma unroll
             for (int m = 0; m < 4; ++m)
               if (faces >> m & 1) {
@@ -838,25 +848,25 @@ __global__ void __launch_bounds__(TILE1 *TILE2)
                 v0[idx + reach] = flip ? -w : w;
                 v1[idx + reach] = flip ? -u : u;
               }
-          if (q == 2) {
+          if (WALLS && q == 2) {
             v0[c] = low * w;
             v1[c] = low * u;
           }
-          if (q == N0 - 3) {
+          if (WALLS && q == N0 - 3) {
             v0[(N0 - 1) * s0 + c] = high * w;
             v1[(N0 - 1) * s0 + c] = high * u;
           }
         }
       }
       if (k < STEPS) {
-        if (q == N0 - 1 && inner)
+        if (WALLS && q == N0 - 1 && inner)
           u = high * Q[k][1];
         Q[k][0] = Q[k][1];
         Q[k][1] = Q[k][2];
         Q[k][2] = u;
-        if (q == 2 && inner)
+        if (WALLS && q == 2 && inner)
           Q[k][0] = low * u;
-        if (!side || q <= 0 || q >= N0 - 1)
+        if (!WALLS || !side || q <= 0 || q >= N0 - 1)
           nxt[k * AREA + i] = u;
       }
     }

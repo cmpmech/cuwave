@@ -285,10 +285,11 @@ def _scalar3d(boundary, N, Nx=(259, 243, 243)):
 
 
 def _shot3d(sim, seed):
-    """Sources beside two corners and inside, sensors by the walls and along a column."""
+    """Sources beside two corners, a wall and inside, sensors by the walls and along a column."""
     n = sim.Nx
-    signal = np.random.default_rng(seed).standard_normal((sim.N, 3))
-    position = [[2, n[0] - 3, n[0] // 2], [2, n[1] - 3, n[1] // 3], [3, n[2] - 3, 7]]
+    signal = np.random.default_rng(seed).standard_normal((sim.N, 4))
+    position = [[2, n[0] - 3, n[0] // 2, 100], [2, n[1] - 3, n[1] // 3, 120]]
+    position += [[3, n[2] - 3, 7, 120]]
     column = [[a, 5, n[2] // 2] for a in range(1, 12)]
     near = [[1, 1, 1], [n[0] - 2, n[1] - 2, n[2] - 2], [n[0] - 2, 2, 50], [70, 1, 9]]
     sensors = np.array(column + near + [[66, 30, n[2] - 2], [3, 2, 3]]).T
@@ -319,7 +320,7 @@ class MarchedTest(unittest.TestCase):
     def test_a_marched_run_is_the_plain_run_bit_for_bit(self):
         mixed = ((Neumann, Dirichlet), (Dirichlet, Neumann), (Dirichlet, Dirichlet))
         for boundary in (None, mixed):
-            for N in (3, 14):
+            for N in (3, 41):
                 with self.subTest(boundary=boundary, N=N):
                     self._assert_bitwise(*_runs3d(_scalar3d(boundary, N), 3))
 
