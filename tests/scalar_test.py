@@ -14,6 +14,7 @@ It claims the plain run bit for bit, so it is compared with `array_equal` over o
 boundaries, damping, inertia, tiles, step counts and sources and sensors on the wall.
 """
 
+import itertools
 import unittest
 from dataclasses import replace
 from unittest import mock
@@ -212,12 +213,14 @@ class BlockedTest(unittest.TestCase):
                         self._assert_bitwise(*_runs(sim, order))
 
     def test_every_tile_and_step_count(self):
-        sim = _scalar(4, "float32", Dirichlet, N=50)
-        for tile, rows in (((32, 64), 8), ((32, 64), 4), ((64, 64), 16), ((32, 96), 8)):
-            for steps in (1, 2, 3, 4):
-                with self.subTest(tile=tile, rows=rows, steps=steps):
-                    blocks = ((tile, rows, steps),) * 2
-                    self._assert_bitwise(*_runs(sim, 6, SMALL_BLOCKS=blocks))
+        tiles = (((32, 64), 8), ((32, 64), 4), ((64, 64), 16), ((32, 96), 8))
+        for order, tile, steps in itertools.product((2, 4), tiles, (1, 2, 3, 4, 6, 12)):
+            if min(tile[0]) - 2 * steps * order // 2 < 8:
+                continue
+            with self.subTest(order=order, tile=tile, steps=steps):
+                sim = _scalar(order, "float32", Dirichlet, N=50)
+                blocks = (((tile[0], tile[1], steps),),) * 2
+                self._assert_bitwise(*_runs(sim, 6, SMALL_BLOCKS=blocks))
 
     def test_the_damped_update_and_a_formed_inertia(self):
         sim = AcousticWave(

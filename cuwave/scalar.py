@@ -39,10 +39,19 @@ from .wave import (
 KERNEL_PATH = Path(__file__).parent / "kernels" / "scalar.cu"
 SENSITIVITY_PATH = Path(__file__).parent / "kernels" / "scalar_sensitivity.cu"
 CHUNK_ROWS = 64  # axis-0 rows one streaming block marches
-SMALL_BLOCKS = (((32, 64), 8, 6), ((32, 64), 8, 4))  # by radius: tile, rows, steps
+# by stencil radius, candidates (tile, thread rows, steps): the fewest waves of tiles
+SMALL_BLOCKS = (
+    (((32, 64), 8, 6), ((64, 64), 16, 12)),
+    (((32, 64), 8, 4), ((32, 64), 8, 3), ((64, 64), 16, 6)),
+)
 LARGE_BLOCKS = (((64, 64), 16, 6), None)  # by radius, for fields spilling out of L2
 STREAM_ORDER = 6  # below it L1 serves the plain step as well as the stream would
 STREAM_BLOCKS = 8  # per multiprocessor the stream needs to fill the device
+
+
+def _cores(Nx: tuple[int, ...], tile: tuple[int, int], halo: int) -> list[int]:
+    """Tiles per axis whose cores, `tile` less `halo` each side, cover the interior."""
+    return [-(-(n - 2) // (t - 2 * halo)) for n, t in zip(Nx, tile)]
 
 
 def _tile_lists(
@@ -294,7 +303,14 @@ class PressureWave(Simulation):
         resident = device["MultiProcessorCount"] * device["MaxThreadsPerMultiProcessor"]
         nodes = math.prod(self.Nx)
         if nodes <= 2 * resident:
-            block = SMALL_BLOCKS[radius - 1]
+            # one tile a multiprocessor at a time: the candidate with the fewest waves
+            sms = device["MultiProcessorCount"]
+            block = min(
+                SMALL_BLOCKS[radius - 1],
+                key=lambda b: (
+                    -(-math.prod(_cores(self.Nx, b[0], b[2] * radius)) // sms)
+                ),
+            )
         elif 16 * nodes > device["L2CacheSize"]:
             block = LARGE_BLOCKS[radius - 1]
         else:
@@ -306,7 +322,7 @@ class PressureWave(Simulation):
         tile, rows, steps = block
         halo = steps * radius
         core = [t - 2 * halo for t in tile]
-        cores = [-(-(n - 2) // c) for n, c in zip(self.Nx, core)]
+        cores = _cores(self.Nx, tile, halo)
 
         # sources in the interior, no node holding two sources or two sensors
         sources = flatten_indices(self, source.position)
