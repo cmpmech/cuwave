@@ -100,6 +100,15 @@ free functions in `wave.py`, not methods, precisely because two equations need t
 density; unset, both adjoint kernels carry no stencil at all, since a uniform `mu` leaves
 the stiffness with no design dependence.
 
+**Two forward paths skip launches and traffic, bitwise the plain ones.** A 2D float32
+pressure run (`simulate` only) takes `PressureWave.define_blocked_step`: tiles stepped
+several steps a launch in shared memory, the excitation, the Neumann/Dirichlet refill and
+the record inside the tile, launched through `march`'s graphs; only where launches
+(`SMALL_BLOCKS`, two waves of threads) or DRAM (`LARGE_BLOCKS`, fields past L2) bound the
+plain step, at orders 2 and 4, without pml or mask. The elastic stress and update pair
+becomes one `fused_kernel` (stresses of a tile and its ring in shared memory) where the
+fields spill out of L2 and the ring at most doubles the tile (2D, and 3D at order 2).
+
 **2D Maxwell needs none of that.** Out of plane one component survives and the curl-curl
 collapses to a flux divergence, so `maxwell.ElectricWave` (E_z, permittivity as inertia)
 and `maxwell.MagneticWave` (H_z, inverse permittivity as stiffness) are `PressureWave` on
@@ -291,6 +300,12 @@ the `docs/cuda_*.md` pages are the only ones that document arguments.
   `float32_array / np.float64_scalar` promotes.
 - **Drivers use nondimensional units** (L = c0 = rho0 = 1). SI-scale fields in float32 give
   gradients ~1e-20, whose square underflows Adam's second moment to zero and yields NaN.
+- **The blocked and fused steps are bitwise the plain kernels only through pinned
+  rounding.** nvcc contracts `a*b + c*d` into an fma either way round, differently per
+  kernel and per order, so `flux_divergence_means` and the blocked update spell the float32
+  rounding out with `MUL_RN`/`FMA_RN` (`common.cuh`) as `fd_kernel` compiles it. A change to
+  `fd_kernel`'s update, the flux or the damping term must be mirrored there; `BlockedTest`
+  and `FusedTest` catch a mismatch.
 - **Every timing brackets `cp.cuda.Stream.null.synchronize()` on both sides** — launches are
   asynchronous, so a bare `time.time()` pair measures the launch, not the kernel.
 
