@@ -51,13 +51,16 @@ CHUNK_ROWS = 64  # axis-0 rows one streaming block marches
 SMALL_BLOCKS = (
     (((32, 64), 8, 6), ((64, 64), 16, 12)),
     (((32, 64), 8, 4), ((32, 64), 8, 3), ((64, 64), 16, 6)),
+    (((32, 32), 32, 2), ((32, 32), 32, 1)),
+    (((32, 32), 32, 2), ((32, 32), 32, 1)),
 )
-LARGE_BLOCKS = (((64, 64), 16, 6), ((64, 64), 16, 4))  # by radius, fields past L2
-LARGE_SMS = (0, 64)  # by radius, the multiprocessors from which the large tier pays
+SMALL_SMS = (0, 0, 64, 64)  # by radius, multiprocessors from which the small tier pays
+LARGE_BLOCKS = (((64, 64), 16, 6), ((64, 64), 16, 4), None, None)  # by radius, past L2
+LARGE_SMS = (0, 64, 0, 0)  # by radius, multiprocessors from which the large tier pays
 FOLD_SMS = 64  # the multiprocessors from which the folded step beats its launches
-MIDDLE_WAVES = (9, 0)  # by radius, the waves of threads below which it pays in L2 too
+MIDDLE_WAVES = (9, 0, 0, 0)  # by radius, the waves of threads below which it pays in L2
 LARGE_L2 = 1.4  # the multiple of L2 past which DRAM bounds the plain step
-SMALL_WAVES = (2, 1.25)  # by radius, the waves of resident threads launches bound
+SMALL_WAVES = (2, 1.25, 0.5, 0.35)  # by radius, waves of threads launches bound
 MARCHED_BLOCK = ((32, 32), 4, 64)  # 3D order 2: (tile in the plane, steps, planes)
 MARCHED_ROWS = ((256, 12, 128), (256, 6, 128))  # 2D by radius: (columns, steps, rows)
 STREAM_ORDER = 6  # below it L1 serves the plain step as well as the stream would
@@ -413,9 +416,10 @@ class PressureWave(Simulation):
         takes steps, steps it in shared memory, refills its ghosts there and writes back
         its core: bitwise the step, excitation, refill and record launched one by one.
         Taken where launches or DRAM bound the plain step (`SMALL_BLOCKS`,
-        `LARGE_BLOCKS`); past L2 the march of `_define_marched_rows` first. In 3D see
-        `_define_marched_step`. None in 1D, in float64, above
-        order 4, with a pml, a domain mask, a condition other than Neumann or Dirichlet,
+        `LARGE_BLOCKS`), at orders 6 and 8 only on small grids of a GPU with
+        `SMALL_SMS` multiprocessors; past L2 the march of `_define_marched_rows` first.
+        In 3D see `_define_marched_step`. None in 1D, in float64, above order 8, with a
+        pml, a domain mask, a condition other than Neumann or Dirichlet,
         a source off the interior, two sources or sensors on one node, or an axis of
         fewer than 4 nodes.
         """
@@ -441,9 +445,9 @@ class PressureWave(Simulation):
             marched = self._define_marched_rows(mat, source, sensors)
             if marched is not None:
                 return marched
-        if nodes <= SMALL_WAVES[radius - 1] * resident:
+        sms = device["MultiProcessorCount"]
+        if nodes <= SMALL_WAVES[radius - 1] * resident and sms >= SMALL_SMS[radius - 1]:
             # one tile a multiprocessor at a time: the candidate with the fewest waves
-            sms = device["MultiProcessorCount"]
             block = min(
                 SMALL_BLOCKS[radius - 1],
                 key=lambda b: (
@@ -453,7 +457,7 @@ class PressureWave(Simulation):
         elif (
             16 * nodes > LARGE_L2 * device["L2CacheSize"]
             or nodes <= MIDDLE_WAVES[radius - 1] * resident
-        ) and device["MultiProcessorCount"] >= LARGE_SMS[radius - 1]:
+        ) and sms >= LARGE_SMS[radius - 1]:
             # a power-capped mobile GPU, few multiprocessors, cannot afford the halo
             block = LARGE_BLOCKS[radius - 1]
         else:
@@ -603,6 +607,8 @@ class PressureWave(Simulation):
         column mirrors both ghosts.
         """
         radius = self.space_order // 2
+        if radius > len(MARCHED_ROWS):
+            return None
         columns, steps, rows = MARCHED_ROWS[radius - 1]
         halo = steps * radius
         if not 2 <= halo <= 31 or self.Nx[1] == 5:

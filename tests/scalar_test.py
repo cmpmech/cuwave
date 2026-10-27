@@ -198,7 +198,10 @@ def _runs(sim, seed, sensed=True, **blocks):
     """The (field, record) of a run blocked as `blocks` patch, then of the plain run."""
     source, indicator, sensors = _shot(sim, seed)
     sensors = sensors if sensed else None
-    with mock.patch.multiple(scalar, **{"SMALL_BLOCKS": scalar.SMALL_BLOCKS, **blocks}):
+    # the small tier of every order on any GPU
+    small = {"SMALL_BLOCKS": scalar.SMALL_BLOCKS, "SMALL_SMS": (0,) * 4}
+    small["SMALL_WAVES"] = (*scalar.SMALL_WAVES[:2], 100, 100)
+    with mock.patch.multiple(scalar, **{**small, **blocks}):
         mat = sim.build_materials(indicator)
         assert sim.define_blocked_step(mat, source, sensors) is not None
         blocked = simulate(sim, source, indicator, sensors=sensors)
@@ -220,7 +223,7 @@ class BlockedTest(unittest.TestCase):
 
     def test_a_blocked_run_is_the_plain_run_bit_for_bit(self):
         mixed = ((Neumann, Dirichlet), (Dirichlet, Neumann))
-        for order in (2, 4):
+        for order in (2, 4, 6, 8):
             for boundary in (None, Dirichlet, mixed):
                 for N in (1, 5, 61):
                     with self.subTest(order=order, boundary=boundary, N=N):
@@ -229,12 +232,13 @@ class BlockedTest(unittest.TestCase):
 
     def test_every_tile_and_step_count(self):
         tiles = (((32, 64), 8), ((32, 64), 4), ((64, 64), 16), ((32, 96), 8))
-        for order, tile, steps in itertools.product((2, 4), tiles, (1, 2, 3, 4, 6, 12)):
+        orders = (2, 4, 6, 8)
+        for order, tile, steps in itertools.product(orders, tiles, (1, 2, 3, 4, 6, 12)):
             if min(tile[0]) - 2 * steps * order // 2 < 8 or steps * order // 2 < 2:
                 continue
             with self.subTest(order=order, tile=tile, steps=steps):
                 sim = _scalar(order, "float32", Dirichlet, N=50)
-                blocks = (((tile[0], tile[1], steps),),) * 2
+                blocks = (((tile[0], tile[1], steps),),) * 4
                 self._assert_bitwise(*_runs(sim, 6, SMALL_BLOCKS=blocks))
 
     def test_a_copied_simulation(self):
@@ -273,7 +277,7 @@ class BlockedTest(unittest.TestCase):
         self.assertIsNotNone(sim.define_blocked_step(mat, source, sensors))
         refused = {
             "float64": _scalar(2, "float64", N=6),
-            "order 8": _scalar(8, "float32", N=6),
+            "order 10": _scalar(10, "float32", N=6),
             "pml": replace(sim, pml=Pml(5, 1.0)),
             "sensor twice": sim,
         }
