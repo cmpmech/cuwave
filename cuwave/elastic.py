@@ -50,6 +50,7 @@ FUSED_TILE = ((16, 32), (4, 8, 32))  # in 2D, 3D: the fused step's tile, a threa
 BLOCKED = ((((32, 32), 32, 6), ((32, 32), 32, 4)), (((32, 32), 32, 2),))
 BLOCKED_WAVES = (4, 1)  # by radius, the waves of tiles the blocked step pays to
 LARGE_BLOCKED = (((32, 64), 16, 4), None)  # by radius, for fields well past L2
+LARGE_SMS = 64  # the multiprocessors from which it pays inside L2 too
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -289,8 +290,8 @@ class ElasticWave(Simulation):
         in shared memory and writes back its core: bitwise the pair, the excitation and
         the record launched one by one. Taken where launches bound the pair (the
         candidate of `BLOCKED` with the fewest waves of tiles, while those stay within
-        `BLOCKED_WAVES`) or DRAM does (`LARGE_BLOCKED`, order 2, fields past 2.25 times
-        L2); else None, as in 1D and 3D, in float64, above order 4, with a pml, a halo
+        `BLOCKED_WAVES`) and past them at order 2 (`LARGE_BLOCKED`: fields past 2.25
+        times L2, and inside L2 from `LARGE_SMS` multiprocessors); else None, as in 1D and 3D, in float64, above order 4, with a pml, a halo
         under 2 nodes, a source on a point the step holds, a sensor off the interior,
         or two sources or sensors on one point.
         """
@@ -317,7 +318,9 @@ class ElasticWave(Simulation):
         # the candidate, then a core and a halo as wide as its steps reach
         if min(waves) <= BLOCKED_WAVES[radius - 1]:
             block = BLOCKED[radius - 1][waves.index(min(waves))]
-        elif fields > 2.25 * device["L2CacheSize"]:
+        elif fields > 2.25 * device["L2CacheSize"] or (
+            fields <= device["L2CacheSize"] and sms >= LARGE_SMS
+        ):
             block = LARGE_BLOCKED[radius - 1]
         else:
             block = None
