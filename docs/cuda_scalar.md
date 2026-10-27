@@ -90,13 +90,14 @@ map a flat thread id `t` to the ghost node it owns and to the direction pointing
 `t`: flat thread index; `faces`: bitmask with bit $2d+\textrm{side}$ set when face (axis $d$, side) belongs to this launch, side 0 low and 1 high; `n`, `s`: from `BC_GEOM`
 **output args**
 `ghost`: flat index of the ghost node (by reference); `normal`: signed stride pointing inward, $+s_d$ on the low side and $-s_d$ on the high side (by reference); the return value is `false` for threads past the last node of the launch
-### mirror_ghosts
+### mirror_ghosts, holds_mirror
 **aim**
 the boundary refill folded into the per-thread `fd_kernel`: the node two in from a refilled face writes that face's ghost, as `homogeneous_neumann_kernel` and `homogeneous_dirichlet_kernel` would after the step
 **input args**
 `u`: the field just stepped; `idx`: the node; `v`: its new value; `d`: the axis; `a`: the node's index along it; `N`: the axis' extent, ghosts included; `s`: its stride
 **how?**
 - a face ghost has one mirror, two nodes in, and every interior node's other indices are interior, so the ghost it writes is a face ghost, never an edge or a corner, which the refill leaves alone too
+- `holds_mirror(b, size, N)` asks whether block `b`, `size` nodes along the axis from `b * size` on, reaches a mirror: only such blocks test their nodes, a branch uniform per block, so the blocks inside pay nothing for the fold
 - `simulate` then skips the refill launch, except where a source sits on a mirror: the excitation lands after the step, and the refill carries it into the ghost. Every other caller refills after the step, which writes the same values again
 
 ## pml helpers
