@@ -54,6 +54,8 @@ BLOCKED = (
     (((32, 32), 32, 2),),
 )
 BLOCKED_WAVES = (2, 1)  # by radius, the waves of tiles the blocked step pays to
+LARGE_BLOCKED = (((32, 128), 8, 6), None)  # by radius, for grids past those waves
+LARGE_SMS = 64  # the multiprocessors from which it pays inside L2 too
 FUSED_TILE = ((16, 32), (4, 8, 32))  # in 2D, 3D: the fused step's tile, a thread each
 FUSED_SMS = (0, 64)  # in 2D, 3D: the multiprocessors from which the ring's curl pays
 
@@ -355,14 +357,15 @@ class MaxwellWave(Simulation):
     def define_blocked_step(
         self, mat: dict, source: Source, sensors: cpt.NDArray[cp.int32] | None
     ) -> Blocked | None:
-        """The 2D step advancing several steps a launch on a small grid, excitation and record included, else None.
+        """The 2D step advancing several steps a launch, excitation and record included, else None.
 
         Each thread block loads a tile of both components with a halo of as many curl
         and force reaches as it takes steps, forms the curl and steps the tile in shared
         memory and writes back its core: bitwise the pair, the excitation and the record
         launched one by one. Taken where launches bound the pair (the candidate of
         `BLOCKED` with the fewest waves of tiles, while those stay within
-        `BLOCKED_WAVES`); else None, as in 3D, in float64, above order 4, with a pml or
+        `BLOCKED_WAVES`) and past them at order 2 (`LARGE_BLOCKED`, inside L2 only from
+        `LARGE_SMS` multiprocessors), where it beats the fused launch too; else None, as in 3D, in float64, above order 4, with a pml or
         a designed permeability, a source on a point the step holds, a sensor off the
         interior, or two sources or sensors on one point.
         """
@@ -377,18 +380,25 @@ class MaxwellWave(Simulation):
         ):
             return None
 
-        # launches bound a grid of few waves of tiles
+        # launches bound a grid of few waves of tiles, the traffic a larger one
         device = cp.cuda.Device().attributes
         sms = device["MultiProcessorCount"]
         waves = [
             -(-math.prod(tile_counts(self.Nx, b[0], b[2] * self.reach)) // sms)
             for b in BLOCKED[radius - 1]
         ]
-        if min(waves) > BLOCKED_WAVES[radius - 1] or (
-            BLOCKED[radius - 1][waves.index(min(waves))][2] * self.reach < 2
-        ):
+        fields = (4 * self.ndim + self.npairs) * math.prod(map(int, self.Nx)) * 4
+
+        # the candidate, then a core and a halo as wide as its steps reach
+        if min(waves) <= BLOCKED_WAVES[radius - 1]:
+            block = BLOCKED[radius - 1][waves.index(min(waves))]
+        elif fields > device["L2CacheSize"] or sms >= LARGE_SMS:
+            block = LARGE_BLOCKED[radius - 1]
+        else:
+            block = None
+        if block is None or block[2] * self.reach < 2:
             return None  # a halo under 2 leaves a ghost's mirror outside its tile
-        tile, rows, steps = BLOCKED[radius - 1][waves.index(min(waves))]
+        tile, rows, steps = block
         halo = steps * self.reach
         core = [t - 2 * halo for t in tile]
         cores = tile_counts(self.Nx, tile, halo)
