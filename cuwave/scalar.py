@@ -156,12 +156,13 @@ class PressureWave(Simulation):
 
     @property
     def _refills_in_step(self) -> bool:
-        """Whether the plain step writes the face ghosts: unmasked, unstreamed, no pml, Neumann and Dirichlet faces only."""
+        """Whether the plain step writes the face ghosts: no mask, stream or pml, order 4 at most, Neumann and Dirichlet faces."""
         conditions = {c for pair in self.boundary for c in pair}
         return (
             not (self.masked or self.streams or self.pml is not None)
             and conditions <= {Neumann, Dirichlet}
             and min(self.Nx) >= 4  # a mirror two nodes in is interior
+            and self.space_order <= 4  # a wider kernel loses more than the launch
         )
 
     @property

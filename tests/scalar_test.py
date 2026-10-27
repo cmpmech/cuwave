@@ -568,6 +568,7 @@ class FoldedRefillTest(unittest.TestCase):
             "a domain": replace(sim, domain=indicator > 0.5),
             "streaming": _scalar(6),
             "three nodes": _scalar(2, Nx=(3, 45)),
+            "order 6": _scalar(6, Nx=(37, 45)),
         }
         position = cp.asarray([[1], [20]], dtype=cp.int32)
         for name, each in kept.items():
