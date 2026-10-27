@@ -33,6 +33,7 @@ from .wave import (
     column_keys,
     compile_kernels,
     covering_hits,
+    define_excitation,
     flatten_indices,
     grid_block,
     mirror_ghosts,
@@ -173,30 +174,89 @@ class PressureWave(Simulation):
             neumann, dirichlet = face_mask(self, Neumann), face_mask(self, Dirichlet)
             flags += ("-DFOLD_REFILL", f"-DNEUMANN_FACES={neumann}")
             flags += (f"-DDIRICHLET_FACES={dirichlet}",)
+            # a 2D stencil is too cheap to carry the source list's loads
+            flags += ("-DFOLD_SOURCES",) if self.ndim == 3 else ()
         if not self.streams:
             return flags
         return flags + ("-DUSE_STREAM", f"-DSTREAM_TX={self.threads[-1]}")
 
-    def folds_refill(self, position: cpt.NDArray[cp.int32]) -> bool:
-        """Whether the step's own ghost writes stand for the refill after a source at `position`.
+    def define_folded_step(
+        self, kernels: cp.RawModule, mat: dict, source: Source
+    ) -> Callable | None:
+        """The step, the excitation of `source` and the ghost refill, `step(u0, u1, u2, signal, t)`: one launch in 3D, two below, else None.
 
-        A source on a ghost's mirror lands after the step wrote the ghost, so it keeps
-        the refill launch.
+        Below 3D the step writes the ghosts before the excitation lands, so a source on
+        a mirror keeps the refill. In 3D each thread block adds the sources it holds, so
+        two on one node, which the excitation adds atomically in no fixed order, keep
+        the launches apart.
         """
         if not self._refills_in_step:
-            return False
-        points = position.get()
-        for d, (low, high) in enumerate(self.boundary):
-            if (low in (Neumann, Dirichlet) and (points[d] == 2).any()) or (
-                high in (Neumann, Dirichlet) and (points[d] == self.Nx[d] - 3).any()
-            ):
-                return False
-        return True
+            return None
+        if self.ndim == 3:
+            flat = flatten_indices(self, source.position)
+            if len(cp.unique(flat)) != len(flat):
+                return None
+            return self._define_folded(kernels, mat, source.position)
+        points = source.position.get()
+        mirrors = (points == 2) | (points == np.asarray(self.Nx)[:, None] - 3)
+        if mirrors.any():
+            return None
+        fd_step = self.define_step(kernels, mat)
+        excitation_step = define_excitation(self, source.position, kernels, mat)
+
+        def folded_step(u0, u1, u2, signal, t):
+            fd_step(u0, u1, u2)
+            return excitation_step(u2, signal, t)
+
+        return folded_step
+
+    def _define_folded(
+        self,
+        kernels: cp.RawModule,
+        mat: dict,
+        position: cpt.NDArray[cp.int32] | None,
+    ) -> Callable:
+        """The 3D step with the sources at `position` folded in, listed per thread block, or none."""
+        fd_kernel = kernels.get_function("fd_kernel")
+        grid, block = grid_block(self)
+        lists = [cp.zeros(1, dtype=cp.int32), cp.zeros(1, dtype=self.dtype)]
+        lists.append(cp.zeros(1, dtype=cp.int32))
+        starts = np.zeros(math.prod(grid) + 1, dtype=np.int32)
+        num = 1
+        if position is not None:
+            # the sources sorted by the thread block holding them, CSR by block
+            points = position.get()
+            sizes = [-(-n // t) for n, t in zip(self.Nx_padded, self.threads)]
+            blocks = points // np.asarray(self.threads)[:, None]
+            owner = np.ravel_multi_index(tuple(blocks), sizes)
+            order = cp.asarray(np.argsort(owner, kind="stable"))
+            flat = flatten_indices(self, position)
+            weights = self.excitation_weights(mat, flat)
+            lists = [flat[order], weights[order], order.astype(cp.int32)]
+            starts[1:] = np.cumsum(np.bincount(owner, minlength=len(starts) - 1))
+            num = position.shape[1]
+        args = [None, None, None, *self.step_kernel_args(mat)]
+        args += axis_geometry(self, self.step_factors())
+        args += [lists[1], np.int32(0), cp.asarray(starts), *lists]
+
+        def folded_step(u0, u1, u2, signal, t):
+            args[0], args[1], args[2] = u0, u1, u2
+            args[-6], args[-5] = signal, np.int32(t * num)
+            fd_kernel(grid, block, args)
+            return u2
+
+        return folded_step
 
     def define_step(self, kernels: cp.RawModule, mat: dict) -> Callable:
         """Closure launching the step, streamed along axis 0 unless a mask tiles it, then the pml."""
         if self.streams:
             step = self.define_streamed_step(kernels, mat)
+        elif self._refills_in_step and self.ndim == 3:
+            folded = self._define_folded(kernels, mat, None)
+            unread = cp.zeros(1, dtype=self.dtype)  # no source reads the signal
+
+            def step(u0, u1, u2):
+                return folded(u0, u1, u2, unread, 0)
         else:
             step = super().define_step(kernels, mat)
         if self.pml is None:

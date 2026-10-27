@@ -17,10 +17,11 @@ runs and chunks small enough that a test grid holds many, the last of each one n
 A 3D order-2 run past L2 marches columns of tiles along axis 0 with the same claim,
 checked on a grid whose last tile and last chunk of planes hold one node each.
 
-Where no mask, pml or streaming stands in the way, the per-thread step writes the face
-ghosts itself from their mirrors two nodes in, and `simulate` skips the refill launch
-unless a source sits on a mirror. It claims the refilled run bit for bit, so it is
-compared with the run the refill launch serves, in 1D to 3D, over faces and dampings.
+Where no mask, pml or streaming stands in the way, up to order 4, the per-thread step
+writes the face ghosts from their mirrors two nodes in, and in 3D adds the sources its
+block holds, so `simulate` drops the refill launch, and in 3D the excitation's too. It
+claims the launches apart bit for bit, so it is compared with them, in 1D to 3D, over
+faces and dampings, with a 3D source on a mirror and sensors on the ghosts.
 """
 
 import copy
@@ -496,12 +497,15 @@ class MarchedTest(unittest.TestCase):
                 self.assertIsNone(each.define_blocked_step(mat, source, taken))
 
 
-# --------------------------------- the folded refill ---------------------------------
+# ---------------------------------- the folded step ----------------------------------
 def _folded_runs(sim, seed):
-    """The (field, record) of a run whose step writes the ghosts, then of one refilling them."""
+    """The (field, record) of a run whose step takes the ghosts (and in 3D the sources), then of one launching them apart."""
     n = np.asarray(sim.Nx)
-    position = cp.asarray(np.stack([n // 3, n // 2]).T, dtype=cp.int32)
-    signal = np.random.default_rng(seed).standard_normal((sim.N, 2))
+    points = [n // 3, n // 2]
+    if sim.ndim == 3:
+        points.append(np.r_[2, n[1:] // 2])  # on a mirror, its ghost takes the source
+    position = cp.asarray(np.stack(points).T, dtype=cp.int32)
+    signal = np.random.default_rng(seed).standard_normal((sim.N, len(points)))
     source = Source(position, cp.asarray(signal, dtype=sim.dtype))
     # the ghosts, mirrors and nodes between along the diagonal, a face ghost, a mirror
     rows = [np.full(sim.ndim, k) for k in (0, 1, 2, 3)]
@@ -513,7 +517,8 @@ def _folded_runs(sim, seed):
     indicator = _random(sim, seed)[0]
     runs = []
     with mock.patch.object(type(sim), "define_blocked_step", lambda *a, **k: None):
-        assert sim.folds_refill(source.position)
+        mat = sim.build_materials(indicator)
+        assert sim.define_folded_step(compile_kernels(sim), mat, source) is not None
         runs.append(simulate(sim, source, indicator, sensors=sensors))
         with mock.patch.object(scalar.PressureWave, "_refills_in_step", False):
             runs.append(simulate(sim, source, indicator, sensors=sensors))
@@ -521,10 +526,11 @@ def _folded_runs(sim, seed):
 
 
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
-class FoldedRefillTest(unittest.TestCase):
-    def test_a_folded_run_is_the_refilled_run_bit_for_bit(self):
+class FoldedStepTest(unittest.TestCase):
+    def test_a_folded_run_is_the_launched_run_bit_for_bit(self):
         mixed = (Neumann, Dirichlet), (Dirichlet, Neumann), (Dirichlet, Dirichlet)
         grids = {1: (61,), 2: (37, 45), 3: (21, 18, 35)}
+        threads = {1: (32,), 2: (4, 32), 3: (1, 16, 32)}
         for ndim, Nx in grids.items():
             for boundary, precision in itertools.product(
                 (None, mixed[:ndim]), ("float32", "float64")
@@ -535,7 +541,7 @@ class FoldedRefillTest(unittest.TestCase):
                     dx,
                     23,
                     0.5 * stable_dt(dx, 1.0, 2),
-                    (32,) if ndim == 1 else (4, 32) if ndim == 2 else (1, 16, 32),
+                    threads[ndim],
                     precision=precision,
                     wavespeed=1.0,
                     density=1.0,
@@ -548,36 +554,33 @@ class FoldedRefillTest(unittest.TestCase):
                     with self.subTest(
                         ndim=ndim, boundary=boundary, precision=precision, damped=damped
                     ):
-                        folded, refilled = _folded_runs(sim, 7)
-                        self.assertGreater(float(cp.abs(refilled[0]).max()), 0.0)
-                        for a, b in zip(folded, refilled):
+                        folded, launched = _folded_runs(sim, 7)
+                        self.assertGreater(float(cp.abs(launched[0]).max()), 0.0)
+                        for a, b in zip(folded, launched):
                             self.assertTrue(bool(cp.array_equal(a, b)))
 
-    def test_a_source_on_a_mirror_keeps_the_refill(self):
+    def test_what_keeps_the_launches_apart(self):
         sim = _scalar(2, Nx=(37, 45))
-        for point in ([2, 20], [34, 20], [20, 2], [20, 42], [20, 20]):
-            with self.subTest(point=point):
-                position = cp.asarray([[p] for p in point], dtype=cp.int32)
-                self.assertEqual(sim.folds_refill(position), point == [20, 20])
-
-    def test_what_keeps_the_refill_launch(self):
-        sim = _scalar(2, Nx=(37, 45))
-        indicator = _random(sim, 1)[0]
+        cube = ScalarWave(
+            (21, 18, 35), (0.1,) * 3, 1, 1e-3, (1, 16, 32), wavespeed=1.0, density=1.0
+        )
         kept = {
-            "a pml": replace(sim, pml=Pml(4, 1.0)),
-            "a domain": replace(sim, domain=indicator > 0.5),
-            "streaming": _scalar(6),
-            "three nodes": _scalar(2, Nx=(3, 45)),
-            "order 6": _scalar(6, Nx=(37, 45)),
+            "a source on a mirror": (sim, [[2], [20]]),
+            "two sources on a node": (cube, [[5, 5], [6, 6], [7, 7]]),
+            "a pml": (replace(sim, pml=Pml(4, 1.0)), [[9], [20]]),
+            "a domain": (replace(sim, domain=_random(sim, 1)[0] > 0.5), [[9], [20]]),
+            "streaming": (_scalar(6), [[9], [20]]),
+            "three nodes": (_scalar(2, Nx=(3, 45)), [[1], [20]]),
+            "order 6": (_scalar(6, Nx=(37, 45)), [[9], [20]]),
         }
-        position = cp.asarray([[1], [20]], dtype=cp.int32)
-        for name, each in kept.items():
+        for name, (each, points) in kept.items():
             with self.subTest(name=name):
-                if name == "streaming":
-                    with mock.patch.object(type(each), "streams", True):
-                        self.assertFalse(each.folds_refill(position))
-                else:
-                    self.assertFalse(each.folds_refill(position))
+                position = cp.asarray(points, dtype=cp.int32)
+                source = Source(position, cp.zeros((1, position.shape[1]), each.dtype))
+                mat = each.build_materials(_random(each, 1)[0])
+                with mock.patch.object(type(each), "streams", name == "streaming"):
+                    kernels = compile_kernels(each)
+                    self.assertIsNone(each.define_folded_step(kernels, mat, source))
 
 
 if __name__ == "__main__":

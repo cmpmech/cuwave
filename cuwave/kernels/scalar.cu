@@ -5,6 +5,7 @@
 //   USE_DOMAIN
 //   USE_STREAM, STREAM_TX
 //   FOLD_REFILL, NEUMANN_FACES, DIRICHLET_FACES
+//   FOLD_SOURCES (3D, with FOLD_REFILL)
 //   STEPS, TILE0, TILE1, ROWS (2D)
 //   STEPS, TILE1, PLANES (2D marched)
 //   STEPS, TILE1, TILE2, PLANES, INTERIOR (3D, order 2)
@@ -184,14 +185,25 @@ __device__ __forceinline__ bool bc_ghost(int t, const int faces, const int *n,
   return false;
 }
 
-// ------------------------------------ refill helpers
+// ------------------------------------ folding helpers
+#ifdef FOLD_SOURCES
+// a source's product rounded apart, as excitation_kernel adds it atomically
+__device__ __forceinline__ float rounded_product(const float a, const float b) {
+  return __fmul_rn(a, b);
+}
+__device__ __forceinline__ double rounded_product(const double a,
+                                                  const double b) {
+  return __dmul_rn(a, b);
+}
+#endif
+
 #ifdef FOLD_REFILL
 // the ghosts of the refilled faces two nodes out along axis d take v, as the
 // refill kernels give them, negated on a Dirichlet face
-__device__ __forceinline__ void mirror_ghosts(real_t *__restrict__ u,
-                                              const int idx, const real_t v,
-                                              const int d, const int a,
-                                              const int N, const int s) {
+__device__ __forceinline__ void write_ghosts(real_t *__restrict__ u,
+                                             const int idx, const real_t v,
+                                             const int d, const int a,
+                                             const int N, const int s) {
   constexpr int refilled = NEUMANN_FACES | DIRICHLET_FACES;
   if ((refilled >> (2 * d)) & 1 && a == 2)
     u[idx - 2 * s] = (DIRICHLET_FACES >> (2 * d)) & 1 ? -v : v;
@@ -316,6 +328,12 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
           ,
           const real_t f2, const int N2, const int s1
 #endif
+#ifdef FOLD_SOURCES
+          ,
+          const real_t *__restrict__ signal, const int offset,
+          const int *__restrict__ starts, const int *__restrict__ lin_index,
+          const real_t *__restrict__ weights, const int *__restrict__ columns
+#endif
 ) {
 #ifdef USE_DOMAIN
   const int tile = tiles[blockIdx.x];
@@ -342,6 +360,11 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
     return;
   const int idx = a0 * s0 + a1 * s1 + a2;
   const int r0 = CLOSURE(a0, N0), r1 = CLOSURE(a1, N1), r2 = CLOSURE(a2, N2);
+#endif
+#ifdef FOLD_SOURCES
+  // the block's source list, loaded before the stencil so its latency hides
+  const int block = BLOCK_X + gridDim.x * (BLOCK_Y + gridDim.y * BLOCK_Z);
+  const int first = starts[block], last = starts[block + 1];
 #endif
 
   const real_t uc = u1[idx];    // load once
@@ -379,31 +402,40 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
   const real_t mi = derive_inertia ? 1.f / sc : minv[idx];
 #ifdef USE_DAMPING
   const real_t beta = 0.5f * mi * damping[idx] * dt;
-  const real_t v =
+  real_t v =
       (2.f * uc - u0[idx] * (1.f - beta) + mi * laplacian) / (1.f + beta);
 #else
-  const real_t v = -u0[idx] + 2.f * uc + mi * laplacian;
+  real_t v = -u0[idx] + 2.f * uc + mi * laplacian;
 #endif
   u2[idx] = v;
+#ifdef FOLD_SOURCES
+  // the excitation folded in: the block's sources in the order of its list,
+  // stored again where one lands, so the plain store waits on no list
+  for (int k = first; k < last; ++k)
+    if (lin_index[k] == idx) {
+      v += rounded_product(weights[k], signal[offset + columns[k]]);
+      u2[idx] = v;
+    }
+#endif
 #ifdef FOLD_REFILL
   // the boundary refill folded in: each face ghost written by its mirror, the
   // test taken only in a block that holds one
 #if NDIM == 1
   if (holds_mirror(BLOCK_X, blockDim.x, N0))
-    mirror_ghosts(u2, idx, v, 0, a0, N0, 1);
+    write_ghosts(u2, idx, v, 0, a0, N0, 1);
 #elif NDIM == 2
   if (holds_mirror(BLOCK_Y, blockDim.y, N0) ||
       holds_mirror(BLOCK_X, blockDim.x, N1)) {
-    mirror_ghosts(u2, idx, v, 0, a0, N0, s0);
-    mirror_ghosts(u2, idx, v, 1, a1, N1, 1);
+    write_ghosts(u2, idx, v, 0, a0, N0, s0);
+    write_ghosts(u2, idx, v, 1, a1, N1, 1);
   }
 #elif NDIM == 3
   if (holds_mirror(BLOCK_Z, blockDim.z, N0) ||
       holds_mirror(BLOCK_Y, blockDim.y, N1) ||
       holds_mirror(BLOCK_X, blockDim.x, N2)) {
-    mirror_ghosts(u2, idx, v, 0, a0, N0, s0);
-    mirror_ghosts(u2, idx, v, 1, a1, N1, s1);
-    mirror_ghosts(u2, idx, v, 2, a2, N2, 1);
+    write_ghosts(u2, idx, v, 0, a0, N0, s0);
+    write_ghosts(u2, idx, v, 1, a1, N1, s1);
+    write_ghosts(u2, idx, v, 2, a2, N2, 1);
   }
 #endif
 #endif

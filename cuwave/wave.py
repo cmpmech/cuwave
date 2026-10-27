@@ -474,9 +474,11 @@ class Simulation:
         """Whether `domain` or `dirichlet` takes nodes out of the stepped set."""
         return self.domain is not None or self.dirichlet is not None
 
-    def folds_refill(self, position: cpt.NDArray[cp.int32]) -> bool:
-        """Whether the step writes the ghosts itself, so `simulate` skips the refill: none here."""
-        return False
+    def define_folded_step(
+        self, kernels: cp.RawModule, mat: dict, source: Source
+    ) -> Callable | None:
+        """The step, the excitation and the ghost refill in fewer launches, `step(u0, u1, u2, signal, t)`: None here."""
+        return None
 
     kernel_path = None  # forward source this equation compiles, set by the subclass
     sensitivity_path = None  # and the adjoint one
@@ -1043,8 +1045,8 @@ def simulate(
     kernels = compile_kernels(sim)
     fd_step = sim.define_step(kernels, mat)
     bc_step = define_boundary(sim, kernels)
-    refill = not sim.folds_refill(source.position)  # else the step wrote the ghosts
     excitation_step = define_excitation(sim, source.position, kernels, mat)
+    folded = sim.define_folded_step(kernels, mat, source)
     windows = [Window(source.signal)]
     if sensors is not None:
         get_signal = define_get_signal(sim, sensors, kernels)
@@ -1054,9 +1056,11 @@ def simulate(
 
     # U[t % 2] takes u^t over u^(t - 2), so the rotation is a function of t alone
     def step(t, signal, um=None):
-        u = fd_step(U[t % 2], U[1 - t % 2], U[t % 2])
-        excitation_step(u, signal, t)
-        if refill:
+        if folded is not None:
+            u = folded(U[t % 2], U[1 - t % 2], U[t % 2], signal, t)
+        else:
+            u = fd_step(U[t % 2], U[1 - t % 2], U[t % 2])
+            excitation_step(u, signal, t)
             bc_step(u)
         if um is not None:
             get_signal(u, um, t)
