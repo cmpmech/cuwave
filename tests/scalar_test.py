@@ -357,6 +357,28 @@ class MarchedRowsTest(unittest.TestCase):
                 with self.subTest(order=order, damped=each.damping is not None):
                     self._assert_bitwise(*_marched_runs(each, 7, self.ROWS))
 
+    def test_five_columns_take_the_tiles(self):
+        # the middle column mirrors both ghost columns, which one mirror cannot write
+        sim = _scalar(
+            2,
+            "float32",
+            ((Neumann, Dirichlet), (Neumann, Dirichlet)),
+            N=30,
+            Nx=(301, 5),
+        )
+        signal = np.random.default_rng(4).standard_normal((sim.N, 3))
+        position = cp.array([[2, 150, 298], [1, 3, 2]], dtype=cp.int32)
+        source = Source(position, cp.asarray(signal, dtype=sim.dtype))
+        sensors = cp.array([[5, 100, 200, 299], [1, 2, 3, 3]], dtype=cp.int32)
+        indicator = _random(sim, 4)[0]
+        mat = sim.build_materials(indicator)
+        with mock.patch.multiple(scalar, MARCHED_ROWS=self.ROWS, LARGE_L2=0):
+            self.assertIsNone(sim._define_marched_rows(mat, source, sensors))
+            blocked = simulate(sim, source, indicator, sensors=sensors)
+        with mock.patch.object(type(sim), "define_blocked_step", lambda *a, **k: None):
+            plain = simulate(sim, source, indicator, sensors=sensors)
+        self._assert_bitwise(blocked, plain)
+
     def test_a_sensor_on_a_ghost_takes_the_tiles(self):
         sim = _scalar(2, "float32", N=6, Nx=(301, 257))
         source, indicator, sensors = _shot(sim, 8)

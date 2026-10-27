@@ -378,7 +378,8 @@ class MaxwellWave(Simulation):
             return None
 
         # launches bound a grid of few waves of tiles
-        sms = cp.cuda.Device().attributes["MultiProcessorCount"]
+        device = cp.cuda.Device().attributes
+        sms = device["MultiProcessorCount"]
         waves = [
             -(-math.prod(tile_counts(self.Nx, b[0], b[2] * self.reach)) // sms)
             for b in BLOCKED[radius - 1]
@@ -428,6 +429,8 @@ class MaxwellWave(Simulation):
         kernels = compile_kernels(self, flags=(*flags, f"-DROWS={rows}"))
         kernel = kernels.get_function("blocked_kernel")
         shared = 3 * (tile[0] + 2 * radius) * (tile[1] + 2 * radius) * 4
+        if shared > device["MaxSharedMemoryPerBlockOptin"]:
+            return None
         kernel.max_dynamic_shared_size_bytes = shared
 
         # the arguments, the pointers and the per-call values filled in per launch

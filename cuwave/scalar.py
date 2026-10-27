@@ -494,11 +494,14 @@ class PressureWave(Simulation):
         wide as the steps reach, each step a stencil radius behind the one before, so u
         of a row is loaded and stored once a launch (`MARCHED_ROWS`): bitwise the step,
         excitation, refill and record launched one by one. None on what
-        `define_blocked_step` refuses, or a sensor off the interior.
+        `define_blocked_step` refuses, a sensor off the interior, or 5 columns, whose middle
+        column mirrors both ghosts.
         """
         radius = self.space_order // 2
         columns, steps, rows = MARCHED_ROWS[radius - 1]
         halo = steps * radius
+        if not 2 <= halo <= 31 or self.Nx[1] == 5:
+            return None  # a mirror inside the run, 32-bit row masks, a mirror per ghost
         core = columns - 2 * halo
         runs = -(-(self.Nx[1] - 2) // core)
         chunks = -(-(self.Nx[0] - 2) // rows)
