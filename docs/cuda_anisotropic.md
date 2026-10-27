@@ -12,7 +12,7 @@ The forward kernels of the [anisotropic](anisotropic.md) equation, gathering the
 
 `RADIUS` stays at its default of 1, since the class caps `space_order` at 2. `BLK` is $2\,\textrm{RADIUS}$, `CELLS` is $\textrm{BLK}^\textrm{ndim}$, the cells a node borders and equally the nodes a cell reaches, and `NLOC` is `CELLS * NDIM`, the side of the stencil table. All are compile-time, so every loop over them unrolls fully
 
-Unlike [cuda_scalar](cuda_scalar.md) neither `STENCIL_RADIUS` nor its coefficient tables enter: the table arrives as the `stencil` argument, one cell's contribution to the nodal stencil at $\gamma=1$
+Unlike [cuda_scalar](cuda_scalar.md) neither `STENCIL_RADIUS` nor its coefficient tables enter: the table, one cell's contribution to the nodal stencil at $\gamma=1$, arrives in the constant array `STENCIL` for `fd_kernel`, copied in once by `AnisotropicElasticWave.define_step`, and as the `stencil` argument for the sensitivity kernels. Its indices are compile-time in every unrolled loop, so in constant memory each entry is an operand of the fused multiply-add rather than a load, which is what bounds the 3D gather
 
 ## macros
 
@@ -77,11 +77,11 @@ add the force at corner `m` of the stress $\gamma VC\,\textrm{sym}\left(P_ep\rig
 **parallelization**
 one thread per node of the padded grid, retired to the interior by the guard
 **input args**
-`u0`, `u1`: the fields at $t-2$ and $t-1$, each `NDIM` components of `cs` entries laid out back to back; `minv`: lumped $1/\left(\gamma\rho_0VW\right)$, nodal and scalar; `cell`: the harmonic cell mean $\gamma_c$, stored at the cell's low corner; `stencil`: `NLOC` by `NLOC`, the cell's contribution at $\gamma=1$, row-major; `damping`: nodal $d$, with `USE_DAMPING` only; `dt`: $\Delta t$, with `USE_DAMPING` only; `cs`: component stride, the padded node count; `f0`: $\Delta t^2$, the only axis factor the kernel reads; `N0, N1, N2`: logical extents, ghost nodes in and padding out; `s0, s1`: strides of axes 0 and 1
+`u0`, `u1`: the fields at $t-2$ and $t-1$, each `NDIM` components of `cs` entries laid out back to back; `minv`: lumped $1/\left(\gamma\rho_0VW\right)$, nodal and scalar; `cell`: the harmonic cell mean $\gamma_c$, stored at the cell's low corner; `damping`: nodal $d$, with `USE_DAMPING` only; `dt`: $\Delta t$, with `USE_DAMPING` only; `cs`: component stride, the padded node count; `f0`: $\Delta t^2$, the only axis factor the kernel reads; `N0, N1, N2`: logical extents, ghost nodes in and padding out; `s0, s1`: strides of axes 0 and 1
 **output args**
 `u2`: the field at $t$, same layout as `u1`
 **internal args**
-`force`: the internal force per component, accumulated over the node's cells; `gc`: $\gamma_c$ of the cell being gathered; `self`: the node's own entry of that cell; `mi`: inverse inertia at the node
+`STENCIL`: `NLOC` by `NLOC` per radius, the cell's contribution at $\gamma=1$, row-major, in constant memory; `force`: the internal force per component, accumulated over the node's cells; `gc`: $\gamma_c$ of the cell being gathered; `self`: the node's own entry of that cell; `mi`: inverse inertia at the node
 **how?**
 - the force gathers the node's row of the stencil from every cell it borders
 $$f_i=-\sum_{c\ni i}\gamma_c\sum_{l,j}\hat{K}_{\left(\textrm{self},i\right)\left(l,j\right)}u_j^{l}$$

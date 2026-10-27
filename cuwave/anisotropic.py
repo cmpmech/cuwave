@@ -259,8 +259,8 @@ class AnisotropicElasticWave(Simulation):
         return mat
 
     def step_kernel_args(self, mat: dict) -> tuple:
-        """Material, stencil table and component stride for the step kernel."""
-        args = (mat["minv"], mat["cell"], mat["stencil"])
+        """Material and component stride for the step kernel, whose table sits in its constant memory."""
+        args = (mat["minv"], mat["cell"])
         if self.damping is not None:
             args += (mat["damping"], self.dtype(self.dt))
         return args + (np.int32(self.comp_stride),)
@@ -296,6 +296,8 @@ class AnisotropicElasticWave(Simulation):
 
     def _define_pml(self, kernels: cp.RawModule, mat: dict, passes: tuple) -> Callable:
         """The cell step, then each pass over every lined axis, all axes in one memory."""
+        table = kernels.get_global("STENCIL")
+        cp.ndarray(mat["stencil"].shape, self.dtype, table)[...] = mat["stencil"]
         fd_step = super().define_step(kernels, mat)
         if self.pml is None:
             return fd_step

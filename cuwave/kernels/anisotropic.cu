@@ -18,6 +18,10 @@
 #endif
 #define NLOC (CELLS * NDIM)
 
+// the cell stencil table of every radius, copied in once by the step's setup:
+// a warp-uniform operand of each fused multiply-add rather than a load
+__constant__ real_t STENCIL[RADIUS * NLOC * NLOC];
+
 // position along axis d of the block entry m, axis 0 running fastest
 __device__ __forceinline__ int block_axis(int m, const int d) {
 #pragma unroll
@@ -332,7 +336,7 @@ extern "C" {
 __global__ void
 fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
           real_t *__restrict__ u2, const real_t *__restrict__ minv,
-          const real_t *__restrict__ cell, const real_t *__restrict__ stencil,
+          const real_t *__restrict__ cell,
 #ifdef USE_DAMPING
           const real_t *__restrict__ damping, const real_t dt,
 #endif
@@ -351,7 +355,7 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
     if (!cell_inside(c, A, NN, S, base, radius, self))
       continue;
     const real_t gc = cell[idx + base];
-    const real_t *__restrict__ table = stencil + (radius - 1) * NLOC * NLOC;
+    const real_t *table = STENCIL + (radius - 1) * NLOC * NLOC;
 #pragma unroll
     for (int l = 0; l < CELLS; ++l) {
       int off;
