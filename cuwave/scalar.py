@@ -161,7 +161,7 @@ class PressureWave(Simulation):
 
     @property
     def _refills_in_step(self) -> bool:
-        """Whether the plain step writes the face ghosts: no mask, stream or pml, order 4 at most, Neumann and Dirichlet faces."""
+        """Whether the plain step writes the face ghosts: no mask, stream or pml, order 4 at most, Neumann and Dirichlet faces, `FOLD_SMS`."""
         conditions = {c for pair in self.boundary for c in pair}
         sms = cp.cuda.Device().attributes["MultiProcessorCount"]
         return (
@@ -419,9 +419,9 @@ class PressureWave(Simulation):
         `LARGE_BLOCKS`), at orders 6 and 8 only on small grids of a GPU with
         `SMALL_SMS` multiprocessors; past L2 the march of `_define_marched_rows` first.
         In 3D see `_define_marched_step`. None in 1D, in float64, above order 8, with a
-        pml, a domain mask, a condition other than Neumann or Dirichlet,
-        a source off the interior, two sources or sensors on one node, or an axis of
-        fewer than 4 nodes.
+        pml, a domain mask, a streaming step, a condition other than Neumann or
+        Dirichlet, a source off the interior, two sources or sensors on one node, or an
+        axis of fewer than 4 nodes.
         """
         conditions = {c for pair in self.boundary for c in pair}
         radius = self.space_order // 2
@@ -431,6 +431,7 @@ class PressureWave(Simulation):
             or radius > len(SMALL_BLOCKS)
             or self.pml is not None
             or self.masked
+            or self.streams  # the tile reproduces the per-thread kernel
             or not conditions <= {Neumann, Dirichlet}
             or min(self.Nx) < 4
         ):

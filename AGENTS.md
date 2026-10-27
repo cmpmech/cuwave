@@ -105,7 +105,7 @@ pressure run (`simulate` only) takes `PressureWave.define_blocked_step`: tiles s
 several steps a launch in shared memory, the excitation, the Neumann/Dirichlet refill and
 the record inside the tile, launched through `march`'s graphs; only where launches
 (`SMALL_BLOCKS`, `SMALL_WAVES` waves of threads) or DRAM (`LARGE_BLOCKS`, fields past `LARGE_L2` times L2, at order 2 also inside it up to `MIDDLE_WAVES`) bound the
-plain step, at orders 2 and 4, without pml or mask. Past `LARGE_L2` times L2 with
+plain step, at orders 2 and 4 (6 and 8 on small grids of `SMALL_SMS` multiprocessors), without pml, mask or streaming. Past `LARGE_L2` times L2 with
 interior sensors a 2D run marches first (`_define_marched_rows`, `MARCHED_ROWS`: runs of
 columns walking axis 0, step k k radii behind). In 3D at order 2 (interior
 sensors) the same call returns a marched step (`MARCHED_BLOCK`: columns of tiles walking
@@ -116,7 +116,8 @@ fields spill out of L2 and the ring at most doubles the tile (2D, and 3D at orde
 small 2D elastic grid (`BLOCKED_WAVES`), or an order-2 one past 2.25 times L2
 (`LARGE_BLOCKED`), takes `ElasticWave.define_blocked_step`: the stresses and update of
 several steps in shared memory. A small 2D `MaxwellWave` grid without pml or `magnetic`
-takes `MaxwellWave.define_blocked_step` (`BLOCKED`, `BLOCKED_WAVES` of maxwell.py) the
+takes `MaxwellWave.define_blocked_step` (`BLOCKED`, `BLOCKED_WAVES` of maxwell.py; past L2
+`LARGE_BLOCKED`, at order 4 only past `LARGE_L2` times L2 on `PAST_SMS` multiprocessors) the
 same way, the curl in place of the stresses; two sources on one point keep the pair.
 Past L2 the Maxwell pair also fuses into one `fused_kernel` (`FUSED_TILE`), as elastic.
 `AnisotropicElasticWave.define_blocked_step` blocks the 2D cell gather the same way, on a

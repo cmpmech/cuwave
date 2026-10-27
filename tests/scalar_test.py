@@ -300,6 +300,17 @@ class BlockedTest(unittest.TestCase):
         )
         self.assertIsNone(middle.define_blocked_step(mat, source, None))
 
+    def test_a_streaming_step_keeps_the_plain_step(self):
+        # the tile reproduces the per-thread kernel, not the streamed one
+        sim = _scalar(6, "float32", Dirichlet, N=6)
+        source, indicator, sensors = _shot(sim, 8)
+        mat = sim.build_materials(indicator)
+        small = {"SMALL_SMS": (0,) * 4, "SMALL_WAVES": (2, 1.25, 100, 100)}
+        with mock.patch.multiple(scalar, **small):
+            self.assertIsNotNone(sim.define_blocked_step(mat, source, sensors))
+            with mock.patch.object(type(sim), "streams", True):
+                self.assertIsNone(sim.define_blocked_step(mat, source, sensors))
+
 
 def _shot_walls(sim, seed):
     """A source beside each wall and a corner, sensors along the walls and inside."""
