@@ -198,6 +198,13 @@ __device__ __forceinline__ void mirror_ghosts(real_t *__restrict__ u,
   if ((refilled >> (2 * d + 1)) & 1 && a == N - 3)
     u[idx + 2 * s] = (DIRICHLET_FACES >> (2 * d + 1)) & 1 ? -v : v;
 }
+
+// whether the block's nodes along an axis reach a mirror, the block b of size
+// nodes from b * size on
+__device__ __forceinline__ bool holds_mirror(const int b, const int size,
+                                             const int N) {
+  return b * size <= 2 || (b + 1) * size - 1 >= N - 3;
+}
 #endif
 
 // -------------------------------------- kernels
@@ -379,16 +386,25 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
 #endif
   u2[idx] = v;
 #ifdef FOLD_REFILL
-  // the boundary refill folded in: each face ghost written by its mirror
+  // the boundary refill folded in: each face ghost written by its mirror, the
+  // test taken only in a block that holds one
 #if NDIM == 1
-  mirror_ghosts(u2, idx, v, 0, a0, N0, 1);
+  if (holds_mirror(BLOCK_X, blockDim.x, N0))
+    mirror_ghosts(u2, idx, v, 0, a0, N0, 1);
 #elif NDIM == 2
-  mirror_ghosts(u2, idx, v, 0, a0, N0, s0);
-  mirror_ghosts(u2, idx, v, 1, a1, N1, 1);
+  if (holds_mirror(BLOCK_Y, blockDim.y, N0) ||
+      holds_mirror(BLOCK_X, blockDim.x, N1)) {
+    mirror_ghosts(u2, idx, v, 0, a0, N0, s0);
+    mirror_ghosts(u2, idx, v, 1, a1, N1, 1);
+  }
 #elif NDIM == 3
-  mirror_ghosts(u2, idx, v, 0, a0, N0, s0);
-  mirror_ghosts(u2, idx, v, 1, a1, N1, s1);
-  mirror_ghosts(u2, idx, v, 2, a2, N2, 1);
+  if (holds_mirror(BLOCK_Z, blockDim.z, N0) ||
+      holds_mirror(BLOCK_Y, blockDim.y, N1) ||
+      holds_mirror(BLOCK_X, blockDim.x, N2)) {
+    mirror_ghosts(u2, idx, v, 0, a0, N0, s0);
+    mirror_ghosts(u2, idx, v, 1, a1, N1, s1);
+    mirror_ghosts(u2, idx, v, 2, a2, N2, 1);
+  }
 #endif
 #endif
 }
