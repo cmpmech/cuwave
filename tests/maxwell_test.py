@@ -567,6 +567,17 @@ class BlockedTest(unittest.TestCase):
                     )
                 self._assert_bitwise(*runs)
 
+    def test_the_order_4_rule_past_l2(self):
+        # fields past 0 times L2 on a GPU of any size: the large tier by its own rule
+        for boundary, damped in itertools.product((Conductor, Magnetic), (False, True)):
+            with self.subTest(b=boundary, damped=damped):
+                patches = {"LARGE_L2": (1, 0), "PAST_SMS": (0, 0)}
+                with mock.patch.multiple(maxwell, **patches):
+                    runs = _blocked_runs(
+                        4, (150, 127), 41, boundary, damped, waves=(0, 0)
+                    )
+                self._assert_bitwise(*runs)
+
     def test_every_tile_and_step_count(self):
         blocks = (
             ((32, 32), 32, 6),
