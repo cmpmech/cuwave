@@ -9,6 +9,7 @@ The forward kernels of the [anisotropic](anisotropic.md) equation, gathering the
 | `USE_FLOAT` | `precision` | `real_t` is `float` rather than `double` |
 | `NDIM` | `len(Nx)` | selects the interior guard, the geometry macro and the loop bounds |
 | `USE_DAMPING` | `damping is not None` | adds the damped update and its two extra arguments |
+| `STENCIL_KEY` | a digest of `dx` and the stiffness, by `AnisotropicElasticWave.compile_flags` | unread: it keys CuPy's module cache, so two simulations whose source and options are otherwise alike never share one `STENCIL` |
 | `STEPS`, `TILE0`, `TILE1`, `ROWS` | `BLOCKED` or `LARGE_BLOCKED`, by `AnisotropicElasticWave.define_blocked_step` in 2D float32 without a pml | compiles `blocked_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
 
 `RADIUS` stays at its default of 1, since the class caps `space_order` at 2. `BLK` is $2\,\textrm{RADIUS}$, `CELLS` is $\textrm{BLK}^\textrm{ndim}$, the cells a node borders and equally the nodes a cell reaches, and `NLOC` is `CELLS * NDIM`, the side of the stencil table. All are compile-time, so every loop over them unrolls fully

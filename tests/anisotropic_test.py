@@ -285,6 +285,19 @@ class OperatorTest(unittest.TestCase):
         ratio = float(cp.abs(aniso.stencil_table()).max() / cp.abs(base.stencil_table()).max())
         self.assertAlmostEqual(ratio, 2.0, places=10)
 
+    def test_a_second_material_leaves_the_first_step_its_table(self):
+        a = _sim((40, 40), N=1)
+        b = replace(a, wavespeed_s=0.8)
+        indicator = cp.ones(a.Nx_padded, dtype=a.dtype)
+        u1 = cp.asarray(np.random.default_rng(0).standard_normal((2, *a.Nx_padded)))
+        u0, out = cp.zeros_like(u1), cp.zeros_like(u1)
+        step = a.define_step(compile_kernels(a), a.build_materials(indicator))
+        step(u0, u1, out)
+        alone = out.copy()
+        b.define_step(compile_kernels(b), b.build_materials(indicator))
+        step(u0, u1, out)
+        self.assertTrue(bool(cp.array_equal(out, alone)))
+
 
 # ---------------------------------- against the scalar -------------------------------
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")

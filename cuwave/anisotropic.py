@@ -13,6 +13,7 @@ general anisotropy.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import math
 from collections.abc import Callable
@@ -183,6 +184,13 @@ class AnisotropicElasticWave(Simulation):
     def ncomp(self) -> int:
         """One displacement component per axis."""
         return self.ndim
+
+    @property
+    def compile_flags(self) -> tuple[str, ...]:
+        """The shared flags and `-DSTENCIL_KEY`, so modules alike but for the table never share `STENCIL`."""
+        table = np.append(np.asarray(self.dx, dtype=float), self.stiffness_matrix())
+        key = hashlib.sha256(table.tobytes()).hexdigest()[:16]
+        return super().compile_flags + (f"-DSTENCIL_KEY={key}",)
 
     def __post_init__(self) -> None:
         """Validate the material, the 2D plane assumption and the order, then derive the grid."""

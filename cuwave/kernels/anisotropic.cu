@@ -3,6 +3,7 @@
 //   NDIM = 1 | 2 | 3
 //   USE_DAMPING
 //   STEPS, TILE0, TILE1, ROWS (2D)
+//   STENCIL_KEY: unread, keys the module cache on the STENCIL table
 
 #ifndef RADIUS
 #define RADIUS 1 // default order 2
