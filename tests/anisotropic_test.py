@@ -11,9 +11,16 @@ A perfectly matched layer is stable only where every wave runs along its phase o
 lined axis (Becache et al. 2003), so a strongly orthotropic `C` that satisfies it has to
 decay through the layer and a free surface crossing it, and one that violates it has to
 be refused on that axis alone.
+
+A 2D float32 run on a small grid or past twice L2 advances several steps a launch
+(`define_blocked_step`), the cell gather, the update, the excitation and the record
+inside the tile; it claims the plain step bit for bit, so it is compared with
+`array_equal` over faces, damping, an anisotropic `C`, tiles and step counts.
 """
 
 import unittest
+from dataclasses import replace
+from unittest import mock
 
 import numpy as np
 
@@ -25,8 +32,9 @@ except Exception:
     HAS_CUDA = False
 
 if HAS_CUDA:
+    from cuwave import anisotropic
     from cuwave.anisotropic import AnisotropicElasticWave, cell_stencil, corner_bits
-    from cuwave.boundary import Clamped, Pml, Traction
+    from cuwave.boundary import Clamped, Pml, Traction, sponge
     from cuwave.elastic import voigt
     from cuwave.scalar import ScalarWave
     from cuwave.sensitivity import (
@@ -504,3 +512,86 @@ class PmlTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _blocked_runs(Nx, N, boundary, blocks, damped=False, C=None):
+    """The (field, record) of a 2D float32 run forced blocked as `blocks`, then plainly."""
+    dx = tuple(1.0 / (n - 3) for n in Nx)
+    dt = 0.4 * stable_dt(dx, 2.5, 2)
+    common = dict(density=1.0, wavespeed_p=CP, wavespeed_s=CS, boundary=boundary, C=C)
+    sim = AnisotropicElasticWave(Nx, dx, N, dt, (4, 32), precision="float32", **common)
+    rng = np.random.default_rng(0)
+    indicator = cp.asarray(0.5 + 0.5 * rng.random(sim.Nx_padded), dtype=sim.dtype)
+    if damped:
+        sim = replace(sim, damping=sponge(sim, indicator, 10, 0.3))
+    n = sim.Nx
+    position = [[0, 1, 1], [1, n[0] // 2, 2], [0, 2, n[1] - 2], [1, n[0] - 2, 3]]
+    position = cp.array(np.array(position).T, dtype=cp.int32)
+    signal = cp.asarray(rng.standard_normal((N, 4)), dtype=sim.dtype)
+    near = [[c, a, 3] for c in (0, 1) for a in range(1, 12)]
+    sensors = cp.array(np.array(near + [[0, n[0] - 2, n[1] - 2]]).T, dtype=cp.int32)
+    source = Source(position, signal)
+    with mock.patch.multiple(anisotropic, BLOCKED=blocks, BLOCKED_WAVES=10**6):
+        mat = sim.build_materials(indicator)
+        assert sim.define_blocked_step(mat, source, sensors) is not None
+        blocked = simulate(sim, source, indicator, sensors=sensors)
+    with mock.patch.object(type(sim), "define_blocked_step", lambda *a, **k: None):
+        plain = simulate(sim, source, indicator, sensors=sensors)
+    return blocked, plain
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class BlockedTest(unittest.TestCase):
+    def _assert_bitwise(self, blocked, plain):
+        self.assertGreater(float(cp.abs(plain[0]).max()), 0.0)
+        for a, b in zip(blocked, plain):
+            self.assertTrue(bool(cp.array_equal(a, b)))
+
+    def test_a_blocked_run_is_the_plain_run_bit_for_bit(self):
+        mixed = ((Traction, Clamped), (Clamped, Traction))
+        C = np.array([[4.0, 1.2, 0.3], [1.2, 3.0, -0.2], [0.3, -0.2, 1.1]])
+        cases = [(Traction, False, None), (mixed, False, None), (Clamped, True, None)]
+        cases += [(mixed, False, C), (mixed, True, C)]
+        for boundary, damped, stiffness in cases:
+            with self.subTest(
+                boundary=boundary, damped=damped, C=stiffness is not None
+            ):
+                runs = _blocked_runs(
+                    (150, 127), 41, boundary, anisotropic.BLOCKED[:1], damped, stiffness
+                )
+                self._assert_bitwise(*runs)
+
+    def test_every_tile_and_step_count(self):
+        blocks = (
+            *anisotropic.BLOCKED,
+            anisotropic.LARGE_BLOCKED,
+            ((32, 32), 32, 2),
+            ((32, 64), 8, 3),
+        )
+        for block in blocks:
+            with self.subTest(block=block):
+                # cores of 24 on (147, 115) leave a last core of one node beside a ghost
+                runs = _blocked_runs(
+                    (147, 115), 24, ((Traction, Clamped),) * 2, (block,)
+                )
+                self._assert_bitwise(*runs)
+
+    def test_what_the_plain_step_keeps(self):
+        dx = (0.01, 0.01)
+        common = dict(density=1.0, wavespeed_p=CP, wavespeed_s=CS)
+        sim = AnisotropicElasticWave(
+            (150, 127), dx, 6, 1e-3, (4, 32), precision="float32", **common
+        )
+        signal = cp.zeros((6, 2), dtype=sim.dtype)
+        once = Source(cp.array([[0, 0], [50, 60], [40, 40]], dtype=cp.int32), signal)
+        twice = Source(cp.array([[0, 0], [50, 50], [40, 40]], dtype=cp.int32), signal)
+        ghost = Source(cp.array([[0, 0], [0, 60], [40, 40]], dtype=cp.int32), signal)
+        indicator = cp.ones(sim.Nx_padded, dtype=sim.dtype)
+        with mock.patch.object(anisotropic, "BLOCKED_WAVES", 10**6):
+            mat = sim.build_materials(indicator)
+            self.assertIsNotNone(sim.define_blocked_step(mat, once, None))
+            self.assertIsNone(sim.define_blocked_step(mat, twice, None))
+            self.assertIsNone(sim.define_blocked_step(mat, ghost, None))
+            wide = replace(sim, precision="float64")
+            mat = wide.build_materials(indicator.astype(wide.dtype))
+            self.assertIsNone(wide.define_blocked_step(mat, once, None))

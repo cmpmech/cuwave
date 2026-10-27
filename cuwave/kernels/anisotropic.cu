@@ -2,6 +2,7 @@
 // Compile-time configuration this file responds to:
 //   NDIM = 1 | 2 | 3
 //   USE_DAMPING
+//   STEPS, TILE0, TILE1, ROWS (2D)
 
 #ifndef RADIUS
 #define RADIUS 1 // default order 2
@@ -329,6 +330,39 @@ __device__ __forceinline__ void memory_force(const real_t *p, const int e,
   const real_t *__restrict__ pe = L[e].profile;                                \
   real_t *__restrict__ me = L[e].aux
 
+// the cell-gathered internal force on every component of the node idx, from u
+// and the cell field strided `cs` a component and S an axis
+__device__ __forceinline__ void cell_force(const real_t *__restrict__ u,
+                                           const real_t *__restrict__ cell,
+                                           const int idx, const int cs,
+                                           const int *A, const int *S,
+                                           const int *NN, real_t *force) {
+#pragma unroll
+  for (int i = 0; i < NDIM; ++i)
+    force[i] = (real_t)0;
+#pragma unroll
+  for (int c = 0; c < CELLS; ++c) {
+    int base, radius, self;
+    if (!cell_inside(c, A, NN, S, base, radius, self))
+      continue;
+    const real_t gc = cell[idx + base];
+    const real_t *table = STENCIL + (radius - 1) * NLOC * NLOC;
+#pragma unroll
+    for (int l = 0; l < CELLS; ++l) {
+      int off;
+      if (!block_offset(c, l, radius, S, off))
+        continue;
+#pragma unroll
+      for (int j = 0; j < NDIM; ++j) {
+        const real_t uj = u[j * cs + idx + off];
+#pragma unroll
+        for (int i = 0; i < NDIM; ++i)
+          force[i] -= gc * table[(self * NDIM + i) * NLOC + l * NDIM + j] * uj;
+      }
+    }
+  }
+}
+
 // -------------------------------------- kernels
 extern "C" {
 
@@ -344,34 +378,8 @@ __global__ void fd_kernel(const real_t *__restrict__ u0,
                           const int cs, AXIS_PARAMS) {
   INTERIOR_OR_RETURN;
   AXIS_GEOM;
-
   real_t force[NDIM];
-#pragma unroll
-  for (int i = 0; i < NDIM; ++i)
-    force[i] = (real_t)0;
-
-#pragma unroll
-  for (int c = 0; c < CELLS; ++c) {
-    int base, radius, self;
-    if (!cell_inside(c, A, NN, S, base, radius, self))
-      continue;
-    const real_t gc = cell[idx + base];
-    const real_t *table = STENCIL + (radius - 1) * NLOC * NLOC;
-#pragma unroll
-    for (int l = 0; l < CELLS; ++l) {
-      int off;
-      if (!block_offset(c, l, radius, S, off))
-        continue;
-#pragma unroll
-      for (int j = 0; j < NDIM; ++j) {
-        const real_t uj = u1[j * cs + idx + off];
-#pragma unroll
-        for (int i = 0; i < NDIM; ++i)
-          force[i] -=
-              gc * table[(self * NDIM + i) * NLOC + l * NDIM + j] * uj;
-      }
-    }
-  }
+  cell_force(u1, cell, idx, cs, A, S, NN, force);
 
   const real_t mi = minv[idx];
 #ifdef USE_DAMPING
@@ -504,5 +512,162 @@ __global__ void pml_adjoint_force_kernel(PML_ARGS) {
   for (int i = 0; i < NDIM; ++i)
     u2[i * cs + idx] += mi * force[i];
 }
+
+#if NDIM == 2 && defined(STEPS)
+// ------------------------------------------------------------------------------------
+// the core a tile writes back, its halo a node a step wide
+#define HALO STEPS
+#define C0 (TILE0 - 2 * HALO)
+#define C1 (TILE1 - 2 * HALO)
+#define NODES (TILE0 / ROWS) // a thread's consecutive nodes along axis 0
+#define WIDE (TILE1 + 2)     // a tile row with its guard columns
+#define AREA ((TILE0 + 2) * WIDE)
+#define AT(x, y) (((x) + 1) * WIDE + (y) + 1)
+static_assert(TILE0 % ROWS == 0, "the thread rows split the tile evenly");
+static_assert(2 * NODES <= 32, "a component bit per node fits the mask");
+
+// advance a tile STEPS steps between one load and one store: the cell gather,
+// the update, the excitation and the record, bitwise the plain launches
+__global__ void __launch_bounds__(TILE1 *ROWS)
+    blocked_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
+                   real_t *__restrict__ v0, real_t *__restrict__ v1,
+                   const real_t *__restrict__ minv,
+                   const real_t *__restrict__ cell,
+#ifdef USE_DAMPING
+                   const real_t *__restrict__ damping, const real_t dt,
+#endif
+                   const real_t *__restrict__ signal,
+                   const real_t *__restrict__ weights, const int num_sources,
+                   real_t *__restrict__ record, const int num_sensors,
+                   const int *__restrict__ source_starts,
+                   const unsigned *__restrict__ source_entries,
+                   const int *__restrict__ sensor_starts,
+                   const unsigned *__restrict__ sensor_entries, const int t0,
+                   const int cs, const real_t f0, const int N0, const real_t f1,
+                   const int N1, const int s0) {
+  // both components of u twice, swapped every step, and the cell field, each
+  // in a guard ring
+  extern __shared__ real_t shared[];
+  real_t *sc = shared + 4 * AREA;
+  const int ty = threadIdx.x, x0 = threadIdx.y * NODES;
+  const int thread = threadIdx.y * TILE1 + ty;
+  const int tile = blockIdx.y * gridDim.x + blockIdx.x;
+  const int lo0 = 1 + blockIdx.y * C0, lo1 = 1 + blockIdx.x * C1;
+  const int a1 = lo1 - HALO + ty, k1 = owner(a1, N1);
+  const bool col = a1 >= 0 && a1 <= N1 - 1;
+  const bool core1 = k1 >= lo1 && k1 < lo1 + C1;
+  const int T[2] = {WIDE, 1}, NN[2] = {N0, N1};
+  for (int e = thread; e < 5 * AREA; e += TILE1 * ROWS)
+    shared[e] = 0;
+  __syncthreads();
+
+  // the tile's sources and sensors as tags in the second u planes, source + 1
+  // and sensor + 1 a half, the component in the entry's local node
+  unsigned *tags = (unsigned *)(shared + 2 * AREA);
+  for (int e = source_starts[tile] + thread; e < source_starts[tile + 1];
+       e += TILE1 * ROWS) {
+    const unsigned entry = source_entries[e], local = entry & 0xffff;
+    const int c = local / (TILE0 * TILE1), at = local % (TILE0 * TILE1);
+    atomicOr(&tags[c * AREA + AT(at / TILE1, at % TILE1)], (entry >> 16) + 1);
+  }
+  for (int e = sensor_starts[tile] + thread; e < sensor_starts[tile + 1];
+       e += TILE1 * ROWS) {
+    const unsigned entry = sensor_entries[e], local = entry & 0xffff;
+    const int c = local / (TILE0 * TILE1), at = local % (TILE0 * TILE1);
+    atomicOr(&tags[c * AREA + AT(at / TILE1, at % TILE1)],
+             (entry >> 16) + 1 << 16);
+  }
+  __syncthreads();
+  unsigned tag[NODES][2];
+#pragma unroll
+  for (int k = 0; k < NODES; ++k) {
+    tag[k][0] = tags[AT(x0 + k, ty)];
+    tag[k][1] = tags[AREA + AT(x0 + k, ty)];
+  }
+  __syncthreads();
+
+  // the thread's nodes, loaded once: u twice, 1 / m and beta
+  real_t up[NODES][2], uc[NODES][2], mi[NODES];
+#ifdef USE_DAMPING
+  real_t beta[NODES];
+#endif
+  unsigned inner = 0; // bit k: an interior node, which the step moves
+#pragma unroll
+  for (int k = 0; k < NODES; ++k) {
+    const int x = x0 + k, a0 = lo0 - HALO + x, idx = a0 * s0 + a1;
+    const bool inside = col && a0 >= 0 && a0 <= N0 - 1;
+    const bool interior = a0 > 0 && a0 < N0 - 1 && a1 > 0 && a1 < N1 - 1;
+    inner |= (unsigned)interior << k;
+    sc[AT(x, ty)] = inside ? cell[idx] : (real_t)0;
+    mi[k] = interior ? minv[idx] : (real_t)0;
+#ifdef USE_DAMPING
+    beta[k] = interior ? 0.5f * mi[k] * damping[idx] : (real_t)0; // over dt
+#endif
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+      up[k][c] = inside ? u0[c * cs + idx] : 0;
+      uc[k][c] = inside ? u1[c * cs + idx] : 0;
+      shared[c * AREA + AT(x, ty)] = uc[k][c];
+    }
+  }
+  __syncthreads();
+
+  for (int t = 0; t < STEPS; ++t) {
+    // fd_kernel's gather off the tile, the tile edge reading garbage that never
+    // reaches the core; what nothing steps keeps its value of two steps back
+    const real_t *cu = shared + (t & 1) * 2 * AREA;
+    real_t *nu = shared + (~t & 1) * 2 * AREA;
+#pragma unroll
+    for (int k = 0; k < NODES; ++k) {
+      const int x = x0 + k, a0 = lo0 - HALO + x;
+      const int A[2] = {a0, a1};
+      real_t force[2];
+      if ((inner >> k) & 1)
+        cell_force(cu, sc, AT(x, ty), AREA, A, T, NN, force);
+#pragma unroll
+      for (int c = 0; c < 2; ++c) {
+        real_t next = up[k][c];
+        if ((inner >> k) & 1) {
+#ifdef USE_DAMPING
+          // rounded as nvcc compiles fd_kernel's, dt beta fused into 1 -+ beta
+          next = FMA_RN(MUL_RN(f0, mi[k]), force[c],
+                        FMA_RN(-up[k][c], FMA_RN(-dt, beta[k], 1.f),
+                               2.f * uc[k][c])) /
+                 FMA_RN(dt, beta[k], 1.f);
+#else
+          next = -up[k][c] + 2.f * uc[k][c] + f0 * mi[k] * force[c];
+#endif
+          const int j = (tag[k][c] & 0xffffu) - 1;
+          if (j >= 0)
+            next +=
+                MUL_RN(weights[j], signal[(size_t)(t0 + t) * num_sources + j]);
+        }
+        up[k][c] = uc[k][c];
+        uc[k][c] = next;
+        nu[c * AREA + AT(x, ty)] = next;
+        if (tag[k][c] >> 16)
+          record[(size_t)(t0 + t) * num_sensors + (tag[k][c] >> 16) - 1] = next;
+      }
+    }
+    __syncthreads();
+  }
+
+  // write back the core, each ghost with its mirror's tile
+  if (!col || !core1)
+    return;
+#pragma unroll
+  for (int k = 0; k < NODES; ++k) {
+    const int a0 = lo0 - HALO + x0 + k;
+    const int k0 = owner(a0, N0);
+    if (a0 >= 0 && a0 <= N0 - 1 && k0 >= lo0 && k0 < lo0 + C0) {
+#pragma unroll
+      for (int c = 0; c < 2; ++c) {
+        v0[c * cs + a0 * s0 + a1] = up[k][c];
+        v1[c * cs + a0 * s0 + a1] = uc[k][c];
+      }
+    }
+  }
+}
+#endif
 
 } // extern "C"

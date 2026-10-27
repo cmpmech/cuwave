@@ -119,6 +119,8 @@ several steps in shared memory. A small 2D `MaxwellWave` grid without pml or `ma
 takes `MaxwellWave.define_blocked_step` (`BLOCKED`, `BLOCKED_WAVES` of maxwell.py) the
 same way, the curl in place of the stresses; two sources on one point keep the pair.
 Past L2 the Maxwell pair also fuses into one `fused_kernel` (`FUSED_TILE`), as elastic.
+`AnisotropicElasticWave.define_blocked_step` blocks the 2D cell gather the same way, on a
+wave of tiles (`BLOCKED`) or past twice L2 (`LARGE_BLOCKED`).
 
 **2D Maxwell needs none of that.** Out of plane one component survives and the curl-curl
 collapses to a flux divergence, so `maxwell.ElectricWave` (E_z, permittivity as inertia)

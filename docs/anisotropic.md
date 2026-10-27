@@ -42,6 +42,7 @@ On top of [Simulation](wave.md) and mirroring [ElasticWave](elastic.md), with th
 | inertia | `inverse_inertia(indicator)` | lumped $1/\left(\gamma\rho_0VW\right)$, the mass the interior-cell assembly implies |
 | weights | `cell_weights()` | the nodal cell weights $W$, halved once per wall the node sits on |
 | stiffness | `stiffness_matrix()` | the Voigt matrix at $\gamma=1$, `C` or the isotropic one, which the stencil and the pml read |
+| blocked step | `define_blocked_step(mat, source, sensors)` | in 2D float32 on a grid of one wave of tiles (`BLOCKED`) or with fields past twice L2 (`LARGE_BLOCKED`), several steps a launch in shared memory, the excitation and the record inside the tile, bitwise the step; None in 1D and 3D, in float64, with a pml, or two sources on one point |
 | pml stability | `backward_axes(C, ndim, samples=4096)` | the axes along which some wave of `C` runs against its phase, sampled over directions, where a pml would grow |
 
 ## boundary conditions

@@ -9,10 +9,11 @@ The forward kernels of the [anisotropic](anisotropic.md) equation, gathering the
 | `USE_FLOAT` | `precision` | `real_t` is `float` rather than `double` |
 | `NDIM` | `len(Nx)` | selects the interior guard, the geometry macro and the loop bounds |
 | `USE_DAMPING` | `damping is not None` | adds the damped update and its two extra arguments |
+| `STEPS`, `TILE0`, `TILE1`, `ROWS` | `BLOCKED` or `LARGE_BLOCKED`, by `AnisotropicElasticWave.define_blocked_step` in 2D float32 without a pml | compiles `blocked_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
 
 `RADIUS` stays at its default of 1, since the class caps `space_order` at 2. `BLK` is $2\,\textrm{RADIUS}$, `CELLS` is $\textrm{BLK}^\textrm{ndim}$, the cells a node borders and equally the nodes a cell reaches, and `NLOC` is `CELLS * NDIM`, the side of the stencil table. All are compile-time, so every loop over them unrolls fully
 
-Unlike [cuda_scalar](cuda_scalar.md) neither `STENCIL_RADIUS` nor its coefficient tables enter: the table, one cell's contribution to the nodal stencil at $\gamma=1$, arrives in the constant array `STENCIL` for `fd_kernel`, copied in once by `AnisotropicElasticWave.define_step`, and as the `stencil` argument for the sensitivity kernels. Its indices are compile-time in every unrolled loop, so in constant memory each entry is an operand of the fused multiply-add rather than a load, which is what bounds the 3D gather
+Unlike [cuda_scalar](cuda_scalar.md) neither `STENCIL_RADIUS` nor its coefficient tables enter: the table, one cell's contribution to the nodal stencil at $\gamma=1$, arrives in the constant array `STENCIL` for `fd_kernel` and `blocked_kernel`, copied into each module once by `AnisotropicElasticWave.define_step` and `define_blocked_step`, and as the `stencil` argument for the sensitivity kernels. Its indices are compile-time in every unrolled loop, so in constant memory each entry is an operand of the fused multiply-add rather than a load, which is what bounds the 3D gather
 
 ## macros
 
@@ -35,6 +36,9 @@ decide whether cell `c` lies inside the domain, and where its low corner sits
 - the cell exists when both of its corners do, on every axis, which for the node gathering it is
 $$\textrm{bit}_d(c)=1:\quad a_d<N_d-2,\qquad\textrm{bit}_d(c)=0:\quad a_d>1$$
 - restricting the assembly to the cells that pass is what makes $\boldsymbol{\sigma}\cdot\mathbf{n}=0$ the natural boundary condition, so no ghost value of $\mathbf{u}$ is ever read and the ring the [boundary](boundary.md) kernels would fill is not needed
+
+### cell_force
+the force `fd_kernel` gathers on every component of a node, below, read from `u` and the cell field strided `cs` a component and `S` an axis, so the plain step reads the global fields and `blocked_kernel` its tile through the same code
 
 ### block_offset
 **aim**
@@ -91,6 +95,19 @@ $$u_i^{t}=-u_i^{t-2}+2u_i^{t-1}+\Delta t^2\,m^{-1}f_i$$
 $$\beta=\frac{d\,\Delta t}{2m}$$
 
 Note that `f1` and `f2` are accepted and never read: the tail `wave.axis_geometry` packs is per-axis, while the elastic factors live in the stencil table instead
+
+### blocked_kernel
+`STEPS` steps of `fd_kernel` between one load and one store of a tile, the excitation and the record included, bitwise the launches one at a time; 2D float32 only
+**parallelization**
+a 2D launch of `(TILE1, ROWS)` threads per block, one block per tile of `TILE0` $\times$ `TILE1` nodes; a thread owns `NODES` $=$ `TILE0 / ROWS` consecutive nodes of its column. Tiles overlap by a halo of `HALO` $=$ `STEPS` nodes each side, a cell gather reaching one node a step, and write back only their core
+**input args**
+`u0, u1`: both components at $t-1, t$; `v0, v1`: the arrays receiving them at $t+S-1, t+S$; `minv, cell` and with `USE_DAMPING` `damping, dt`: as `fd_kernel`; `signal, weights, num_sources, record, num_sensors, t0`, `source_starts, source_entries, sensor_starts, sensor_entries`: as the elastic `blocked_kernel`, entries `component node | point << 16`; `cs`: component stride; `f0, N0, f1, N1, s0`: as `fd_kernel`
+**internal args**
+`shared`: both components of $u$ twice, swapped every step, and the cell field, each in a guard ring one node wide, read by `cell_force` through the tile strides `T`; `up, uc, mi, beta, tag`: per owned node in registers; `inner`: the owned interior nodes, which the step moves
+**how?**
+- each step gathers the force off the tile's current $u$ and writes the next into the other copy, so one barrier separates the steps; a node off the interior keeps its value of two steps back, as the plain buffers do
+- the edge nodes of a tile read the guard ring and go wrong, one node deeper every step; after `STEPS` steps the error stops short of the core
+- the update is `fd_kernel`'s expression, the damped one rounded by `FMA_RN` and `MUL_RN` as nvcc contracts it ($\Delta t\,d/2m$ fused into $1\mp\beta$), and the source term rounded apart as `excitation_kernel` adds it
 
 ### pml_cell_kernel
 **parallelization**

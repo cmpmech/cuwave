@@ -14,6 +14,7 @@ general anisotropy.
 from __future__ import annotations
 
 import itertools
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,15 +29,29 @@ from .elastic import voigt
 from .wave import (
     PAIRS,
     PML_THREADS,
+    Blocked,
+    LaunchSlots,
     Simulation,
+    Source,
     apply_cell_weights,
     axis_geometry,
+    blocked_launches,
+    compile_kernels,
+    covering_hits,
+    flatten_indices,
     grid_block,
+    owner_hits,
     slab_grid,
+    tile_counts,
+    tile_lists,
 )
 
 KERNEL_PATH = Path(__file__).parent / "kernels" / "anisotropic.cu"
 SENSITIVITY_PATH = Path(__file__).parent / "kernels" / "anisotropic_sensitivity.cu"
+# candidates (tile, thread rows, steps) of the 2D blocked step: the first with the fewest waves
+BLOCKED = (((32, 32), 32, 6), ((32, 32), 32, 4), ((32, 64), 16, 6))
+BLOCKED_WAVES = 1  # the waves of tiles the blocked step pays to
+LARGE_BLOCKED = ((32, 128), 8, 4)  # for fields past twice L2
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -286,6 +301,89 @@ class AnisotropicElasticWave(Simulation):
         """The cell step, followed by its pml terms if there are any."""
         passes = ("pml_cell", "pml_force")
         return self._define_pml(kernels, mat, passes)
+
+    def define_blocked_step(
+        self, mat: dict, source: Source, sensors: cpt.NDArray[cp.int32] | None
+    ) -> Blocked | None:
+        """The 2D step advancing several steps a launch, excitation and record included, else None.
+
+        Each thread block loads a tile of both components with a halo of a node a step,
+        gathers the cells and steps the tile in shared memory and writes back its core:
+        bitwise the step, the excitation and the record launched one by one. Taken where
+        launches bound the step (the candidate of `BLOCKED` with the fewest waves of
+        tiles, while those stay within `BLOCKED_WAVES`) or DRAM does (`LARGE_BLOCKED`,
+        fields past twice L2); else None, as in 1D and 3D, in float64, with a pml, a
+        source or a sensor off the interior, or two sources or sensors on one point.
+        """
+        if self.ndim != 2 or self.precision != "float32" or self.pml is not None:
+            return None
+        if min(self.Nx) < 4:
+            return None
+
+        # launches bound a grid of a wave of tiles, DRAM one whose fields pass L2
+        device = cp.cuda.Device().attributes
+        sms = device["MultiProcessorCount"]
+        waves = [
+            -(-math.prod(tile_counts(self.Nx, b[0], b[2])) // sms) for b in BLOCKED
+        ]
+        fields = (3 * self.ndim + 2) * math.prod(map(int, self.Nx)) * 4
+        if min(waves) <= BLOCKED_WAVES:
+            tile, rows, steps = BLOCKED[waves.index(min(waves))]
+        elif fields > 2 * device["L2CacheSize"]:
+            tile, rows, steps = LARGE_BLOCKED
+        else:
+            return None
+        core = [t - 2 * steps for t in tile]
+        cores = tile_counts(self.Nx, tile, steps)
+
+        # sources and sensors in the interior, none twice
+        sources = flatten_indices(self, source.position)
+        targets = flatten_indices(self, sensors) if sensors is not None else sources[:0]
+        upper = np.asarray(self.Nx)[:, None] - 2
+        points, layers = [], []
+        for index in (sources, targets):
+            flat = index.get()
+            layer, node = np.divmod(flat, self.comp_stride)
+            point = np.stack(np.divmod(node, self.Nx_padded[1]))
+            # in the interior, each point once, the index fitting an entry's half
+            if not ((point >= 1) & (point <= upper)).all():
+                return None
+            if len(flat) >= 2**16 or len(np.unique(flat)) != len(flat):
+                return None
+            points.append(point)
+            layers.append(layer)
+
+        # a tile's sources wherever its nodes reach, its sensors where its core does
+        hits = [
+            covering_hits(points[0], tile, core, steps, cores),
+            owner_hits(points[1], points[1], core),
+        ]
+        lists = []
+        for hit, layer in zip(hits, layers):
+            lists += tile_lists(hit, tile, core, steps, cores, layer)
+
+        # the kernel, its stencil table copied in, u twice and the cell field
+        flags = (f"-DSTEPS={steps}", f"-DTILE0={tile[0]}", f"-DTILE1={tile[1]}")
+        kernels = compile_kernels(self, flags=(*flags, f"-DROWS={rows}"))
+        table = kernels.get_global("STENCIL")
+        cp.ndarray(mat["stencil"].shape, self.dtype, table)[...] = mat["stencil"]
+        kernel = kernels.get_function("blocked_kernel")
+        shared = 5 * (tile[0] + 2) * (tile[1] + 2) * 4
+        if shared > device["MaxSharedMemoryPerBlockOptin"]:
+            return None
+        kernel.max_dynamic_shared_size_bytes = shared
+
+        # the arguments, the pointers and the per-call values filled in per launch
+        weights = self.excitation_weights(mat, sources)
+        args = [None, None, None, None, mat["minv"], mat["cell"]]
+        if self.damping is not None:
+            args += [mat["damping"], self.dtype(self.dt)]
+        args += [None, weights, np.int32(len(sources)), None, np.int32(len(targets))]
+        args += [*lists, None]
+        slots = LaunchSlots(len(args) - 10, len(args) - 7, len(args) - 1, None)
+        args += [np.int32(self.comp_stride), *axis_geometry(self, self.step_factors())]
+        launches = [(kernel, tuple(cores[::-1]), None)]
+        return blocked_launches(steps, launches, (tile[1], rows), shared, args, slots)
 
     def define_adjoint_step(
         self, kernels: cp.RawModule, sens_kernels: cp.RawModule, mat: dict
