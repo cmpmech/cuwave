@@ -279,37 +279,14 @@ class MaxwellWave(Simulation):
 
     def _define_pair(self, kernels: cp.RawModule, mat: dict, adjoint: bool) -> Callable:
         """The curl and update launches, each followed by its pml terms if there are any; fused past L2 without one."""
-        # one launch where DRAM bounds the pair and the ring at most doubles the curl
-        device = cp.cuda.Device().attributes
-        nodes = math.prod(map(int, self.Nx))
-        fields = (4 * self.ndim + self.npairs) * nodes * self.dtype().itemsize
-        tile = FUSED_TILE[self.ndim - 2]
-        ring = math.prod(t + self.space_order for t in tile)
-        shared = self.npairs * ring * self.dtype().itemsize
-        if (
-            self.pml is None
-            and fields > device["L2CacheSize"]
-            and ring <= 2 * math.prod(tile)
-            and shared <= device["MaxSharedMemoryPerBlockOptin"]
-            and device["MultiProcessorCount"] >= FUSED_SMS[self.ndim - 2]
-        ):
-            return self._define_fused(mat, tile, shared)
+        if self._fuses_pair():
+            return self._define_fused(mat)
 
         # the pair
         curl_kernel = kernels.get_function("curl_kernel")
         fd_kernel = kernels.get_function("fd_kernel")
         grid, block = grid_block(self)
-        # the curl scratch outlives the closure, its invalid pair points never written
-        h = cp.zeros((self.npairs, *self.Nx_padded), dtype=self.dtype)
-        inv_dx = [self.dtype(1.0 / d) for d in self.dx]
-        cs = np.int32(self.comp_stride)
-        material = [mat["nu_pair"]] if self.magnetic else []
-        material += [self.dtype(1.0 / self.permeability), cs]
-        cargs = [None, h, *material, *axis_geometry(self, inv_dx)]
-        uargs = [None, None, None, h, mat["minv"]]
-        if self.damping is not None:
-            uargs += [mat["damping"], self.dtype(self.dt)]
-        uargs += [cs, *axis_geometry(self, self.step_factors())]
+        h, cargs, uargs = self._pair_args(mat)
         if self.pml is None:
 
             def fd_step(u0, u1, u2):
@@ -320,6 +297,8 @@ class MaxwellWave(Simulation):
                 return u2
 
             return fd_step
+        cs = np.int32(self.comp_stride)
+        material = self._curl_material(mat)
         curl_pml, force_pml = define_pair_pml(
             self, kernels, "curl", h, material, [mat["minv"], cs], adjoint
         )
@@ -336,11 +315,64 @@ class MaxwellWave(Simulation):
         pml_step.memory = curl_pml.memory
         return pml_step
 
-    def _define_fused(self, mat: dict, tile: tuple[int, ...], shared: int) -> Callable:
+    def _pair_args(self, mat: dict) -> tuple[cpt.NDArray, list, list]:
+        """A curl scratch and the argument lists of the curl and update kernels on it."""
+        # the curl scratch outlives the closure, its invalid pair points never written
+        h = cp.zeros((self.npairs, *self.Nx_padded), dtype=self.dtype)
+        inv_dx = [self.dtype(1.0 / d) for d in self.dx]
+        cargs = [None, h, *self._curl_material(mat), *axis_geometry(self, inv_dx)]
+        uargs = [None, None, None, h, mat["minv"]]
+        if self.damping is not None:
+            uargs += [mat["damping"], self.dtype(self.dt)]
+        uargs += [np.int32(self.comp_stride), *axis_geometry(self, self.step_factors())]
+        return h, cargs, uargs
+
+    def _curl_material(self, mat: dict) -> list:
+        """The curl kernel's material arguments, the component stride last."""
+        material = [mat["nu_pair"]] if self.magnetic else []
+        return material + [
+            self.dtype(1.0 / self.permeability),
+            np.int32(self.comp_stride),
+        ]
+
+    def _fuses_pair(self) -> bool:
+        """Whether one launch steps the pair: DRAM bounds it and the ring at most doubles the curl."""
+        device = cp.cuda.Device().attributes
+        nodes = math.prod(map(int, self.Nx))
+        fields = (4 * self.ndim + self.npairs) * nodes * self.dtype().itemsize
+        tile = FUSED_TILE[self.ndim - 2]
+        ring = math.prod(t + self.space_order for t in tile)
+        return (
+            self.pml is None
+            and fields > device["L2CacheSize"]
+            and ring <= 2 * math.prod(tile)
+            and self._fused_shared() <= device["MaxSharedMemoryPerBlockOptin"]
+            and device["MultiProcessorCount"] >= FUSED_SMS[self.ndim - 2]
+        )
+
+    def _fused_shared(self) -> int:
+        """Bytes of the fused step's curl: its tile and a ring a radius wide."""
+        ring = math.prod(t + self.space_order for t in FUSED_TILE[self.ndim - 2])
+        return self.npairs * ring * self.dtype().itemsize
+
+    def _define_fused(self, mat: dict) -> Callable:
         """The step as one launch, each block's curl in shared memory, ring included."""
-        flags = tuple(f"-DTILE{d}={t}" for d, t in enumerate(tile))
+        args, launch = self._fused_launch(mat, ())
+
+        def fd_step(u0, u1, u2):
+            args[0], args[1], args[2] = u0, u1, u2
+            launch()
+            return u2
+
+        return fd_step
+
+    def _fused_launch(self, mat: dict, flags: tuple[str, ...]) -> tuple[list, Callable]:
+        """The fused step's argument list, compiled with `flags` too, and a launch over it."""
+        tile = FUSED_TILE[self.ndim - 2]
+        flags += tuple(f"-DTILE{d}={t}" for d, t in enumerate(tile))
         kernel = compile_kernels(self, flags=flags).get_function("fused_kernel")
         grid = tuple(-(-n // t) for n, t in zip(self.Nx_padded, tile))[::-1]
+        shared = self._fused_shared()
         kernel.max_dynamic_shared_size_bytes = shared
         args = [None, None, None, *([mat["nu_pair"]] if self.magnetic else [])]
         args += [self.dtype(1.0 / self.permeability), mat["minv"]]
@@ -349,12 +381,62 @@ class MaxwellWave(Simulation):
         args += [np.int32(self.comp_stride), *(self.dtype(1.0 / d) for d in self.dx)]
         args += axis_geometry(self, self.step_factors())
 
-        def fd_step(u0, u1, u2):
-            args[0], args[1], args[2] = u0, u1, u2
+        def launch():
             kernel(grid, tile[::-1], args, shared_mem=shared)
-            return u2
 
-        return fd_step
+        return args, launch
+
+    @property
+    def fuses_adjoint(self) -> bool:
+        """Whether the adjoint pair accumulates the gradients: not under a pml, whose own launches amend the update."""
+        return self.pml is None
+
+    def define_adjoint_gradient(
+        self, kernels: cp.RawModule, mat: dict, grads: dict
+    ) -> Callable:
+        """Closure stepping the adjoint `l0` over `l1` in place, adding the gradients of `l1` against `u1`.
+
+        The step kernels under `-DGRADIENT`, the inertia term summed by parts in time as
+        `PressureWave` sums it; `kernels` goes unused.
+        """
+        if self.pml is not None:
+            raise ValueError(
+                "a pml amends the update in launches of its own: step the adjoint with "
+                "define_adjoint_step and accumulate with define_gradient"
+            )
+        mf = self.dtype(self.adjoint_mass_factor())
+        nu = [grads["nu"]] if self.magnetic else []
+        if self._fuses_pair():
+            args, launch = self._fused_launch(mat, ("-DGRADIENT",))
+            args += [grads["mass"], None, mf, *nu]
+            at = len(args) - 2 - len(nu)
+
+            def fused_gradient_step(l0, l1, u1):
+                args[0], args[1], args[2], args[at] = l0, l1, l0, u1
+                launch()
+                return l0
+
+            return fused_gradient_step
+
+        # the pair
+        gradient_kernels = compile_kernels(self, flags=("-DGRADIENT",))
+        curl_kernel = gradient_kernels.get_function("curl_kernel")
+        fd_kernel = gradient_kernels.get_function("fd_kernel")
+        grid, block = grid_block(self)
+        _, cargs, uargs = self._pair_args(mat)
+        cargs += [*nu, None] if self.magnetic else []
+        uargs += [grads["mass"], None, mf]
+
+        def adjoint_gradient_step(l0, l1, u1):
+            cargs[0] = l1
+            if self.magnetic:
+                cargs[-1] = u1
+            curl_kernel(grid, block, cargs)
+            uargs[0], uargs[1], uargs[2], uargs[-2] = l0, l1, l0, u1
+            fd_kernel(grid, block, uargs)
+            return l0
+
+        return adjoint_gradient_step
 
     def define_blocked_step(
         self, mat: dict, source: Source, sensors: cpt.NDArray[cp.int32] | None

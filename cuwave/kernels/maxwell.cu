@@ -5,6 +5,7 @@
 //   USE_MAGNETIC
 //   TILE0, TILE1, TILE2 (the fused step's tile)
 //   STEPS, TILE0, TILE1, ROWS (2D, without USE_MAGNETIC)
+//   GRADIENT (no STEPS): the step adds the gradient densities of u1 against v1
 
 #if NDIM == 1
 #error "a single in-plane component has no curl; use maxwell.ElectricWave"
@@ -71,6 +72,19 @@ __device__ __forceinline__ real_t pair_weight(const int k, const int l,
       w *= (real_t)0.5;
   return w;
 }
+
+// the adjoint pair's accumulators and the forward field v1 they pair u1 with
+#if defined(GRADIENT) && defined(USE_MAGNETIC)
+#define CURL_GRADIENT , real_t *__restrict__ g_nu, const real_t *__restrict__ v1
+#else
+#define CURL_GRADIENT
+#endif
+#ifdef GRADIENT
+#define MASS_GRADIENT                                                          \
+  , real_t *__restrict__ g_mass, const real_t *__restrict__ v1, const real_t mf
+#else
+#define MASS_GRADIENT
+#endif
 
 // ------------------------------------- pml helpers
 // the curl row of the pair (c, e), counted from the first pair
@@ -186,7 +200,8 @@ __global__ void curl_kernel(const real_t *__restrict__ u1,
 #ifdef USE_MAGNETIC
                             const real_t *__restrict__ nu_pair,
 #endif
-                            const real_t nu, const int cs, AXIS_PARAMS) {
+                            const real_t nu, const int cs,
+                            AXIS_PARAMS CURL_GRADIENT) {
   INTERIOR_OR_RETURN;
   AXIS_GEOM;
   AXIS_FACTORS;
@@ -199,6 +214,10 @@ __global__ void curl_kernel(const real_t *__restrict__ u1,
         continue; // no pair point on the staggered ghost of either axis
       const int p = PAIR_ROW(k, l) - NDIM;
       const real_t b = curl_component(u1, idx, cs, k, l, A, S, NN, F);
+#if defined(GRADIENT) && defined(USE_MAGNETIC)
+      // dJ/d(1/mu): the adjoint curl against the forward one
+      g_nu[p * cs + idx] -= b * curl_component(v1, idx, cs, k, l, A, S, NN, F);
+#endif
 #ifdef USE_MAGNETIC
       h[p * cs + idx] = nu_pair[p * cs + idx] * b; // the weight is folded in
 #else
@@ -215,7 +234,7 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
 #ifdef USE_DAMPING
           const real_t *__restrict__ damping, const real_t dt,
 #endif
-          const int cs, AXIS_PARAMS) {
+          const int cs, AXIS_PARAMS MASS_GRADIENT) {
   INTERIOR_OR_RETURN;
   AXIS_GEOM;
   AXIS_FACTORS;
@@ -229,10 +248,16 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
     const real_t mi = minv[n];
 #ifdef USE_DAMPING
     const real_t beta = 0.5f * mi * damping[idx] * dt;
-    u2[n] = (2.f * u1[n] - u0[n] * (1.f - beta) + mi * force) / (1.f + beta);
+    const real_t next =
+        (2.f * u1[n] - u0[n] * (1.f - beta) + mi * force) / (1.f + beta);
 #else
-    u2[n] = -u0[n] + 2.f * u1[n] + mi * force;
+    const real_t next = -u0[n] + 2.f * u1[n] + mi * force;
 #endif
+#ifdef GRADIENT
+    // dJ/dpermittivity by parts in time: v against the second difference
+    g_mass[n] -= mf * v1[n] * (next - 2.f * u1[n] + u0[n]);
+#endif
+    u2[n] = next;
   }
 }
 
@@ -403,7 +428,12 @@ __global__ void __launch_bounds__(THREADS)
 #if NDIM == 3
                  const real_t e2,
 #endif
-                 AXIS_PARAMS) {
+                 AXIS_PARAMS MASS_GRADIENT
+#if defined(GRADIENT) && defined(USE_MAGNETIC)
+                 ,
+                 real_t *__restrict__ g_nu
+#endif
+    ) {
   extern __shared__ real_t sh[]; // NPAIRS * RING
 #if NDIM == 2
   const int b0 = blockIdx.y * TILE0 - STENCIL_RADIUS;
@@ -463,6 +493,19 @@ __global__ void __launch_bounds__(THREADS)
       threadIdx.x + STENCIL_RADIUS;
   const int T[3] = {WIDE * DEEP_, DEEP_, 1};
 #endif
+#if defined(GRADIENT) && defined(USE_MAGNETIC)
+  // dJ/d(1/mu) on the node's pair points, with the curl's factors E
+#pragma unroll
+  for (int k = 0; k < NDIM - 1; ++k)
+#pragma unroll
+    for (int l = k + 1; l < NDIM; ++l) {
+      if (A[k] > NN[k] - 3 || A[l] > NN[l] - 3)
+        continue;
+      g_nu[(PAIR_ROW(k, l) - NDIM) * cs + idx] -=
+          curl_component(u1, idx, cs, k, l, A, S, NN, E) *
+          curl_component(v1, idx, cs, k, l, A, S, NN, E);
+    }
+#endif
 #pragma unroll
   for (int c = 0; c < NDIM; ++c) {
     if (A[c] > NN[c] - 3)
@@ -472,10 +515,15 @@ __global__ void __launch_bounds__(THREADS)
     const real_t mi = minv[n];
 #ifdef USE_DAMPING
     const real_t beta = 0.5f * mi * damping[idx] * dt;
-    u2[n] = (2.f * u1[n] - u0[n] * (1.f - beta) + mi * force) / (1.f + beta);
+    const real_t next =
+        (2.f * u1[n] - u0[n] * (1.f - beta) + mi * force) / (1.f + beta);
 #else
-    u2[n] = -u0[n] + 2.f * u1[n] + mi * force;
+    const real_t next = -u0[n] + 2.f * u1[n] + mi * force;
 #endif
+#ifdef GRADIENT
+    g_mass[n] -= mf * v1[n] * (next - 2.f * u1[n] + u0[n]);
+#endif
+    u2[n] = next;
   }
 }
 #endif

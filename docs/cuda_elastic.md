@@ -1,6 +1,6 @@
 # CUDA elastic
 
-The forward kernels of the staggered [elastic](elastic.md) equation: one pass forming the stresses on their staggered points, one pass gathering their divergence into the update
+The forward kernels of the staggered [elastic](elastic.md) equation: one pass forming the stresses on their staggered points, one pass gathering their divergence into the update. Compiled with `GRADIENT`, the same two passes step the adjoint and add its gradient densities on the way
 
 ## compilation logic
 
@@ -14,6 +14,7 @@ The forward kernels of the staggered [elastic](elastic.md) equation: one pass fo
 | `STAG_COEFFS` | `staggered_weights` | the graded coefficient table, prepended alongside |
 | `TILE0`, `TILE1`, `TILE2` | `FUSED_TILE`, by `ElasticWave.define_step` without a pml where the fields spill out of L2 and the ring at most doubles the tile | compiles `fused_kernel`, the tile one block steps |
 | `STEPS`, `TILE0`, `TILE1`, `ROWS` | `BLOCKED` or `LARGE_BLOCKED`, by `ElasticWave.define_blocked_step` in 2D without a pml, on a small grid or past L2 | compiles `blocked_kernel` instead of `fused_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
+| `GRADIENT` | `ElasticWave.define_adjoint_gradient` | `stress_kernel`, `fd_kernel` and `fused_kernel` add the gradient densities of the adjoint `u1` against the forward `v1`, their accumulators appended to the arguments |
 
 `NPAIRS` is $\textrm{ndim}\left(\textrm{ndim}-1\right)/2$ and `NVOIGT` is `NDIM + NPAIRS`, the stress components held back to back in the `sigma` scratch. `SG_W(r, k)` reads coefficient $k$ of the radius-$r$ row from `__constant__` memory, collapsing to 1 at `STENCIL_RADIUS` 1. `PAIR_ROW(k, l)` maps an axis pair onto its Voigt row, `NDIM + 3 - k - l` in 3D and 2 in 2D
 
@@ -30,6 +31,9 @@ Under `USE_PML`, the per-axis arguments appended to `stress_kernel` and `fd_kern
 
 ### AXIS_GEOM, AXIS_FACTORS
 Declare the compile-time arrays the family loops index: `A` the per-axis grid index, `S` the per-axis stride (last is 1), `NN` the per-axis logical extent, `F` the per-axis factor `f0..f2`
+
+### STIFFNESS_GRADIENT, MASS_GRADIENT, SHEAR_ROWS
+Under `GRADIENT`, the arguments appended to `stress_kernel` (`g_normal`, `g_shear` from 2D on, `v1`) and to `fd_kernel` (`g_mass`, `v1`, `mf`) ahead of the pml ones, and `SHEAR_ROWS` the shear accumulator a call passes on; empty otherwise
 
 ## device functions
 
@@ -118,6 +122,21 @@ every stress of the node at `idx`, zero off the point a family does not carry, a
 **aim**
 the stress divergence on component `c`'s point, as `fd_kernel` takes it; see there for the taps
 
+## gradient helpers
+
+Under `GRADIENT` only. `normal_form` is the one of [cuda_elastic_sensitivity](cuda_elastic_sensitivity.md), copied, since each file is its own module
+
+### stiffness_density
+**aim**
+subtract the stiffness densities of the adjoint against the forward field at the node and its shear points, as `gradient_kernel` does
+**input args**
+`u1`: the adjoint field; `v1`: the forward field it pairs with; `idx`, `cs`, `A`, `S`, `NN`: geometry; `F`: $1/\Delta x_d$, the strain factors; `lam`, `mu`, `clamped`: as `stress_kernel`
+**output args**
+`g_normal`, `g_shear`: the normal and shear accumulators, decremented
+**how?**
+- the graded strains of both fields, never the deep shortcut, so the densities are bit for bit those of `gradient_kernel`
+$$g_n\mathrel{-}=2\mu\,\boldsymbol{\varepsilon}\left(\lambda\right):\boldsymbol{\varepsilon}\left(u\right)+\lambda_\textrm{eff}\,\textrm{tr}\,\boldsymbol{\varepsilon}\left(\lambda\right)\textrm{tr}\,\boldsymbol{\varepsilon}\left(u\right)\qquad g_{kl}\mathrel{-}=\mu\,2\varepsilon_{kl}\left(\lambda\right)\,2\varepsilon_{kl}\left(u\right)$$
+
 ## pml helpers
 The pml terms are folded into `stress_kernel` and `fd_kernel`: a thread whose node lies on the slab of a lined axis `e` adds that axis' memory terms in registers, so a lined step costs no launch beyond the unlined one. The memory `aux` of axis `e` holds `2 * NDIM` rows: the strain memories $\psi_k$ of $\partial_eu_k$ at the strain point $\left(k,e\right)$, then the divergence memories $\zeta_c$ of the axis-$e$ part of $\nabla\cdot\sigma_c$. The adjoint adds a second block of `NDIM` strain rows at `2 * NDIM`: `fd_kernel` reads one block at the neighbours while settling the other at its own node, and the two swap every step. Its slab row `t` is `slab_index` of the node ([cuda_scalar](cuda_scalar.md)). The `profile` rows are read at the node or at the half point $a+\tfrac12$, whichever the quantity sits on along `e`
 ### zeroed_axes
@@ -173,9 +192,9 @@ read off the block `phase` names and written into the other, so no thread overwr
 **parallelization**
 one thread per grid point, writing every stress family whose point it carries
 **input args**
-`u1`: the field at $t-1$; `gamma`: the nodal design, which `node_gamma` and `shear_gamma` take onto the stress points; `lam`, `mu`: $\lambda$ (plane-reduced on the host) and $\mu$; `clamped`: the face bitmask; `cs`: component stride; `f0..f2`: $1/\Delta x_d$; `N0..N2`, `s0, s1`: geometry; under `USE_PML`, per axis `m`, `p`, `lo`, `hi`: its memory, profile and slab rows, 0 unlined, then `phase`: 0 forwards, 1 or 2 the adjoint reading its strain memory off row 0 or `2 * NDIM`
+`u1`: the field at $t-1$; `gamma`: the nodal design, which `node_gamma` and `shear_gamma` take onto the stress points; `lam`, `mu`: $\lambda$ (plane-reduced on the host) and $\mu$; `clamped`: the face bitmask; `cs`: component stride; `f0..f2`: $1/\Delta x_d$; `N0..N2`, `s0, s1`: geometry; under `GRADIENT`, `v1`: the forward field `u1` pairs with; under `USE_PML`, per axis `m`, `p`, `lo`, `hi`: its memory, profile and slab rows, 0 unlined, then `phase`: 0 forwards, 1 or 2 the adjoint reading its strain memory off row 0 or `2 * NDIM`
 **output args**
-`sigma`: `NVOIGT` fields, the normal stresses first and the pairs in Voigt order, assigned rather than accumulated; points no family writes stay at the zero the scratch was allocated with
+`sigma`: `NVOIGT` fields, the normal stresses first and the pairs in Voigt order, assigned rather than accumulated; points no family writes stay at the zero the scratch was allocated with; under `GRADIENT`, `g_normal`, `g_shear`: the stiffness densities of `stiffness_density`, accumulated with `-=`
 **how?**
 - the normal family couples through the (possibly condensed) $\lambda$, a zeroed axis writing an explicit zero
 $$\sigma_{dd}=W\gamma\left(2\mu\,\varepsilon_{dd}+\lambda_\textrm{eff}\,\textrm{tr}\,\boldsymbol{\varepsilon}\right)$$
@@ -186,9 +205,9 @@ $$\sigma_{kl}=w_s\gamma_s\,\mu\left(2\,\varepsilon_{kl}\right)$$
 **parallelization**
 one thread per grid point, updating every component whose unknown it carries
 **input args**
-`u0`, `u1`: the fields at $t-2$ and $t-1$; `sigma`: the stresses `stress_kernel` just wrote; `gamma`, `rho`: the nodal design and $\rho_0$, from which `point_minv` forms the inverse inertia per component; `damping`: nodal $d$, with `USE_DAMPING` only; `dt`: $\Delta t$, with `USE_DAMPING` only; `clamped`, `cs`: as above; `f0..f2`: $\Delta t^2/\Delta x_d$; the pml arguments of `stress_kernel`, under `USE_PML`
+`u0`, `u1`: the fields at $t-2$ and $t-1$; `sigma`: the stresses `stress_kernel` just wrote; `gamma`, `rho`: the nodal design and $\rho_0$, from which `point_minv` forms the inverse inertia per component; `damping`: nodal $d$, with `USE_DAMPING` only; `dt`: $\Delta t$, with `USE_DAMPING` only; `clamped`, `cs`: as above; `f0..f2`: $\Delta t^2/\Delta x_d$; under `GRADIENT`, `v1`: the forward field `u1` pairs with, and `mf`: $1/\Delta t^2$; the pml arguments of `stress_kernel`, under `USE_PML`
 **output args**
-`u2`: the field at $t$, same layout as `u1`
+`u2`: the field at $t$, same layout as `u1`, which the adjoint passes as `u0` again; under `GRADIENT`, `g_mass`: the inertia density, accumulated with `-=`
 **internal args**
 `force`: the divergence per component; `ap, am`: the stress node of the plus and minus tap; `rp, rm`: that point's own graded radius, which decides whether the tap exists
 **how?**
@@ -196,13 +215,15 @@ one thread per grid point, updating every component whose unknown it carries
 $$f_c=\frac{1}{\Delta x_c}\sum_k c_k^{\left(r\left(a\right)\right)}\left(\sigma_{cc}^{i+k}-\sigma_{cc}^{i-k+1}\right)+\sum_{l\ne c}\frac{1}{\Delta x_l}\sum_j c_j^{\left(r\left(a\right)\right)}\left(\sigma_{cl}^{i+j-1}-\sigma_{cl}^{i-j}\right)$$
 - the march is the three-term recursion of [cuda_scalar](cuda_scalar.md), component by component, `USE_DAMPING` dividing by $1+\beta$ with one damping field serving every component
 - under `USE_PML`, `force_memory` of every lined axis adds onto the update, $u_c^t\mathrel{+}=m_c^{-1}\zeta_c$, and the adjoint then settles its strain memories with `settle_memory`
+- under `GRADIENT`, the inertia density summed by parts in time, the forward field against the second difference of the adjoint, formed before the store so the `u0` it reads is not yet overwritten
+$$g_{m,c}\mathrel{-}=\frac{1}{\Delta t^2}v_c\left(u_c^t-2u_c^{t-1}+u_c^{t-2}\right)$$
 
 ### fused_kernel
 `stress_kernel` and `fd_kernel` in one launch, bitwise the pair; without a pml
 **parallelization**
 one block per tile of `TILE0` $\times$ `TILE1` ($\times$ `TILE2`) nodes, a thread each; the block first forms the stresses of the tile and of a ring `STENCIL_RADIUS` wide around it, then updates its own nodes
 **input args**
-`u0`, `u1`, `u2`, `gamma`, `rho`, `damping`, `dt`, `clamped`, `cs`, `f0..f2`: as `fd_kernel`; `lam`, `mu`: as `stress_kernel`; `e0..e2`: $1/\Delta x_d$, the factors `stress_kernel` takes
+`u0`, `u1`, `u2`, `gamma`, `rho`, `damping`, `dt`, `clamped`, `cs`, `f0..f2`: as `fd_kernel`; `lam`, `mu`: as `stress_kernel`; `e0..e2`: $1/\Delta x_d$, the factors `stress_kernel` takes; under `GRADIENT`, after the geometry, `g_mass`, `g_normal`, `g_shear`, `v1`, `mf`: as the pair, both densities formed at the block's own nodes, the stiffness strains read off global memory with `e0..e2`
 **internal args**
 `ss`: the `NVOIGT` stresses of the tile and its ring in shared memory, zero where `stress_kernel` writes nothing (off the interior); `local`, `T`: the node's place and strides in it, which `nodal_force` reads through as it would the `sigma` scratch
 **how?**

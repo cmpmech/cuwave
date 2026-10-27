@@ -478,6 +478,7 @@ class Simulation:
     pml_shifted = False  # whether a pml needs the CFS shift, cross terms coupling it
     pml_walls = None  # the conditions a lined face may carry, None for any
     fuses_adjoint = False  # whether the gradients ride in the adjoint step kernels
+    fuses_superposition = False  # whether the Frechet integrands ride in the step kernel
 
     @property
     def compile_flags(self) -> tuple[str, ...]:

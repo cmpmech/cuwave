@@ -798,7 +798,7 @@ def superposition_sensitivity(
     excitation_step = define_excitation(sim, source.position, kernels, mat)
     get_signal = define_get_signal(sim, sensors, kernels)
     accs = sim.gradient_fields(mat)
-    fused = sim.fuses_adjoint
+    fused = sim.fuses_superposition
     if fused:
         subtract_step = sim.define_superposed(sens_kernels, mat, accs, -1.0)
         add_step = sim.define_superposed(sens_kernels, mat, accs, 1.0)

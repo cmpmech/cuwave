@@ -814,7 +814,7 @@ class SuperpositionTest(unittest.TestCase):
         for name, sim, freq, base in self._cases():
             with self.subTest(formulation=name):
                 separate = replace(sim)
-                separate.fuses_adjoint = False
+                separate.fuses_superposition = False
                 source, sensors, indicator, objective = _problem(sim, freq, base)
                 runs = [
                     superposition_sensitivity(s, source, indicator, sensors, objective)

@@ -24,6 +24,10 @@ tile. It claims the curl and update pair bit for bit, so it is compared with
 `array_equal` over orders, faces, damping, tiles and sources on both components. Past L2
 the pair becomes one launch (`_define_fused`) that recomputes the curl of a ring around
 each tile, pinned to the pair bit for bit in 2D and 3D, a designed permeability included.
+The adjoint pair that carries the gradients is pinned on both tiers to the step and the
+gradient kernel launched apart: the step and the permeability density bit for bit, the
+permittivity density to its sum by parts in time. A pml keeps the two apart, since its
+own launches amend the update after the kernel has read it.
 """
 
 import itertools
@@ -650,11 +654,7 @@ class FusedTest(unittest.TestCase):
                 mat = sim.build_materials(gamma)
                 # a grid this small takes the pair
                 pair = sim._define_pair(compile_kernels(sim), mat, adjoint=False)
-                tile = maxwell.FUSED_TILE[sim.ndim - 2]
-                ring = math.prod(t + order for t in tile)
-                fused = sim._define_fused(
-                    mat, tile, sim.npairs * ring * sim.dtype().itemsize
-                )
+                fused = sim._define_fused(mat)
                 shape = (sim.ncomp, *sim.Nx_padded)
                 u0, u1 = (
                     cp.asarray(rng.standard_normal(shape), dtype=sim.dtype)
@@ -664,6 +664,70 @@ class FusedTest(unittest.TestCase):
                 b = fused(u0, u1, cp.zeros_like(u0))
                 self.assertGreater(float(cp.abs(a).max()), 0.0)
                 self.assertTrue(bool(cp.array_equal(a, b)))
+
+
+def _assert_fused_adjoint(test, sim, gamma, rng, fused):
+    """The adjoint step carrying the gradients against the step, the gradient kernel and the sum by parts."""
+    mat = sim.build_materials(gamma)
+    kernels = compile_kernels(sim, sim.sensitivity_path)
+    l0, l1, u1 = (
+        cp.asarray(rng.standard_normal(sim.field_shape), dtype=sim.dtype)
+        for _ in range(3)
+    )
+    step = sim.define_adjoint_step(compile_kernels(sim), kernels, mat)
+    expected = step(l0, l1, cp.zeros_like(l0))
+    separate, grads = sim.gradient_fields(mat), sim.gradient_fields(mat)
+    zero = cp.zeros_like(u1)
+    sim.define_gradient(kernels, mat, separate)(zero, u1, zero, l1)
+    got = l0.copy()
+    with mock.patch.object(type(sim), "_fuses_pair", lambda self: fused):
+        sim.define_adjoint_gradient(kernels, mat, grads)(got, l1, u1)
+    # the points the step writes, each component short of its staggered ghost
+    points = cp.zeros(sim.field_shape, dtype=cp.bool_)
+    for c in range(sim.ndim):
+        points[c][tuple(slice(1, n - 1 - (d == c)) for d, n in enumerate(sim.Nx))] = 1
+    test.assertTrue(bool(cp.array_equal(got[points], expected[points])))
+    for name in set(separate) - {"mass"}:
+        test.assertTrue(bool(cp.array_equal(grads[name], separate[name])), name)
+    mass = -sim.adjoint_mass_factor() * u1 * (expected - 2 * l1 + l0) * points
+    error = float(cp.abs(grads["mass"] - mass).max() / cp.abs(mass).max())
+    test.assertLess(error, 1e-13)
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class AdjointGradientTest(unittest.TestCase):
+    def test_the_fused_adjoint_step_is_the_step_and_the_gradient_kernel(self):
+        rng = np.random.default_rng(6)
+        mixed = ((Conductor, Magnetic), (Magnetic, Conductor))
+        cases = (
+            ((37, 70), 2, Conductor, False, DielectricWave),
+            ((37, 70), 4, mixed, True, DielectricWave),
+            ((37, 70), 4, Magnetic, False, MagnetodielectricWave),
+            ((13, 21, 40), 2, (*mixed, (Conductor, Conductor)), True, DielectricWave),
+            ((13, 21, 40), 2, Conductor, False, MagnetodielectricWave),
+        )
+        for (Nx, order, boundary, damped, cls), fused in itertools.product(
+            cases, (False, True)
+        ):
+            with self.subTest(Nx=Nx, order=order, cls=cls.__name__, fused=fused):
+                dx = tuple(1.0 / (n - 3) for n in Nx)
+                common = dict(permittivity1=EPS1, permittivity2=4.0, permeability=MU)
+                threads = VECTOR_THREADS[len(Nx)]
+                sim = cls(Nx, dx, 1, 1e-3, threads, precision="float64", **common)
+                sim = replace(sim, space_order=order, boundary=boundary)
+                gamma = cp.asarray(rng.random(sim.Nx_padded), dtype=sim.dtype)
+                if damped:
+                    sim = replace(sim, damping=sponge(sim, gamma, 3, 0.3))
+                _assert_fused_adjoint(self, sim, gamma, rng, fused)
+
+    def test_a_pml_keeps_the_gradient_kernel_apart(self):
+        sim = _sim(DielectricWave, (37, 40), 1, boundary=Conductor)
+        lined = replace(sim, pml=Pml(4, 1.0 / math.sqrt(EPS1 * MU), frequency=1.0))
+        self.assertTrue(sim.fuses_adjoint)
+        self.assertFalse(lined.fuses_adjoint)
+        mat = lined.build_materials(cp.zeros(lined.Nx_padded, dtype=lined.dtype))
+        with self.assertRaises(ValueError):
+            lined.define_adjoint_gradient(None, mat, lined.gradient_fields(mat))
 
 
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")

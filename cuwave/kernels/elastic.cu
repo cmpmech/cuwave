@@ -5,6 +5,7 @@
 //   USE_PML
 //   TILE0, TILE1, TILE2 (no pml): the fused step's tile
 //   STEPS, TILE0, TILE1, ROWS (2D, no pml): the blocked step's
+//   GRADIENT (no STEPS): the step adds the gradient densities of u1 against v1
 
 #ifdef USE_PML
 // the slowest axis' blocks alternately from either end, so the slabs there run
@@ -87,6 +88,25 @@
 #endif
 #else
 #define PML_FOLD
+#endif
+
+// the adjoint pair's accumulators and the forward field v1 they pair u1 with
+#ifdef GRADIENT
+#if NDIM >= 2
+#define STIFFNESS_GRADIENT                                                     \
+  , real_t *__restrict__ g_normal, real_t *__restrict__ g_shear,               \
+      const real_t *__restrict__ v1
+#define SHEAR_ROWS , g_shear
+#else
+#define STIFFNESS_GRADIENT                                                     \
+  , real_t *__restrict__ g_normal, const real_t *__restrict__ v1
+#define SHEAR_ROWS
+#endif
+#define MASS_GRADIENT                                                          \
+  , real_t *__restrict__ g_mass, const real_t *__restrict__ v1, const real_t mf
+#else
+#define STIFFNESS_GRADIENT
+#define MASS_GRADIENT
 #endif
 
 // a node 2R inside every wall: full radius on every tap, no wall terms
@@ -331,6 +351,56 @@ nodal_force(const real_t *__restrict__ sigma, const int idx, const int cs,
 #endif
   return force;
 }
+
+#ifdef GRADIENT
+// ------------------------------------ gradient helpers
+// the normal bilinear form of two strain sets under the condensed coupling
+__device__ __forceinline__ real_t normal_form(const real_t *ea,
+                                              const real_t *eb,
+                                              const real_t lam,
+                                              const real_t mu,
+                                              const int zeroed) {
+  const real_t lam_eff = condensed_lame(lam, mu, zeroed);
+  real_t tra = (real_t)0, trb = (real_t)0, dot = (real_t)0;
+#pragma unroll
+  for (int d = 0; d < NDIM; ++d) {
+    tra += ea[d];
+    trb += eb[d];
+    dot += ea[d] * eb[d];
+  }
+  return 2.f * mu * dot + lam_eff * tra * trb;
+}
+
+// dJ/dgamma on the node and its shear points: the adjoint u1 against v1
+__device__ __forceinline__ void
+stiffness_density(const real_t *__restrict__ u1, const real_t *__restrict__ v1,
+                  real_t *__restrict__ g_normal,
+#if NDIM >= 2
+                  real_t *__restrict__ g_shear,
+#endif
+                  const int idx, const int cs, const int *A, const int *S,
+                  const int *NN, const real_t *F, const real_t lam,
+                  const real_t mu, const int clamped) {
+  real_t eu[NDIM], el[NDIM];
+  const int zeroed = normal_strains(v1, idx, cs, A, S, NN, F, clamped, eu);
+  normal_strains(u1, idx, cs, A, S, NN, F, clamped, el);
+  g_normal[idx] -= normal_form(el, eu, lam, mu, zeroed);
+
+#if NDIM >= 2
+#pragma unroll
+  for (int k = 0; k < NDIM - 1; ++k)
+#pragma unroll
+    for (int l = k + 1; l < NDIM; ++l) {
+      if (A[k] > NN[k] - 3 || A[l] > NN[l] - 3)
+        continue;
+      const int v = PAIR_ROW(k, l);
+      g_shear[(v - NDIM) * cs + idx] -=
+          mu * shear_strain(u1, idx, cs, k, l, A, S, NN, F) *
+          shear_strain(v1, idx, cs, k, l, A, S, NN, F);
+    }
+#endif
+}
+#endif
 
 // ------------------------------------- pml helpers
 // the axes a traction wall zeroes at a node: normal_strains' set bits alone
@@ -588,10 +658,15 @@ __global__ void
 stress_kernel(const real_t *__restrict__ u1, real_t *__restrict__ sigma,
               const real_t *__restrict__ gamma, const real_t lam,
               const real_t mu, const int clamped, const int cs,
-              AXIS_PARAMS PML_FOLD) {
+              AXIS_PARAMS STIFFNESS_GRADIENT PML_FOLD) {
   INTERIOR_OR_RETURN;
   AXIS_GEOM;
   AXIS_FACTORS;
+
+#ifdef GRADIENT
+  stiffness_density(u1, v1, g_normal SHEAR_ROWS, idx, cs, A, S, NN, F, lam, mu,
+                    clamped);
+#endif
 
   real_t sig[NVOIGT];
   if (deep_node(A, NN))
@@ -619,7 +694,7 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
 #ifdef USE_DAMPING
           const real_t *__restrict__ damping, const real_t dt,
 #endif
-          const int clamped, const int cs, AXIS_PARAMS PML_FOLD) {
+          const int clamped, const int cs, AXIS_PARAMS MASS_GRADIENT PML_FOLD) {
   INTERIOR_OR_RETURN;
   AXIS_GEOM;
   AXIS_FACTORS;
@@ -652,6 +727,10 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
       if (LO[e] + HI[e])
         next += mi * force_memory(sigma, u1, idx, cs, c, e, M[e], P[e], LO[e],
                                   HI[e], phase, A, S, NN, F, clamped);
+#endif
+#ifdef GRADIENT
+    // dJ/dmass by parts in time: v against the second difference of lambda
+    g_mass[n] -= mf * v1[n] * (next - 2.f * u1[n] + u0[n]);
 #endif
     u2[n] = next;
   }
@@ -690,7 +769,14 @@ __global__ void __launch_bounds__(THREADS)
 #if NDIM == 3
                  const real_t e2,
 #endif
-                 AXIS_PARAMS) {
+                 AXIS_PARAMS
+#ifdef GRADIENT
+                 ,
+                 real_t *__restrict__ g_mass, real_t *__restrict__ g_normal,
+                 real_t *__restrict__ g_shear, const real_t *__restrict__ v1,
+                 const real_t mf
+#endif
+    ) {
   extern __shared__ real_t ss[]; // NVOIGT * RING
 #if NDIM == 2
   const int b0 = blockIdx.y * TILE0 - STENCIL_RADIUS;
@@ -749,6 +835,10 @@ __global__ void __launch_bounds__(THREADS)
       threadIdx.x + STENCIL_RADIUS;
   const int T[3] = {WIDE * DEEP_, DEEP_, 1};
 #endif
+#ifdef GRADIENT
+  stiffness_density(u1, v1, g_normal, g_shear, idx, cs, A, S, NN, E, lam, mu,
+                    clamped);
+#endif
   const bool deep = deep_node(A, NN);
 #pragma unroll
   for (int c = 0; c < NDIM; ++c) {
@@ -763,10 +853,15 @@ __global__ void __launch_bounds__(THREADS)
              : point_minv(gamma, idx, c, A, S, NN, rho, clamped);
 #ifdef USE_DAMPING
     const real_t beta = 0.5f * mi * damping[idx] * dt;
-    u2[n] = (2.f * u1[n] - u0[n] * (1.f - beta) + mi * force) / (1.f + beta);
+    const real_t next =
+        (2.f * u1[n] - u0[n] * (1.f - beta) + mi * force) / (1.f + beta);
 #else
-    u2[n] = -u0[n] + 2.f * u1[n] + mi * force;
+    const real_t next = -u0[n] + 2.f * u1[n] + mi * force;
 #endif
+#ifdef GRADIENT
+    g_mass[n] -= mf * v1[n] * (next - 2.f * u1[n] + u0[n]);
+#endif
+    u2[n] = next;
   }
 }
 #endif

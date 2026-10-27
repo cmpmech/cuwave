@@ -90,6 +90,7 @@ def fd_step(u0, u1, u2):
 | `define_gradient`    | `sensitivity.py` | `gradient_kernel`   | `gradient_step(g_mass, g_stiff, u0, u1, u2, l1)` |
 | `sim.define_adjoint_step` | `scalar.py` | `adjoint_kernel` | `adjoint_step(l0, l1, l2)` |
 | `define_adjoint_gradient` | `scalar.py` | `adjoint_gradient_kernel` | `adjoint_gradient_step(l0, l1, u1)` |
+| `define_adjoint_gradient` | `elastic.py`, `maxwell.py` | the step pair, or `fused_kernel`, under `-DGRADIENT` | `adjoint_gradient_step(l0, l1, u1)` |
 | `define_adjoint_excitation` | `wave.py` | `adjoint_excitation_kernel` | `adjoint_excitation_step(l2, signal, u1, t_index)` |
 | `define_superposed` | `scalar.py` | `superposed_kernel` | `superposed_step(u0, u1, u2, mass=True)` |
 

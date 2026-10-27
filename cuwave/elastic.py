@@ -98,6 +98,7 @@ class ElasticWave(Simulation):
     accepts_pml = True
     pml_shifted = True
     pml_walls = (Clamped,)  # a traction wall behind the layer holds a growing surface wave
+    fuses_adjoint = True  # the adjoint pair accumulates both gradients
 
     @property
     def ncomp(self) -> int:
@@ -220,19 +221,7 @@ class ElasticWave(Simulation):
 
     def _define_pair(self, kernels: cp.RawModule, mat: dict, adjoint: bool) -> Callable:
         """The stress and update launches, a pml folded into both; fused past L2 without one."""
-        # one launch where DRAM bounds the pair and the ring at most doubles the stresses
-        device = cp.cuda.Device().attributes
-        nodes = math.prod(map(int, self.Nx))  # a caller may pass numpy int32
-        fields = (3 * self.ndim + self.nvoigt + 1) * nodes * self.dtype().itemsize
-        tile = FUSED_TILE[self.ndim - 2] if self.ndim >= 2 else ()
-        ring = math.prod(t + self.space_order for t in tile)
-        if (
-            self.ndim >= 2
-            and self.pml is None
-            and fields > device["L2CacheSize"]
-            and ring <= 2 * math.prod(tile)
-            and self._fused_shared() <= device["MaxSharedMemoryPerBlockOptin"]
-        ):
+        if self._fuses_pair():
             return self._define_fused(mat)
 
         # the pair, a pml folded into both
@@ -258,10 +247,37 @@ class ElasticWave(Simulation):
         fd_step.memory = memory
         return fd_step
 
+    def _fuses_pair(self) -> bool:
+        """Whether one launch steps the pair: DRAM bounds it and the ring at most doubles the stresses."""
+        device = cp.cuda.Device().attributes
+        nodes = math.prod(map(int, self.Nx))  # a caller may pass numpy int32
+        fields = (3 * self.ndim + self.nvoigt + 1) * nodes * self.dtype().itemsize
+        tile = FUSED_TILE[self.ndim - 2] if self.ndim >= 2 else ()
+        ring = math.prod(t + self.space_order for t in tile)
+        return (
+            self.ndim >= 2
+            and self.pml is None
+            and fields > device["L2CacheSize"]
+            and ring <= 2 * math.prod(tile)
+            and self._fused_shared() <= device["MaxSharedMemoryPerBlockOptin"]
+        )
+
     def _define_fused(self, mat: dict) -> Callable:
         """The step as one launch, each block's stresses in shared memory, ring included."""
+        args, launch = self._fused_launch(mat, ())
+
+        def fd_step(u0, u1, u2):
+            args[0], args[1], args[2] = u0, u1, u2
+            launch()
+            return u2
+
+        fd_step.memory = []
+        return fd_step
+
+    def _fused_launch(self, mat: dict, flags: tuple[str, ...]) -> tuple[list, Callable]:
+        """The fused step's argument list, compiled with `flags` too, and a launch over it."""
         tile = FUSED_TILE[self.ndim - 2]
-        flags = tuple(f"-DTILE{d}={t}" for d, t in enumerate(tile))
+        flags += tuple(f"-DTILE{d}={t}" for d, t in enumerate(tile))
         kernel = compile_kernels(self, flags=flags).get_function("fused_kernel")
         grid = tuple(-(-n // t) for n, t in zip(self.Nx_padded, tile))[::-1]
         shared = self._fused_shared()
@@ -272,13 +288,61 @@ class ElasticWave(Simulation):
         args += [self.dtype(1.0 / d) for d in self.dx]
         args += axis_geometry(self, self.step_factors())
 
-        def fd_step(u0, u1, u2):
-            args[0], args[1], args[2] = u0, u1, u2
+        def launch():
             kernel(grid, tile[::-1], args, shared_mem=shared)
-            return u2
 
-        fd_step.memory = []
-        return fd_step
+        return args, launch
+
+    def define_adjoint_gradient(
+        self, kernels: cp.RawModule, mat: dict, grads: dict
+    ) -> Callable:
+        """Closure stepping the adjoint `l0` over `l1` in place, adding both gradients of `l1` against `u1`.
+
+        The step kernels under `-DGRADIENT`, the inertia term summed by parts in time as
+        `PressureWave` sums it; `kernels` goes unused.
+        """
+        mf = self.dtype(self.adjoint_mass_factor())
+        if self._fuses_pair():
+            args, launch = self._fused_launch(mat, ("-DGRADIENT",))
+            args += [*self._density_args(grads), None, mf]
+            at = len(args) - 2
+
+            def fused_gradient_step(l0, l1, u1):
+                args[0], args[1], args[2], args[at] = l0, l1, l0, u1
+                launch()
+                return l0
+
+            fused_gradient_step.memory = []
+            return fused_gradient_step
+
+        # the pair, a pml folded into both
+        gradient_kernels = compile_kernels(self, flags=("-DGRADIENT",))
+        stress_kernel = gradient_kernels.get_function("stress_kernel")
+        fd_kernel = gradient_kernels.get_function("fd_kernel")
+        grid, block = grid_block(self)
+
+        # the accumulators and the forward field, ahead of the pml arguments
+        _, sargs, uargs = self.step_args(mat)
+        sargs += [*self._density_args(grads)[1:], None]
+        uargs += [grads["mass"], None, mf]
+        at = len(sargs) - 1, len(uargs) - 2
+        memory = []
+        if self.pml is not None:
+            fold, memory = self._pml_fold(True)
+            sargs += fold
+            uargs += fold
+
+        def adjoint_gradient_step(l0, l1, u1):
+            sargs[0], sargs[at[0]] = l1, u1
+            stress_kernel(grid, block, sargs)
+            uargs[0], uargs[1], uargs[2], uargs[at[1]] = l0, l1, l0, u1
+            fd_kernel(grid, block, uargs)
+            if self.pml is not None:  # the strain memory swaps its two row blocks
+                sargs[-1] = uargs[-1] = np.int32(3 - sargs[-1])
+            return l0
+
+        adjoint_gradient_step.memory = memory
+        return adjoint_gradient_step
 
     def define_blocked_step(
         self, mat: dict, source: Source, sensors: cpt.NDArray[cp.int32] | None

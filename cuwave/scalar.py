@@ -735,6 +735,7 @@ class PressureWave(Simulation):
 
     gradient_names = ("mass", "stiff")  # the fields the adjoint differentiates
     fuses_adjoint = True  # one kernel steps the adjoint and accumulates both gradients
+    fuses_superposition = True  # one kernel steps the field and adds both integrands
 
     def gradient_fields(self, mat: dict) -> dict[str, cpt.NDArray]:
         """Zeroed accumulators the adjoint kernels add into, one per material field."""

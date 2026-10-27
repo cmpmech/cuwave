@@ -1,6 +1,6 @@
 # CUDA maxwell
 
-The forward kernels of the vector curl-curl [maxwell](maxwell.md) equation: one pass forming the curl on its staggered pair points, one pass gathering the transposed curl into the update. The 2D reductions run on [cuda_scalar](cuda_scalar.md) instead and reach none of this
+The forward kernels of the vector curl-curl [maxwell](maxwell.md) equation: one pass forming the curl on its staggered pair points, one pass gathering the transposed curl into the update. Compiled with `GRADIENT`, the same passes step the adjoint and add its gradient densities on the way. The 2D reductions run on [cuda_scalar](cuda_scalar.md) instead and reach none of this
 
 ## compilation logic
 
@@ -11,6 +11,7 @@ The forward kernels of the vector curl-curl [maxwell](maxwell.md) equation: one 
 | `USE_MAGNETIC` | `magnetic` | the pair coefficient arrives as a field rather than a scalar |
 | `TILE0`, `TILE1`, `TILE2` | `FUSED_TILE`, by `MaxwellWave._define_pair` past L2 without a pml, where the ring at most doubles the tile | compiles `fused_kernel`: the tile a block updates |
 | `STEPS`, `TILE0`, `TILE1`, `ROWS` | `BLOCKED` or `LARGE_BLOCKED`, by `MaxwellWave.define_blocked_step` in 2D without a pml or `magnetic`, on a small grid or past it (order 4 only past `LARGE_L2` times L2, on a GPU of `PAST_SMS` multiprocessors) | compiles `blocked_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
+| `GRADIENT` | `MaxwellWave.define_adjoint_gradient`, without a pml | `fd_kernel` and `fused_kernel` add the inertia density of the adjoint `u1` against the forward `v1`, and with `USE_MAGNETIC` `curl_kernel` and `fused_kernel` the permeability density, their accumulators appended to the arguments (`MASS_GRADIENT`, `CURL_GRADIENT`) |
 
 `real_t`, `STENCIL_RADIUS`, `SG_W`, `NPAIRS`, `PAIR_ROW`, `rad_half` and the transfer kernels all come from the prelude; see [cuda_elastic](cuda_elastic.md), which documents them
 
@@ -65,21 +66,23 @@ the force `fd_kernel` forms on component `c`, the curl rows of the pairs it belo
 **parallelization**
 one thread per grid point, writing every pair point it carries
 **input args**
-`u1`: the field at $t-1$; `nu_pair`: `NPAIRS` fields of $w_p\nu_p$, the harmonic pair means, with `USE_MAGNETIC` only; `nu`: the scalar $1/\mu$, used when the permeability is uniform; `cs`: component stride; `f0..f2`: $1/\Delta x_d$; `N0..N2`, `s0, s1`: geometry
+`u1`: the field at $t-1$; `nu_pair`: `NPAIRS` fields of $w_p\nu_p$, the harmonic pair means, with `USE_MAGNETIC` only; `nu`: the scalar $1/\mu$, used when the permeability is uniform; `cs`: component stride; `f0..f2`: $1/\Delta x_d$; `N0..N2`, `s0, s1`: geometry; with `GRADIENT` and `USE_MAGNETIC`, `v1`: the forward field `u1` pairs with
 **output args**
-`h`: `NPAIRS` fields of $w_p\nu b_p$, assigned rather than accumulated; a pair point neither axis carries an unknown for is skipped and keeps the zero the scratch was allocated with, which the gather relies on
+`h`: `NPAIRS` fields of $w_p\nu b_p$, assigned rather than accumulated; a pair point neither axis carries an unknown for is skipped and keeps the zero the scratch was allocated with, which the gather relies on; with `GRADIENT` and `USE_MAGNETIC`, `g_nu`: the permeability density, accumulated with `-=`
 **how?**
 - one multiply on the curl of each pair point
 $$h_p=w_p\,\nu\,b_p$$
+- under `GRADIENT` with `USE_MAGNETIC`, the adjoint curl already formed against the forward one, as `gradient_kernel` pairs them
+$$g_{\nu,p}\mathrel{-}=b_p\left(\lambda\right)b_p\left(u\right)$$
 - the guard `A[k] > NN[k] - 3 || A[l] > NN[l] - 3` is the pair-point existence test, one staggered ghost per axis of the pair
 
 ### fd_kernel
 **parallelization**
 one thread per grid point, updating every component whose unknown it carries
 **input args**
-`u0`, `u1`: the fields at $t-2$ and $t-1$; `h`: the weighted curl `curl_kernel` just wrote; `minv`: `NDIM` fields of $1/\left(W_c\bar{\varepsilon}_c\right)$, one per component at its own points, the volume deliberately left out since the force below leaves it out too; `damping`: nodal $\sigma$, with `USE_DAMPING` only; `dt`: $\Delta t$, with `USE_DAMPING` only; `cs`: as above; `f0..f2`: $\Delta t^2/\Delta x_d$
+`u0`, `u1`: the fields at $t-2$ and $t-1$; `h`: the weighted curl `curl_kernel` just wrote; `minv`: `NDIM` fields of $1/\left(W_c\bar{\varepsilon}_c\right)$, one per component at its own points, the volume deliberately left out since the force below leaves it out too; `damping`: nodal $\sigma$, with `USE_DAMPING` only; `dt`: $\Delta t$, with `USE_DAMPING` only; `cs`: as above; `f0..f2`: $\Delta t^2/\Delta x_d$; under `GRADIENT`, `v1`: the forward field `u1` pairs with, and `mf`: $1/\Delta t^2$
 **output args**
-`u2`: the field at $t$, same layout as `u1`
+`u2`: the field at $t$, same layout as `u1`, which the adjoint passes as `u0` again; under `GRADIENT`, `g_mass`: the inertia density, accumulated with `-=`
 **internal args**
 `sgn`: $+1$ where the partner axis is below `c` and $-1$ above it; `ap, am`: the pair point of the plus and minus tap; `rp, rm`: that point's own graded radius, which decides whether the tap exists
 **how?**
@@ -87,13 +90,16 @@ one thread per grid point, updating every component whose unknown it carries
 $$f_c=\sum_{m\ne c}\pm\frac{1}{\Delta x_m}\sum_jc_j^{\left(r\left(a\right)\right)}\left(h_{cm}^{i+j-1}-h_{cm}^{i-j}\right)$$
 - every tap carries the coefficient of the **pair point it reads**, evaluated by `rad_half` at that point rather than at the thread's own, which is exactly what makes the two launches an exact transpose pair
 - the march is the three-term recursion of [cuda_scalar](cuda_scalar.md), component by component, `USE_DAMPING` dividing by $1+\beta$ with one conductivity field serving every component
+- under `GRADIENT`, the inertia density summed by parts in time, formed before the store so the `u0` it reads is not yet overwritten
+$$g_{m,c}\mathrel{-}=\frac{1}{\Delta t^2}v_c\left(u_c^t-2u_c^{t-1}+u_c^{t-2}\right)$$
+- a pml's own launches amend `u2` after this kernel, which the sum by parts would miss, so `GRADIENT` is never compiled with one
 
 ### fused_kernel
 `curl_kernel` and `fd_kernel` as one launch, bitwise the pair
 **parallelization**
 one block per tile of `FUSED_TILE` points, a thread per point; the block first forms the curl of its tile and a ring $R$ wide, the ring's points strided over the threads, then each thread updates its own point
 **input args**
-`u0, u1, u2`: as `fd_kernel`; `nu_pair` with `USE_MAGNETIC`, `nu`: as `curl_kernel`; `minv`, `damping, dt` with `USE_DAMPING`: as `fd_kernel`; `cs`: component stride; `e0..e2`: $1/\Delta x_d$, the curl's factors; `f0..f2`, `N0..N2`, `s0, s1`: as `fd_kernel`
+`u0, u1, u2`: as `fd_kernel`; `nu_pair` with `USE_MAGNETIC`, `nu`: as `curl_kernel`; `minv`, `damping, dt` with `USE_DAMPING`: as `fd_kernel`; `cs`: component stride; `e0..e2`: $1/\Delta x_d$, the curl's factors; `f0..f2`, `N0..N2`, `s0, s1`: as `fd_kernel`; under `GRADIENT`, after the geometry, `g_mass`, `v1`, `mf`: as `fd_kernel`, then `g_nu` with `USE_MAGNETIC`, the curls of both fields at the block's own pair points read off global memory with `e0..e2`
 **internal args**
 `sh`: `NPAIRS` planes of the weighted curl over the tile and its ring, zero where `curl_kernel` writes nothing
 **how?**
