@@ -497,7 +497,9 @@ class VectorMaxwellTest(unittest.TestCase):
             _vector((40, 40), pml=Pml(6, 1.0))
 
 
-def _blocked_runs(order, Nx, N, boundary, damped=False, blocks=None):
+def _blocked_runs(
+    order, Nx, N, boundary, damped=False, blocks=None, waves=(1000, 1000)
+):
     """The (field, record) of a 2D float32 run forced blocked, then of the plain pair."""
     dx = tuple(1.0 / (n - 3) for n in Nx)
     dt = 0.9 * stable_dt(dx, 1.0, order)
@@ -525,7 +527,7 @@ def _blocked_runs(order, Nx, N, boundary, damped=False, blocks=None):
     sensors = near + [[0, 1, 1], [1, n[0] - 2, n[1] - 2], [0, n[0] - 3, n[1] - 2]]
     sensors = cp.array(np.array(sensors).T, dtype=cp.int32)
     source = Source(position, signal)
-    patches = {"BLOCKED_WAVES": (1000, 1000)}
+    patches = {"BLOCKED_WAVES": waves}
     patches |= {"BLOCKED": blocks} if blocks is not None else {}
     with mock.patch.multiple(maxwell, **patches):
         mat = sim.build_materials(indicator)
@@ -551,6 +553,18 @@ class BlockedTest(unittest.TestCase):
                     with self.subTest(order=order, b=boundary, damped=damped):
                         runs = _blocked_runs(order, (150, 127), 41, boundary, damped)
                         self._assert_bitwise(*runs)
+
+    def test_the_large_tier_is_the_plain_pair_bit_for_bit(self):
+        mixed = ((Conductor, Magnetic), (Magnetic, Conductor))
+        for boundary in (Conductor, Magnetic, mixed):
+            for damped in (False, True):
+                with self.subTest(b=boundary, damped=damped):
+                    # no small tier, and the large one inside L2 on any GPU
+                    with mock.patch.object(maxwell, "LARGE_SMS", 0):
+                        runs = _blocked_runs(
+                            2, (150, 127), 41, boundary, damped, waves=(0, 0)
+                        )
+                    self._assert_bitwise(*runs)
 
     def test_every_tile_and_step_count(self):
         blocks = (

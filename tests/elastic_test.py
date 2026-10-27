@@ -23,6 +23,7 @@ Held to both, a long run through a heterogeneous model with a free surface cross
 layer has to decay rather than grow.
 """
 
+import itertools
 import unittest
 from dataclasses import replace
 from unittest import mock
@@ -495,8 +496,8 @@ class FusedTest(unittest.TestCase):
                 self.assertTrue(bool(cp.array_equal(a, b)))
 
 
-def _blocked_runs(sim, seed, blocks=None):
-    """The (field, record) of a run blocked as `blocks` patch, then of the pair's run."""
+def _blocked_runs(sim, seed, blocks=None, waves=(99, 99)):
+    """The (field, record) of a run blocked as `blocks` and `waves` patch, then of the pair's run."""
     rng = np.random.default_rng(seed)
     gamma = cp.asarray(0.25 + 0.5 * rng.random(sim.Nx_padded), dtype=sim.dtype)
     coords = [[0.3, 0.4], [0.05, 0.9], [0.9, 0.06]]
@@ -507,7 +508,7 @@ def _blocked_runs(sim, seed, blocks=None):
     rows += [[1, 22, 23]]
     sensors = cp.array(np.array(rows).T, dtype=cp.int32)
     candidates = elastic.BLOCKED if blocks is None else blocks
-    with mock.patch.multiple(elastic, BLOCKED=candidates, BLOCKED_WAVES=(99, 99)):
+    with mock.patch.multiple(elastic, BLOCKED=candidates, BLOCKED_WAVES=waves):
         mat = sim.build_materials(gamma)
         assert sim.define_blocked_step(mat, source, sensors) is not None
         blocked = simulate(sim, source, gamma, sensors=sensors)
@@ -535,6 +536,18 @@ class BlockedTest(unittest.TestCase):
                                 rho = cp.ones(sim.Nx_padded, dtype=sim.dtype)
                                 sim = replace(sim, damping=sponge(sim, rho, 9, 0.3))
                             self._assert_bitwise(*_blocked_runs(sim, order))
+
+    def test_the_large_tier_is_the_pair_bit_for_bit(self):
+        mixed = ((Traction, Clamped), (Clamped, Traction))
+        for boundary, damped in itertools.product((None, mixed), (False, True)):
+            with self.subTest(b=boundary, damped=damped):
+                sim = _sim((70, 57), 40, "float32", 2, boundary=boundary)
+                if damped:
+                    rho = cp.ones(sim.Nx_padded, dtype=sim.dtype)
+                    sim = replace(sim, damping=sponge(sim, rho, 9, 0.3))
+                # no small tier, and the large one inside L2 on any GPU
+                with mock.patch.object(elastic, "LARGE_SMS", 0):
+                    self._assert_bitwise(*_blocked_runs(sim, 2, waves=(0, 0)))
 
     def test_every_tile_and_step_count(self):
         blocks = (
