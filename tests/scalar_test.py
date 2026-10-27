@@ -516,7 +516,8 @@ def _folded_runs(sim, seed):
     sensors = cp.asarray(np.stack(rows).T, dtype=cp.int32)
     indicator = _random(sim, seed)[0]
     runs = []
-    with mock.patch.object(type(sim), "define_blocked_step", lambda *a, **k: None):
+    blocked = mock.patch.object(type(sim), "define_blocked_step", lambda *a, **k: None)
+    with blocked, mock.patch.object(scalar, "FOLD_SMS", 0):
         mat = sim.build_materials(indicator)
         assert sim.define_folded_step(compile_kernels(sim), mat, source) is not None
         runs.append(simulate(sim, source, indicator, sensors=sensors))
@@ -539,7 +540,7 @@ class FoldedStepTest(unittest.TestCase):
                 sim = ScalarWave(
                     Nx,
                     dx,
-                    23,
+                    53,  # past two graphed chunks, so the windows are staged
                     0.5 * stable_dt(dx, 1.0, 2),
                     threads[ndim],
                     precision=precision,
@@ -566,6 +567,8 @@ class FoldedStepTest(unittest.TestCase):
         )
         kept = {
             "a source on a mirror": (sim, [[2], [20]]),
+            "a source on a face ghost": (sim, [[0], [20]]),
+            "a source on an edge ghost": (cube, [[0], [0], [17]]),
             "two sources on a node": (cube, [[5, 5], [6, 6], [7, 7]]),
             "a pml": (replace(sim, pml=Pml(4, 1.0)), [[9], [20]]),
             "a domain": (replace(sim, domain=_random(sim, 1)[0] > 0.5), [[9], [20]]),
@@ -578,7 +581,8 @@ class FoldedStepTest(unittest.TestCase):
                 position = cp.asarray(points, dtype=cp.int32)
                 source = Source(position, cp.zeros((1, position.shape[1]), each.dtype))
                 mat = each.build_materials(_random(each, 1)[0])
-                with mock.patch.object(type(each), "streams", name == "streaming"):
+                streams = mock.patch.object(type(each), "streams", name == "streaming")
+                with streams, mock.patch.object(scalar, "FOLD_SMS", 0):
                     kernels = compile_kernels(each)
                     self.assertIsNone(each.define_folded_step(kernels, mat, source))
 

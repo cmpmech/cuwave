@@ -283,7 +283,7 @@ class ElasticWave(Simulation):
     def define_blocked_step(
         self, mat: dict, source: Source, sensors: cpt.NDArray[cp.int32] | None
     ) -> Blocked | None:
-        """The 2D step advancing several steps a launch on a small grid, excitation and record included, else None.
+        """The 2D step advancing several steps a launch, excitation and record included, else None.
 
         Each thread block loads a tile of both components with a halo of as many strain
         and divergence reaches as it takes steps, forms the stresses and steps the tile

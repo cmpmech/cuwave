@@ -54,6 +54,7 @@ SMALL_BLOCKS = (
 )
 LARGE_BLOCKS = (((64, 64), 16, 6), ((64, 64), 16, 4))  # by radius, fields past L2
 LARGE_SMS = (0, 64)  # by radius, the multiprocessors from which the large tier pays
+FOLD_SMS = 64  # the multiprocessors from which the folded step beats its launches
 MIDDLE_WAVES = (9, 0)  # by radius, the waves of threads below which it pays in L2 too
 LARGE_L2 = 1.4  # the multiple of L2 past which DRAM bounds the plain step
 SMALL_WAVES = (2, 1.25)  # by radius, the waves of resident threads launches bound
@@ -159,11 +160,13 @@ class PressureWave(Simulation):
     def _refills_in_step(self) -> bool:
         """Whether the plain step writes the face ghosts: no mask, stream or pml, order 4 at most, Neumann and Dirichlet faces."""
         conditions = {c for pair in self.boundary for c in pair}
+        sms = cp.cuda.Device().attributes["MultiProcessorCount"]
         return (
             not (self.masked or self.streams or self.pml is not None)
             and conditions <= {Neumann, Dirichlet}
             and min(self.Nx) >= 4  # a mirror two nodes in is interior
             and self.space_order <= 4  # a wider kernel loses more than the launch
+            and sms >= FOLD_SMS
         )
 
     @property
@@ -185,12 +188,18 @@ class PressureWave(Simulation):
     ) -> Callable | None:
         """The step, the excitation of `source` and the ghost refill, `step(u0, u1, u2, signal, t)`: one launch in 3D, two below, else None.
 
+        A source off the interior keeps the launches apart: the refill overwrites one on a
+        face ghost, and an edge or corner ghost, which no thread steps, keeps its own.
         Below 3D the step writes the ghosts before the excitation lands, so a source on
         a mirror keeps the refill. In 3D each thread block adds the sources it holds, so
         two on one node, which the excitation adds atomically in no fixed order, keep
         the launches apart.
         """
         if not self._refills_in_step:
+            return None
+        points = source.position.get()
+        upper = np.asarray(self.Nx)[:, None] - 2
+        if ((points < 1) | (points > upper)).any():
             return None
         if self.ndim == 3:
             flat = flatten_indices(self, source.position)
@@ -199,8 +208,7 @@ class PressureWave(Simulation):
             return self._define_folded(kernels, mat, source.position)
 
         # below 3D the step writes the ghosts, then the excitation launches
-        points = source.position.get()
-        mirrors = (points == 2) | (points == np.asarray(self.Nx)[:, None] - 3)
+        mirrors = (points == 2) | (points == upper - 1)
         if mirrors.any():
             return None
         fd_step = self.define_step(kernels, mat)
