@@ -10,7 +10,7 @@ The forward kernels of the vector curl-curl [maxwell](maxwell.md) equation: one 
 | `USE_DAMPING` | `damping is not None` | adds the damped update and its two extra arguments |
 | `USE_MAGNETIC` | `magnetic` | the pair coefficient arrives as a field rather than a scalar |
 | `TILE0`, `TILE1`, `TILE2` | `FUSED_TILE`, by `MaxwellWave._define_pair` past L2 without a pml, where the ring at most doubles the tile | compiles `fused_kernel`: the tile a block updates |
-| `STEPS`, `TILE0`, `TILE1`, `ROWS` | `BLOCKED` or `LARGE_BLOCKED`, by `MaxwellWave.define_blocked_step` in 2D without a pml or `magnetic`, on a small grid or past it at order 2 | compiles `blocked_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
+| `STEPS`, `TILE0`, `TILE1`, `ROWS` | `BLOCKED` or `LARGE_BLOCKED`, by `MaxwellWave.define_blocked_step` in 2D without a pml or `magnetic`, on a small grid or past it (order 4 only past `LARGE_L2` times L2) | compiles `blocked_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
 
 `real_t`, `STENCIL_RADIUS`, `SG_W`, `NPAIRS`, `PAIR_ROW`, `rad_half` and the transfer kernels all come from the prelude; see [cuda_elastic](cuda_elastic.md), which documents them
 

@@ -26,6 +26,7 @@ the pair becomes one launch (`_define_fused`) that recomputes the curl of a ring
 each tile, pinned to the pair bit for bit in 2D and 3D, a designed permeability included.
 """
 
+import itertools
 import math
 import unittest
 from dataclasses import replace
@@ -556,15 +557,15 @@ class BlockedTest(unittest.TestCase):
 
     def test_the_large_tier_is_the_plain_pair_bit_for_bit(self):
         mixed = ((Conductor, Magnetic), (Magnetic, Conductor))
-        for boundary in (Conductor, Magnetic, mixed):
-            for damped in (False, True):
-                with self.subTest(b=boundary, damped=damped):
-                    # no small tier, and the large one inside L2 on any GPU
-                    with mock.patch.object(maxwell, "LARGE_SMS", 0):
-                        runs = _blocked_runs(
-                            2, (150, 127), 41, boundary, damped, waves=(0, 0)
-                        )
-                    self._assert_bitwise(*runs)
+        cases = itertools.product((2, 4), (Conductor, Magnetic, mixed), (False, True))
+        for order, boundary, damped in cases:
+            with self.subTest(order=order, b=boundary, damped=damped):
+                # no small tier, and the large one inside L2 on any GPU
+                with mock.patch.object(maxwell, "LARGE_SMS", (0, 0)):
+                    runs = _blocked_runs(
+                        order, (150, 127), 41, boundary, damped, waves=(0, 0)
+                    )
+                self._assert_bitwise(*runs)
 
     def test_every_tile_and_step_count(self):
         blocks = (
