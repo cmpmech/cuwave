@@ -457,10 +457,10 @@ def sensitivity(
         adjoint_excitation = define_adjoint_excitation(sim, sensors, kernels, mat, grads)
 
         # reversed, so row m is the middle slot both gradients of lambda^(n + 1) read
+        # no refill: the step folds the ghosts onto their mirrors and reads none of lambda
         def backward(m, signal, history):
             p = adjoint_step(P[m % 2], P[1 - m % 2], history[m])  # lambda^n
             adjoint_excitation(p, signal, history[m], m)
-            bc_step(p)
 
         state = [P, *getattr(adjoint_step, "memory", [])]
         march(sim.N, backward, [Window(signal), Window(V[::-1])], state)

@@ -9,6 +9,8 @@ that transpose departs from the forward step only near the walls (the graded row
 halved wall cell and the ghost folded onto its mirror), so the high-order checks probe
 walls, corners and rows 2 .. 2R on a sharp material, and one adjoint step is pinned to the
 transpose of one forward step on its own, across dimensions, orders and face layouts.
+Folding the ghosts in, the fused step reads none of lambda's, which lets `sensitivity` step
+lambda without a refill: pinned bit for bit against ghosts filled with garbage.
 
 For the pressure classes `sensitivity` fuses both gradients into the adjoint step and
 sums the inertia term by parts in time, so it is pinned at round-off to the separate
@@ -59,6 +61,7 @@ match `sensitivity` at round-off, and `spectral_sensitivity` needs no damping at
 once the layer opens the domain.
 """
 
+import itertools
 import math
 import unittest
 from dataclasses import replace
@@ -692,6 +695,31 @@ class TransposeTest(unittest.TestCase):
         Wm = apply_cell_weights(sim, mask.copy()) / sim.inverse_inertia(indicator)
         scale = float(cp.sqrt(cp.sum(Wm * Ap**2) * cp.sum(Wm * u**2)))
         return abs(float(cp.sum(Wm * Ap * u) - cp.sum(Wm * p * Au))) / scale
+
+    def test_the_fused_adjoint_step_ignores_the_ghosts_of_lambda(self):
+        # so sensitivity() steps lambda without a refill; a zero tap may still read one
+        for ndim, order, faces, kind in itertools.product(
+            (1, 2, 3),
+            (2, 4, 8),
+            ("Neumann", "Dirichlet", "mixed"),
+            ("scalar", "acoustic"),
+        ):
+            sim = self._sim(ndim, order, faces, kind)
+            rng = np.random.default_rng(1)
+            indicator = cp.asarray(0.2 + rng.random(sim.Nx_padded), dtype=sim.dtype)
+            mat = sim.build_materials(indicator)
+            kernels = compile_kernels(sim, sim.sensitivity_path)
+            inner = tuple(slice(1, n - 1) for n in sim.Nx)
+            u1, l1 = (cp.asarray(rng.standard_normal(sim.Nx_padded)) for _ in "ul")
+            outputs = []
+            for scale in (0.0, 1e3):
+                poisoned = scale * (1 + cp.asarray(rng.random(sim.Nx_padded)))
+                poisoned[inner] = l1[inner]
+                l0, grads = cp.zeros_like(l1), sim.gradient_fields(mat)
+                sim.define_adjoint_gradient(kernels, mat, grads)(l0, poisoned, u1)
+                outputs.append([l0[inner], *grads.values()])
+            for a, b in zip(*outputs):
+                self.assertTrue(bool(cp.array_equal(a, b)), (ndim, order, faces, kind))
 
     def test_one_adjoint_step_is_the_transpose_of_one_forward_step(self):
         for ndim, orders in ((1, (2, 4)), (2, (2, 4, 8, 16)), (3, (2, 4))):
