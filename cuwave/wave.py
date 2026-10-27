@@ -474,6 +474,10 @@ class Simulation:
         """Whether `domain` or `dirichlet` takes nodes out of the stepped set."""
         return self.domain is not None or self.dirichlet is not None
 
+    def folds_refill(self, position: cpt.NDArray[cp.int32]) -> bool:
+        """Whether the step writes the ghosts itself, so `simulate` skips the refill: none here."""
+        return False
+
     kernel_path = None  # forward source this equation compiles, set by the subclass
     sensitivity_path = None  # and the adjoint one
     default_boundary = None  # what `boundary=None` means for this equation
@@ -1039,6 +1043,7 @@ def simulate(
     kernels = compile_kernels(sim)
     fd_step = sim.define_step(kernels, mat)
     bc_step = define_boundary(sim, kernels)
+    refill = not sim.folds_refill(source.position)  # else the step wrote the ghosts
     excitation_step = define_excitation(sim, source.position, kernels, mat)
     windows = [Window(source.signal)]
     if sensors is not None:
@@ -1051,7 +1056,8 @@ def simulate(
     def step(t, signal, um=None):
         u = fd_step(U[t % 2], U[1 - t % 2], U[t % 2])
         excitation_step(u, signal, t)
-        bc_step(u)
+        if refill:
+            bc_step(u)
         if um is not None:
             get_signal(u, um, t)
 

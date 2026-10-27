@@ -4,6 +4,7 @@
 //   USE_DAMPING
 //   USE_DOMAIN
 //   USE_STREAM, STREAM_TX
+//   FOLD_REFILL, NEUMANN_FACES, DIRICHLET_FACES
 //   STEPS, TILE0, TILE1, ROWS (2D)
 //   STEPS, TILE1, PLANES (2D marched)
 //   STEPS, TILE1, TILE2, PLANES, INTERIOR (3D, order 2)
@@ -183,6 +184,22 @@ __device__ __forceinline__ bool bc_ghost(int t, const int faces, const int *n,
   return false;
 }
 
+// ------------------------------------ refill helpers
+#ifdef FOLD_REFILL
+// the ghosts of the refilled faces two nodes out along axis d take v, as the
+// refill kernels give them, negated on a Dirichlet face
+__device__ __forceinline__ void mirror_ghosts(real_t *__restrict__ u,
+                                              const int idx, const real_t v,
+                                              const int d, const int a,
+                                              const int N, const int s) {
+  constexpr int refilled = NEUMANN_FACES | DIRICHLET_FACES;
+  if ((refilled >> (2 * d)) & 1 && a == 2)
+    u[idx - 2 * s] = (DIRICHLET_FACES >> (2 * d)) & 1 ? -v : v;
+  if ((refilled >> (2 * d + 1)) & 1 && a == N - 3)
+    u[idx + 2 * s] = (DIRICHLET_FACES >> (2 * d + 1)) & 1 ? -v : v;
+}
+#endif
+
 // -------------------------------------- kernels
 extern "C" {
 
@@ -355,9 +372,24 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
   const real_t mi = derive_inertia ? 1.f / sc : minv[idx];
 #ifdef USE_DAMPING
   const real_t beta = 0.5f * mi * damping[idx] * dt;
-  u2[idx] = (2.f * uc - u0[idx] * (1.f - beta) + mi * laplacian) / (1.f + beta);
+  const real_t v =
+      (2.f * uc - u0[idx] * (1.f - beta) + mi * laplacian) / (1.f + beta);
 #else
-  u2[idx] = -u0[idx] + 2.f * uc + mi * laplacian;
+  const real_t v = -u0[idx] + 2.f * uc + mi * laplacian;
+#endif
+  u2[idx] = v;
+#ifdef FOLD_REFILL
+  // the boundary refill folded in: each face ghost written by its mirror
+#if NDIM == 1
+  mirror_ghosts(u2, idx, v, 0, a0, N0, 1);
+#elif NDIM == 2
+  mirror_ghosts(u2, idx, v, 0, a0, N0, s0);
+  mirror_ghosts(u2, idx, v, 1, a1, N1, 1);
+#elif NDIM == 3
+  mirror_ghosts(u2, idx, v, 0, a0, N0, s0);
+  mirror_ghosts(u2, idx, v, 1, a1, N1, s1);
+  mirror_ghosts(u2, idx, v, 2, a2, N2, 1);
+#endif
 #endif
 }
 #endif

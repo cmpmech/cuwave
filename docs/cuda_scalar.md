@@ -10,6 +10,7 @@
 | `-DUSE_DAMPING`               | `sim.compile_flags`, once `Simulation.damping` is set | compiles the damping term and its two extra kernel parameters |
 | `-DUSE_DOMAIN`                | `sim.compile_flags`, once `Simulation.domain` is set  | launches `fd_kernel` over a tile list and grades the cells at the domain wall, two extra kernel parameters |
 | `-DUSE_STREAM`, `-DSTREAM_TX` | `sim.compile_flags`, where `PressureWave.streams` (a wide unmasked 2D stencil on a full grid) | compiles the streaming `fd_kernel` below instead of the per-thread one, its tile `STREAM_TX = threads[-1]` wide |
+| `-DFOLD_REFILL`, `-DNEUMANN_FACES`, `-DDIRICHLET_FACES` | `sim.compile_flags`, unmasked, unstreamed, without a pml, every face Neumann or Dirichlet and every axis at least 4 nodes | the per-thread `fd_kernel` writes the face ghosts from their mirrors itself (`mirror_ghosts`), the two face masks as bit $2d+\textrm{side}$ |
 | `-DSTEPS`, `-DTILE0`, `-DTILE1`, `-DROWS` | `PressureWave.define_blocked_step` in 2D, from `SMALL_BLOCKS` or `LARGE_BLOCKS` | compiles `blocked_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
 | `-DSTEPS`, `-DTILE1`, `-DPLANES`, `-DINTERIOR` | `PressureWave._define_marched_rows` in 2D past L2, from `MARCHED_ROWS` | compiles the 2D marched `blocked_kernel`: the steps a launch advances, the columns of a run, the rows a block marches, and under `-DINTERIOR` the variant without the walls, the sources and the sensors |
 | `-DSTEPS`, `-DTILE1`, `-DTILE2`, `-DPLANES`, `-DINTERIOR` | `PressureWave.define_blocked_step` in 3D, from `MARCHED_BLOCK` | compiles the 3D `blocked_kernel` (order 2): the steps a launch advances, the tile in the plane, the planes a block marches, and under `-DINTERIOR` the variant without the walls, the sources and the sensors |
@@ -89,6 +90,15 @@ map a flat thread id `t` to the ghost node it owns and to the direction pointing
 `t`: flat thread index; `faces`: bitmask with bit $2d+\textrm{side}$ set when face (axis $d$, side) belongs to this launch, side 0 low and 1 high; `n`, `s`: from `BC_GEOM`
 **output args**
 `ghost`: flat index of the ghost node (by reference); `normal`: signed stride pointing inward, $+s_d$ on the low side and $-s_d$ on the high side (by reference); the return value is `false` for threads past the last node of the launch
+### mirror_ghosts
+**aim**
+the boundary refill folded into the per-thread `fd_kernel`: the node two in from a refilled face writes that face's ghost, as `homogeneous_neumann_kernel` and `homogeneous_dirichlet_kernel` would after the step
+**input args**
+`u`: the field just stepped; `idx`: the node; `v`: its new value; `d`: the axis; `a`: the node's index along it; `N`: the axis' extent, ghosts included; `s`: its stride
+**how?**
+- a face ghost has one mirror, two nodes in, and every interior node's other indices are interior, so the ghost it writes is a face ghost, never an edge or a corner, which the refill leaves alone too
+- `simulate` then skips the refill launch, except where a source sits on a mirror: the excitation lands after the step, and the refill carries it into the ghost. Every other caller refills after the step, which writes the same values again
+
 ## pml helpers
 The slab geometry and the memory accessors live in `kernels/common.cuh`, shared by every equation's pml kernels, and are documented here once. A lined axis $d$ keeps its memory only on its slab: the `lo` rows behind the low face and the `hi` rows behind the high one, each row a full padded plane of the other axes
 ### PML_PARAMS, PML_GEOM
@@ -139,6 +149,7 @@ $$u^{n+1}\approx\frac{1}{1+\beta}\left(2 u^{n} - u^{n-1}(1-\beta) + \frac{1}{m}\
 - without `-DUSE_DAMPING` the $\beta$ branch is not compiled at all and the update is
 $$u^{n+1}=-u^{n-1}+2u^n+m^{-1}\nabla\cdot(k\nabla u^n)$$
 - under `-DUSE_DOMAIN` the grid is a 1D launch over `tiles`, and only a tile with bit 30 reads `cells`: a branch uniform per block, so a tile wholly inside runs the plain stencil and pays nothing. There a node outside returns before writing, which leaves it at the zero it started at, and a node near the wall replaces the plain laplacian with `wall_laplacian`
+- under `-DFOLD_REFILL` the node then writes the face ghosts it mirrors (`mirror_ghosts`)
 ### fd_kernel (streaming)
 Same aim, operator and update as `fd_kernel`, compiled in its place under `-DUSE_STREAM`: the taps are taken in the same order, so the two agree bit for bit at order 2 and to the last bit of a contracted fma above it
 **parallelization**

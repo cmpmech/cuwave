@@ -16,6 +16,11 @@ A 2D run past L2 marches runs of columns along axis 0 with the same claim, check
 runs and chunks small enough that a test grid holds many, the last of each one node.
 A 3D order-2 run past L2 marches columns of tiles along axis 0 with the same claim,
 checked on a grid whose last tile and last chunk of planes hold one node each.
+
+Where no mask, pml or streaming stands in the way, the per-thread step writes the face
+ghosts itself from their mirrors two nodes in, and `simulate` skips the refill launch
+unless a source sits on a mirror. It claims the refilled run bit for bit, so it is
+compared with the run the refill launch serves, in 1D to 3D, over faces and dampings.
 """
 
 import copy
@@ -489,6 +494,89 @@ class MarchedTest(unittest.TestCase):
                 if name == "in L2":
                     taken = None
                 self.assertIsNone(each.define_blocked_step(mat, source, taken))
+
+
+# --------------------------------- the folded refill ---------------------------------
+def _folded_runs(sim, seed):
+    """The (field, record) of a run whose step writes the ghosts, then of one refilling them."""
+    n = np.asarray(sim.Nx)
+    position = cp.asarray(np.stack([n // 3, n // 2]).T, dtype=cp.int32)
+    signal = np.random.default_rng(seed).standard_normal((sim.N, 2))
+    source = Source(position, cp.asarray(signal, dtype=sim.dtype))
+    # the ghosts, mirrors and nodes between along the diagonal, a face ghost, a mirror
+    rows = [np.full(sim.ndim, k) for k in (0, 1, 2, 3)]
+    rows += [n - k for k in (1, 2, 3, 4)] + [
+        np.r_[0, n[1:] // 2],
+        np.r_[n[:1] - 3, 2 * n[1:] // 3],
+    ]
+    sensors = cp.asarray(np.stack(rows).T, dtype=cp.int32)
+    indicator = _random(sim, seed)[0]
+    runs = []
+    with mock.patch.object(type(sim), "define_blocked_step", lambda *a, **k: None):
+        assert sim.folds_refill(source.position)
+        runs.append(simulate(sim, source, indicator, sensors=sensors))
+        with mock.patch.object(scalar.PressureWave, "_refills_in_step", False):
+            runs.append(simulate(sim, source, indicator, sensors=sensors))
+    return runs
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class FoldedRefillTest(unittest.TestCase):
+    def test_a_folded_run_is_the_refilled_run_bit_for_bit(self):
+        mixed = (Neumann, Dirichlet), (Dirichlet, Neumann), (Dirichlet, Dirichlet)
+        grids = {1: (61,), 2: (37, 45), 3: (21, 18, 35)}
+        for ndim, Nx in grids.items():
+            for boundary, precision in itertools.product(
+                (None, mixed[:ndim]), ("float32", "float64")
+            ):
+                dx = (0.1,) * ndim
+                sim = ScalarWave(
+                    Nx,
+                    dx,
+                    23,
+                    0.5 * stable_dt(dx, 1.0, 2),
+                    (32,) if ndim == 1 else (4, 32) if ndim == 2 else (1, 16, 32),
+                    precision=precision,
+                    wavespeed=1.0,
+                    density=1.0,
+                    boundary=boundary,
+                )
+                for damped in (False, True):
+                    if damped:
+                        indicator = _random(sim, 5)[0]
+                        sim = replace(sim, damping=sponge(sim, indicator, 4, 0.5))
+                    with self.subTest(
+                        ndim=ndim, boundary=boundary, precision=precision, damped=damped
+                    ):
+                        folded, refilled = _folded_runs(sim, 7)
+                        self.assertGreater(float(cp.abs(refilled[0]).max()), 0.0)
+                        for a, b in zip(folded, refilled):
+                            self.assertTrue(bool(cp.array_equal(a, b)))
+
+    def test_a_source_on_a_mirror_keeps_the_refill(self):
+        sim = _scalar(2, Nx=(37, 45))
+        for point in ([2, 20], [34, 20], [20, 2], [20, 42], [20, 20]):
+            with self.subTest(point=point):
+                position = cp.asarray([[p] for p in point], dtype=cp.int32)
+                self.assertEqual(sim.folds_refill(position), point == [20, 20])
+
+    def test_what_keeps_the_refill_launch(self):
+        sim = _scalar(2, Nx=(37, 45))
+        indicator = _random(sim, 1)[0]
+        kept = {
+            "a pml": replace(sim, pml=Pml(4, 1.0)),
+            "a domain": replace(sim, domain=indicator > 0.5),
+            "streaming": _scalar(6),
+            "three nodes": _scalar(2, Nx=(3, 45)),
+        }
+        position = cp.asarray([[1], [20]], dtype=cp.int32)
+        for name, each in kept.items():
+            with self.subTest(name=name):
+                if name == "streaming":
+                    with mock.patch.object(type(each), "streams", True):
+                        self.assertFalse(each.folds_refill(position))
+                else:
+                    self.assertFalse(each.folds_refill(position))
 
 
 if __name__ == "__main__":

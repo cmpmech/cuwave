@@ -155,12 +155,42 @@ class PressureWave(Simulation):
         return tiles * chunks >= STREAM_BLOCKS * sms
 
     @property
+    def _refills_in_step(self) -> bool:
+        """Whether the plain step writes the face ghosts: unmasked, unstreamed, no pml, Neumann and Dirichlet faces only."""
+        conditions = {c for pair in self.boundary for c in pair}
+        return (
+            not (self.masked or self.streams or self.pml is not None)
+            and conditions <= {Neumann, Dirichlet}
+            and min(self.Nx) >= 4  # a mirror two nodes in is interior
+        )
+
+    @property
     def compile_flags(self) -> tuple[str, ...]:
-        """The base flags, plus the streaming block where the step streams."""
+        """The base flags, plus the streaming block where the step streams, or the folded refill."""
         flags = super().compile_flags
+        if self._refills_in_step:
+            neumann, dirichlet = face_mask(self, Neumann), face_mask(self, Dirichlet)
+            flags += ("-DFOLD_REFILL", f"-DNEUMANN_FACES={neumann}")
+            flags += (f"-DDIRICHLET_FACES={dirichlet}",)
         if not self.streams:
             return flags
         return flags + ("-DUSE_STREAM", f"-DSTREAM_TX={self.threads[-1]}")
+
+    def folds_refill(self, position: cpt.NDArray[cp.int32]) -> bool:
+        """Whether the step's own ghost writes stand for the refill after a source at `position`.
+
+        A source on a ghost's mirror lands after the step wrote the ghost, so it keeps
+        the refill launch.
+        """
+        if not self._refills_in_step:
+            return False
+        points = position.get()
+        for d, (low, high) in enumerate(self.boundary):
+            if (low in (Neumann, Dirichlet) and (points[d] == 2).any()) or (
+                high in (Neumann, Dirichlet) and (points[d] == self.Nx[d] - 3).any()
+            ):
+                return False
+        return True
 
     def define_step(self, kernels: cp.RawModule, mat: dict) -> Callable:
         """Closure launching the step, streamed along axis 0 unless a mask tiles it, then the pml."""
