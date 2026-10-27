@@ -54,6 +54,7 @@ BLOCKED = (
     (((32, 32), 32, 2),),
 )
 BLOCKED_WAVES = (2, 1)  # by radius, the waves of tiles the blocked step pays to
+FUSED_TILE = ((16, 32), (4, 8, 32))  # in 2D, 3D: the fused step's tile, a thread each
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -272,7 +273,23 @@ class MaxwellWave(Simulation):
         return self._define_pair(kernels, mat, adjoint=self.pml is not None)
 
     def _define_pair(self, kernels: cp.RawModule, mat: dict, adjoint: bool) -> Callable:
-        """The curl and update launches, each followed by its pml terms if there are any."""
+        """The curl and update launches, each followed by its pml terms if there are any; fused past L2 without one."""
+        # one launch where DRAM bounds the pair and the ring at most doubles the curl
+        device = cp.cuda.Device().attributes
+        nodes = math.prod(map(int, self.Nx))
+        fields = (4 * self.ndim + self.npairs) * nodes * self.dtype().itemsize
+        tile = FUSED_TILE[self.ndim - 2]
+        ring = math.prod(t + self.space_order for t in tile)
+        shared = self.npairs * ring * self.dtype().itemsize
+        if (
+            self.pml is None
+            and fields > device["L2CacheSize"]
+            and ring <= 2 * math.prod(tile)
+            and shared <= device["MaxSharedMemoryPerBlockOptin"]
+        ):
+            return self._define_fused(mat, tile, shared)
+
+        # the pair
         curl_kernel = kernels.get_function("curl_kernel")
         fd_kernel = kernels.get_function("fd_kernel")
         grid, block = grid_block(self)
@@ -312,6 +329,26 @@ class MaxwellWave(Simulation):
 
         pml_step.memory = curl_pml.memory
         return pml_step
+
+    def _define_fused(self, mat: dict, tile: tuple[int, ...], shared: int) -> Callable:
+        """The step as one launch, each block's curl in shared memory, ring included."""
+        flags = tuple(f"-DTILE{d}={t}" for d, t in enumerate(tile))
+        kernel = compile_kernels(self, flags=flags).get_function("fused_kernel")
+        grid = tuple(-(-n // t) for n, t in zip(self.Nx_padded, tile))[::-1]
+        kernel.max_dynamic_shared_size_bytes = shared
+        args = [None, None, None, *([mat["nu_pair"]] if self.magnetic else [])]
+        args += [self.dtype(1.0 / self.permeability), mat["minv"]]
+        if self.damping is not None:
+            args += [mat["damping"], self.dtype(self.dt)]
+        args += [np.int32(self.comp_stride), *(self.dtype(1.0 / d) for d in self.dx)]
+        args += axis_geometry(self, self.step_factors())
+
+        def fd_step(u0, u1, u2):
+            args[0], args[1], args[2] = u0, u1, u2
+            kernel(grid, tile[::-1], args, shared_mem=shared)
+            return u2
+
+        return fd_step
 
     def define_blocked_step(
         self, mat: dict, source: Source, sensors: cpt.NDArray[cp.int32] | None

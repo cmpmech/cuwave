@@ -3,6 +3,7 @@
 //   NDIM = 2 | 3
 //   USE_DAMPING
 //   USE_MAGNETIC
+//   TILE0, TILE1, TILE2 (the fused step's tile)
 //   STEPS, TILE0, TILE1, ROWS (2D, without USE_MAGNETIC)
 
 #if NDIM == 1
@@ -375,6 +376,109 @@ __global__ void pml_adjoint_memory_kernel(const real_t *__restrict__ h,
     *m = profile[3 * NN[e] + a] * (*m + h[curl_row(k, e) * cs + idx]);
   }
 }
+
+#if defined(TILE0) && !defined(STEPS)
+// ------------------------------------------------------------------------------------
+// the curl of the block's tile and a ring a stencil radius wide around it
+#define WIDE (TILE1 + 2 * STENCIL_RADIUS)
+#if NDIM == 2
+#define RING ((TILE0 + 2 * STENCIL_RADIUS) * WIDE)
+#define THREADS (TILE0 * TILE1)
+#else
+#define DEEP_ (TILE2 + 2 * STENCIL_RADIUS)
+#define RING ((TILE0 + 2 * STENCIL_RADIUS) * WIDE * DEEP_)
+#define THREADS (TILE0 * TILE1 * TILE2)
+#endif
+__global__ void __launch_bounds__(THREADS)
+    fused_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
+                 real_t *__restrict__ u2,
+#ifdef USE_MAGNETIC
+                 const real_t *__restrict__ nu_pair,
+#endif
+                 const real_t nu, const real_t *__restrict__ minv,
+#ifdef USE_DAMPING
+                 const real_t *__restrict__ damping, const real_t dt,
+#endif
+                 const int cs, const real_t e0, const real_t e1,
+#if NDIM == 3
+                 const real_t e2,
+#endif
+                 AXIS_PARAMS) {
+  extern __shared__ real_t sh[]; // NPAIRS * RING
+#if NDIM == 2
+  const int b0 = blockIdx.y * TILE0 - STENCIL_RADIUS;
+  const int b1 = blockIdx.x * TILE1 - STENCIL_RADIUS;
+  const real_t E[2] = {e0, e1};
+  for (int t = threadIdx.y * TILE1 + threadIdx.x; t < RING; t += THREADS) {
+    const int g0 = b0 + t / WIDE, g1 = b1 + t % WIDE;
+    const bool inner = g0 > 0 && g0 < N0 - 1 && g1 > 0 && g1 < N1 - 1;
+    const int G[2] = {g0, g1}, GS[2] = {s0, 1}, GN[2] = {N0, N1};
+    const int at = g0 * s0 + g1;
+#else
+  const int b0 = blockIdx.z * TILE0 - STENCIL_RADIUS;
+  const int b1 = blockIdx.y * TILE1 - STENCIL_RADIUS;
+  const int b2 = blockIdx.x * TILE2 - STENCIL_RADIUS;
+  const real_t E[3] = {e0, e1, e2};
+  for (int t = (threadIdx.z * TILE1 + threadIdx.y) * TILE2 + threadIdx.x;
+       t < RING; t += THREADS) {
+    const int g0 = b0 + t / (WIDE * DEEP_), g1 = b1 + t / DEEP_ % WIDE;
+    const int g2 = b2 + t % DEEP_;
+    const bool inner =
+        g0 > 0 && g0 < N0 - 1 && g1 > 0 && g1 < N1 - 1 && g2 > 0 && g2 < N2 - 1;
+    const int G[3] = {g0, g1, g2}, GS[3] = {s0, s1, 1}, GN[3] = {N0, N1, N2};
+    const int at = g0 * s0 + g1 * s1 + g2;
+#endif
+    // curl_kernel's pair points; the scratch it writes is zero elsewhere
+#pragma unroll
+    for (int k = 0; k < NDIM - 1; ++k)
+#pragma unroll
+      for (int l = k + 1; l < NDIM; ++l) {
+        const int p = PAIR_ROW(k, l) - NDIM;
+        real_t h = (real_t)0;
+        if (inner && G[k] <= GN[k] - 3 && G[l] <= GN[l] - 3) {
+          const real_t b = curl_component(u1, at, cs, k, l, G, GS, GN, E);
+#ifdef USE_MAGNETIC
+          h = nu_pair[p * cs + at] * b;
+#else
+          h = nu * pair_weight(k, l, G, GN) * b;
+#endif
+        }
+        sh[p * RING + t] = h;
+      }
+  }
+  __syncthreads();
+
+  // fd_kernel's update, the force read off the tile
+  INTERIOR_OR_RETURN;
+  AXIS_GEOM;
+  AXIS_FACTORS;
+#if NDIM == 2
+  const int local =
+      (threadIdx.y + STENCIL_RADIUS) * WIDE + threadIdx.x + STENCIL_RADIUS;
+  const int T[2] = {WIDE, 1};
+#else
+  const int local =
+      ((threadIdx.z + STENCIL_RADIUS) * WIDE + threadIdx.y + STENCIL_RADIUS) *
+          DEEP_ +
+      threadIdx.x + STENCIL_RADIUS;
+  const int T[3] = {WIDE * DEEP_, DEEP_, 1};
+#endif
+#pragma unroll
+  for (int c = 0; c < NDIM; ++c) {
+    if (A[c] > NN[c] - 3)
+      continue; // no unknown on the staggered ghost of its own axis
+    const real_t force = curl_force(sh, local, RING, c, A, T, NN, F);
+    const int n = c * cs + idx;
+    const real_t mi = minv[n];
+#ifdef USE_DAMPING
+    const real_t beta = 0.5f * mi * damping[idx] * dt;
+    u2[n] = (2.f * u1[n] - u0[n] * (1.f - beta) + mi * force) / (1.f + beta);
+#else
+    u2[n] = -u0[n] + 2.f * u1[n] + mi * force;
+#endif
+  }
+}
+#endif
 
 #if NDIM == 2 && defined(STEPS) && !defined(USE_MAGNETIC)
 // ------------------------------------------------------------------------------------

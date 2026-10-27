@@ -21,7 +21,9 @@ gradient on a damped domain, where both of its runs decay.
 A 2D float32 vector run on a small grid advances several steps a launch
 (`define_blocked_step`), the curl, the update, the excitation and the record inside the
 tile. It claims the curl and update pair bit for bit, so it is compared with
-`array_equal` over orders, faces, damping, tiles and sources on both components.
+`array_equal` over orders, faces, damping, tiles and sources on both components. Past L2
+the pair becomes one launch (`_define_fused`) that recomputes the curl of a ring around
+each tile, pinned to the pair bit for bit in 2D and 3D, a designed permeability included.
 """
 
 import math
@@ -582,6 +584,59 @@ class BlockedTest(unittest.TestCase):
             wide = replace(sim, precision="float64")
             mat = wide.build_materials(indicator.astype(wide.dtype))
             self.assertIsNone(wide.define_blocked_step(mat, once, None))
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class FusedTest(unittest.TestCase):
+    def test_the_fused_step_is_the_pair_bit_for_bit(self):
+        rng = np.random.default_rng(5)
+        mixed = ((Conductor, Magnetic), (Magnetic, Conductor))
+        mixed3 = (*mixed, (Conductor, Conductor))
+        cases = (
+            ((37, 70), 2, Conductor, "float32", False, DielectricWave),
+            ((37, 70), 4, mixed, "float32", True, DielectricWave),
+            ((37, 70), 8, Magnetic, "float32", False, MagnetodielectricWave),
+            ((37, 70), 4, mixed, "float64", False, DielectricWave),
+            ((13, 21, 40), 2, mixed3, "float32", True, DielectricWave),
+            ((13, 21, 40), 4, Conductor, "float32", False, MagnetodielectricWave),
+            ((13, 21, 40), 2, Magnetic, "float64", False, DielectricWave),
+        )
+        for Nx, order, boundary, precision, damped, cls in cases:
+            with self.subTest(Nx=Nx, order=order, cls=cls.__name__, damped=damped):
+                dx = tuple(1.0 / (n - 3) for n in Nx)
+                threads = VECTOR_THREADS[len(Nx)]
+                common = dict(permittivity1=EPS1, permittivity2=4.0, permeability=MU)
+                sim = cls(
+                    Nx,
+                    dx,
+                    1,
+                    1e-3,
+                    threads,
+                    precision=precision,
+                    space_order=order,
+                    boundary=boundary,
+                    **common,
+                )
+                gamma = cp.asarray(rng.random(sim.Nx_padded), dtype=sim.dtype)
+                if damped:
+                    sim = replace(sim, damping=sponge(sim, gamma, 3, 0.3))
+                mat = sim.build_materials(gamma)
+                # a grid this small takes the pair
+                pair = sim._define_pair(compile_kernels(sim), mat, adjoint=False)
+                tile = maxwell.FUSED_TILE[sim.ndim - 2]
+                ring = math.prod(t + order for t in tile)
+                fused = sim._define_fused(
+                    mat, tile, sim.npairs * ring * sim.dtype().itemsize
+                )
+                shape = (sim.ncomp, *sim.Nx_padded)
+                u0, u1 = (
+                    cp.asarray(rng.standard_normal(shape), dtype=sim.dtype)
+                    for _ in range(2)
+                )
+                a = pair(u0, u1, cp.zeros_like(u0))
+                b = fused(u0, u1, cp.zeros_like(u0))
+                self.assertGreater(float(cp.abs(a).max()), 0.0)
+                self.assertTrue(bool(cp.array_equal(a, b)))
 
 
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
