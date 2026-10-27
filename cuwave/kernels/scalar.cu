@@ -7,6 +7,7 @@
 //   FOLD_REFILL, NEUMANN_FACES, DIRICHLET_FACES
 //   FOLD_SOURCES (3D, with FOLD_REFILL)
 //   STEPS, TILE0, TILE1, ROWS (2D)
+//   RECORD (2D, with the tiles): every level written into its history row
 //   STEPS, TILE1, PLANES (2D marched)
 //   STEPS, TILE1, TILE2, PLANES, INTERIOR (3D, order 2)
 
@@ -527,7 +528,12 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
     const int *__restrict__ sensor_starts,
     const unsigned *__restrict__ sensor_entries, const int t0, const int neumann,
     const int dirichlet, const real_t f0, const int N0, const real_t f1,
-    const int N1, const int s0) {
+    const int N1, const int s0
+#ifdef RECORD
+    ,
+    const long long level // between the history rows v0 begins
+#endif
+) {
   // u of this step and the next, each in a guard ring a radius wide
   extern __shared__ real_t shared[];
   const int ty = threadIdx.x, x0 = threadIdx.y * NODES;
@@ -683,9 +689,20 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
     for (int k = 0; k < NODES; ++k)
       if (tag[k] >> 16)
         record[(size_t)(t0 + t) * num_sensors + (tag[k] >> 16) - 1] = uc[k];
+#ifdef RECORD
+    // the level into its history row, where the plain step and refill write
+    if (col && core1)
+#pragma unroll
+      for (int k = 0; k < NODES; ++k) {
+        const int a0 = lo0 - HALO + x0 + k, k0 = owner(a0, N0);
+        if (((stepped | ghost) >> k) & 1 && k0 >= lo0 && k0 < lo0 + C0)
+          v0[t * level + a0 * s0 + a1] = uc[k];
+      }
+#endif
     __syncthreads();
   }
 
+#ifndef RECORD
   // write back the core, each ghost with its mirror
   if (!col || !core1)
     return;
@@ -698,6 +715,7 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
       v1[a0 * s0 + a1] = uc[k];
     }
   }
+#endif
 }
 #elif NDIM == 2
 // ------------------------------------------------------------------------------------

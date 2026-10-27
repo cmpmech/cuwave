@@ -10,7 +10,9 @@ halved wall cell and the ghost folded onto its mirror), so the high-order checks
 walls, corners and rows 2 .. 2R on a sharp material, and one adjoint step is pinned to the
 transpose of one forward step on its own, across dimensions, orders and face layouts.
 Folding the ghosts in, the fused step reads none of lambda's, which lets `sensitivity` step
-lambda without a refill: pinned bit for bit against ghosts filled with garbage.
+lambda without a refill: pinned bit for bit against ghosts filled with garbage. Its 2D
+forward advancing whole blocks of steps into the history is pinned bit for bit to the
+launched one.
 
 For the pressure classes `sensitivity` fuses both gradients into the adjoint step and
 sums the inertia term by parts in time, so it is pinned at round-off to the separate
@@ -65,6 +67,7 @@ import itertools
 import math
 import unittest
 from dataclasses import replace
+from unittest import mock
 
 import numpy as np
 
@@ -533,6 +536,47 @@ class GradientTest(unittest.TestCase):
                 error = cp.abs(fused[name] - separate[name]).max()
                 error = float(error / cp.abs(separate[name]).max())
                 self.assertLess(error, 1e-12, f"{name} off by {error:.2e}")
+
+
+@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
+class RecordedTest(unittest.TestCase):
+    def test_the_recorded_forward_is_the_launched_one_bit_for_bit(self):
+        # 53 steps: graphed chunks of whole blocks, then a few launched one by one
+        mixed = ((Neumann, Dirichlet), (Dirichlet, Neumann))
+        Nx, dx = (37, 45), (0.1, 0.1)
+        n = np.asarray(Nx)
+        rows = [(2, n[1] // 2), (n[0] // 2, n[1] - 3), n // 3]
+        sensors = cp.asarray(np.stack([n - 3, (2, 2), n // 2]).T, dtype=cp.int32)
+        for order, boundary in itertools.product((2, 4), (None, mixed)):
+            sim = ScalarWave(
+                Nx,
+                dx,
+                53,
+                0.5 * stable_dt(dx, 1.0, order),
+                (4, 32),
+                space_order=order,
+                boundary=boundary,
+                wavespeed=1.0,
+                density=1.0,
+            )
+            rng = np.random.default_rng(order)
+            signal = cp.asarray(rng.standard_normal((sim.N, 3)), dtype=sim.dtype)
+            source = Source(cp.asarray(np.stack(rows).T, dtype=cp.int32), signal)
+            indicator = cp.asarray(
+                0.5 + 0.5 * rng.random(sim.Nx_padded), dtype=sim.dtype
+            )
+            objective = l2_misfit(cp.zeros((sim.N, 3), dtype=sim.dtype))
+            mat = sim.build_materials(indicator)
+            self.assertIsNotNone(sim.define_recorded_step(mat, source))
+            recorded = sensitivity(sim, source, indicator, sensors, objective)
+            launched = lambda *args: None
+            with mock.patch.object(ScalarWave, "define_recorded_step", launched):
+                plain = sensitivity(sim, source, indicator, sensors, objective)
+            self.assertEqual(recorded[0], plain[0])
+            self.assertTrue(bool(cp.array_equal(recorded[2], plain[2])))
+            for name in plain[1]:
+                same = cp.array_equal(recorded[1][name], plain[1][name])
+                self.assertTrue(bool(same), (order, name))
 
 
 @unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")

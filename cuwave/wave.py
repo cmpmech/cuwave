@@ -240,6 +240,13 @@ def tile_lists(
     return [cp.asarray(starts, dtype=cp.int32), cp.asarray(entries)]
 
 
+class Recorded(NamedTuple):
+    """A step closure advancing several steps a launch into a history, `step(history, t, signal)`."""
+
+    steps: int  # the steps one call advances, a divisor of CHUNK
+    step: Callable
+
+
 class LaunchSlots(NamedTuple):
     """The positions in a blocked kernel's argument list a call fills in."""
 
@@ -247,6 +254,17 @@ class LaunchSlots(NamedTuple):
     record: int  # the (N, num_sensors) sensor record, or a dummy
     step: int  # the first step the call advances
     blocks: int | None  # the list a kernel decodes its thread block from, if any
+
+
+class TiledLaunch(NamedTuple):
+    """A blocked kernel's launch before it is wrapped into a step, as `blocked_launches` takes it."""
+
+    steps: int  # the steps one call advances
+    launches: list  # (kernel, grid, blocks) each, as `blocked_launches` takes them
+    block: tuple[int, ...]  # threads per block
+    shared: int  # dynamic shared memory per block in bytes
+    args: list  # the kernels' arguments, the fields and `slots` filled per call
+    slots: LaunchSlots  # where in `args` a call puts what changes per call
 
 
 def blocked_launches(
@@ -478,6 +496,10 @@ class Simulation:
         self, kernels: cp.RawModule, mat: dict, source: Source
     ) -> Callable | None:
         """The step, the excitation and the ghost refill in fewer launches, `step(u0, u1, u2, signal, t)`: None here."""
+        return None
+
+    def define_recorded_step(self, mat: dict, source: Source) -> Recorded | None:
+        """The step advancing several steps a launch into a history, `step(history, t, signal)`: None here."""
         return None
 
     kernel_path = None  # forward source this equation compiles, set by the subclass

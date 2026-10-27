@@ -24,6 +24,8 @@ from .wave import (
     PML_THREADS,
     Blocked,
     LaunchSlots,
+    Recorded,
+    TiledLaunch,
     Simulation,
     Source,
     TileHits,
@@ -423,9 +425,51 @@ class PressureWave(Simulation):
         Dirichlet, a source off the interior, two sources or sensors on one node, or an
         axis of fewer than 4 nodes.
         """
+        if not self._blockable():
+            return None
+        if self.ndim == 3:
+            return self._define_marched_step(mat, source, sensors)
+        # DRAM bounds a grid whose fields pass L2: the march of rows first
+        nodes = math.prod(map(int, self.Nx))  # a caller may pass numpy int32
+        if 16 * nodes > LARGE_L2 * cp.cuda.Device().attributes["L2CacheSize"]:
+            marched = self._define_marched_rows(mat, source, sensors)
+            if marched is not None:
+                return marched
+        tiled = self._define_tiled(mat, source, sensors)
+        return None if tiled is None else blocked_launches(*tiled)
+
+    def define_recorded_step(self, mat: dict, source: Source) -> Recorded | None:
+        """The 2D step advancing several steps a launch into a history, `step(history, t, signal)`, else None.
+
+        `history[t]` and `history[t + 1]` hold the two levels before step t, and the
+        call writes the level of step t + k into `history[t + 2 + k]`, as `sensitivity`
+        stores them: bitwise the step, excitation and refill launched one by one. Taken
+        where `define_blocked_step` takes its tiles; None elsewhere.
+        """
+        if not self._blockable() or self.ndim != 2:
+            return None
+        tiled = self._define_tiled(mat, source, None, ("-DRECORD",))
+        if tiled is None:
+            return None
+        steps, launches, block, shared, args, slots = tiled
+        ((kernel, grid, _),) = launches
+        args.append(np.int64(math.prod(self.field_shape)))  # one level of the history
+        unread = cp.zeros(1, dtype=self.dtype)  # no sensor is recorded
+
+        def recorded_step(history, t, signal):
+            args[0], args[1] = history[t], history[t + 1]
+            args[2] = args[3] = history[t + 2]
+            args[slots.signal], args[slots.record] = signal, unread
+            args[slots.step] = np.int32(t)
+            kernel(grid, block, args, shared_mem=shared)
+
+        return Recorded(steps, recorded_step)
+
+    def _blockable(self) -> bool:
+        """Whether a blocked step can reproduce the plain one here: the conditions `define_blocked_step` names."""
         conditions = {c for pair in self.boundary for c in pair}
         radius = self.space_order // 2
-        if (
+        return not (
             self.ndim == 1
             or self.precision != "float32"
             or radius > len(SMALL_BLOCKS)
@@ -434,18 +478,21 @@ class PressureWave(Simulation):
             or self.streams  # the tile reproduces the per-thread kernel
             or not conditions <= {Neumann, Dirichlet}
             or min(self.Nx) < 4
-        ):
-            return None
-        if self.ndim == 3:
-            return self._define_marched_step(mat, source, sensors)
+        )
+
+    def _define_tiled(
+        self,
+        mat: dict,
+        source: Source,
+        sensors: cpt.NDArray[cp.int32] | None,
+        flags: tuple[str, ...] = (),
+    ) -> TiledLaunch | None:
+        """The 2D tile tier's launch, its kernel compiled with the extra `flags`, else None."""
+        radius = self.space_order // 2
         # launches bound a grid of a wave or two of threads, DRAM one whose fields pass L2
         device = cp.cuda.Device().attributes
         resident = device["MultiProcessorCount"] * device["MaxThreadsPerMultiProcessor"]
         nodes = math.prod(map(int, self.Nx))  # a caller may pass numpy int32
-        if 16 * nodes > LARGE_L2 * device["L2CacheSize"]:
-            marched = self._define_marched_rows(mat, source, sensors)
-            if marched is not None:
-                return marched
         sms = device["MultiProcessorCount"]
         if nodes <= SMALL_WAVES[radius - 1] * resident and sms >= SMALL_SMS[radius - 1]:
             # one tile a multiprocessor at a time: the candidate with the fewest waves
@@ -495,8 +542,8 @@ class PressureWave(Simulation):
         lists = [a for h in hits for a in tile_lists(h, tile, core, halo, cores)]
 
         # the kernel and its arguments, the pointers swapped per launch
-        flags = (f"-DSTEPS={steps}", f"-DTILE0={tile[0]}", f"-DTILE1={tile[1]}")
-        kernels = compile_kernels(self, flags=(*flags, f"-DROWS={rows}"))
+        tier = (f"-DSTEPS={steps}", f"-DTILE0={tile[0]}", f"-DTILE1={tile[1]}")
+        kernels = compile_kernels(self, flags=(*tier, f"-DROWS={rows}", *flags))
         kernel = kernels.get_function("blocked_kernel")
         # u twice, each in a guard ring a radius wide
         shared = 2 * (tile[0] + 2 * radius) * (tile[1] + 2 * radius) * 4
@@ -508,7 +555,7 @@ class PressureWave(Simulation):
         args += [face_mask(self, Neumann), face_mask(self, Dirichlet)]
         args += axis_geometry(self, self.step_factors())
         launches = [(kernel, tuple(cores[::-1]), None)]
-        return blocked_launches(steps, launches, (tile[1], rows), shared, args, slots)
+        return TiledLaunch(steps, launches, (tile[1], rows), shared, args, slots)
 
     def _define_marched_step(
         self, mat: dict, source: Source, sensors: cpt.NDArray[cp.int32] | None

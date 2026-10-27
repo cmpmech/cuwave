@@ -426,8 +426,9 @@ def sensitivity(
     grads = sim.gradient_fields(mat)
 
 # ------------------------------------ forward pass -----------------------------------
-    # its host checks wait on the device, so they run before the history is zeroed
+    # their host checks wait on the device, so they run before the history is zeroed
     folded = sim.define_folded_step(kernels, mat, source)
+    recorded = sim.define_recorded_step(mat, source)
     # stepped straight into the history, so the leading zeros are u^-2 / u^-1
     V = cp.zeros((sim.N + 2, *sim.field_shape), dtype=sim.dtype)
 
@@ -440,7 +441,21 @@ def sensitivity(
         bc_step(u)
 
     windows = [Window(source.signal), Window(V, halo=2, store=True)]
-    march(sim.N, forward, windows, getattr(fd_step, "memory", []))
+    memory = getattr(fd_step, "memory", [])
+    if recorded is None:
+        march(sim.N, forward, windows, memory)
+    else:
+        # whole blocks a launch through the graphs, the steps left over one by one
+        S = recorded.steps
+        full = sim.N - sim.N % S
+
+        def blocked_forward(t, signal, history):
+            if t % S == 0:
+                recorded.step(history, t, signal)
+
+        march(full, blocked_forward, windows, memory)
+        for t in range(full, sim.N):
+            forward(t, source.signal, V)
 
     # gathered off the history rather than probed per step, saving one launch a step
     um = V[2:].reshape(sim.N, -1)[:, flatten_indices(sim, sensors)]
