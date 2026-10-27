@@ -781,6 +781,8 @@ __global__ void __launch_bounds__(THREADS)
 #define WIDE (TILE1 + 2 * STENCIL_RADIUS) // a tile row with its guard columns
 #define AREA ((TILE0 + 2 * STENCIL_RADIUS) * WIDE)
 #define AT(x, y) (((x) + STENCIL_RADIUS) * WIDE + (y) + STENCIL_RADIUS)
+static_assert(TILE0 % ROWS == 0, "the thread rows split the tile evenly");
+static_assert(2 * NODES <= 32, "a component bit per node fits the mask");
 
 // advance a tile STEPS steps between one load and one store: the stresses, the
 // update, the excitation and the record, bitwise the plain launches

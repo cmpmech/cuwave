@@ -290,9 +290,9 @@ class ElasticWave(Simulation):
         the record launched one by one. Taken where launches bound the pair (the
         candidate of `BLOCKED` with the fewest waves of tiles, while those stay within
         `BLOCKED_WAVES`) or DRAM does (`LARGE_BLOCKED`, order 2, fields past 2.25 times
-        L2); else None, as in 1D and 3D, in float64, above order 4, with a pml, a source
-        on a point the step holds, a sensor off the interior, or two sources or sensors
-        on one point.
+        L2); else None, as in 1D and 3D, in float64, above order 4, with a pml, a halo
+        under 2 nodes, a source on a point the step holds, a sensor off the interior,
+        or two sources or sensors on one point.
         """
         radius = self.radius
         if (
@@ -321,8 +321,8 @@ class ElasticWave(Simulation):
             block = LARGE_BLOCKED[radius - 1]
         else:
             block = None
-        if block is None:
-            return None
+        if block is None or block[2] * reach < 2:
+            return None  # a halo under 2 leaves a ghost's mirror outside its tile
         tile, rows, steps = block
         halo = steps * reach
         core = [t - 2 * halo for t in tile]
