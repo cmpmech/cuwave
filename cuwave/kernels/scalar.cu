@@ -708,6 +708,14 @@ __global__ void __launch_bounds__(TILE1 *TILE2)
     Q[k][0] = Q[k][1] = Q[k][2] = 0;
     MI[k] = 0;
   }
+#ifdef INTERIOR
+  // the in-plane means from plane z - 1 on in registers, with no wall code to
+  // crowd them out: -1, +1 of axis 1, then of axis 2
+  real_t M[STEPS][4];
+#pragma unroll
+  for (int k = 0; k < STEPS; ++k)
+    M[k][0] = M[k][1] = M[k][2] = M[k][3] = 1;
+#endif
 #pragma unroll
   for (int k = 0; k <= STEPS; ++k)
     G[k] = 1;
@@ -755,9 +763,17 @@ __global__ void __launch_bounds__(TILE1 *TILE2)
 
     // the plane's cell means toward +1, harmonic as flux_divergence_axis forms
     // them, toward -1 the neighbour's
+#ifdef INTERIOR
+    real_t mz[4];
+    mz[0] = ls * skz[i - WIDE] / (ls + skz[i - WIDE]);
+    mz[1] = ls * skz[i + WIDE] / (ls + skz[i + WIDE]);
+    mz[2] = ls * skz[i - 1] / (ls + skz[i - 1]);
+    mz[3] = ls * skz[i + 1] / (ls + skz[i + 1]);
+#else
     real_t *mz = means + slot * 2 * AREA;
     mz[i] = ls * skz[i + WIDE] / (ls + skz[i + WIDE]);
     mz[AREA + i] = ls * skz[i + 1] / (ls + skz[i + 1]);
+#endif
     Q[0][0] = Q[0][1];
     Q[0][1] = Q[0][2];
     Q[0][2] = lu1;
@@ -781,8 +797,15 @@ __global__ void __launch_bounds__(TILE1 *TILE2)
       real_t u = k == 1 ? P[0] : Q[k - 2][0]; // held where nothing steps
       if (inner && (!WALLS || q > 0 && q < N0 - 1)) {
         const real_t *cu = cur + (k - 1) * AREA;
+#ifdef INTERIOR
+        const real_t gm1 = M[k - 1][0], gp1 = M[k - 1][1];
+        const real_t gm2 = M[k - 1][2], gp2 = M[k - 1][3];
+#else
         const real_t *g =
             means + (slot + STEPS + 1 - k) % (STEPS + 1) * 2 * AREA;
+        const real_t gm1 = g[i - WIDE], gp1 = g[i];
+        const real_t gm2 = g[AREA + i - 1], gp2 = g[AREA + i];
+#endif
         const auto along0 = [&](const int j) {
           return j > 0 ? Q[k - 1][2] : Q[k - 1][0];
         };
@@ -790,10 +813,8 @@ __global__ void __launch_bounds__(TILE1 *TILE2)
         const auto along2 = [&](const int j) { return cu[i + j]; };
         const real_t d0 = flux_divergence_taps(along0, uc, G[STEPS - k + 1],
                                                G[STEPS - k], 1, 1);
-        const real_t d1 =
-            flux_divergence_taps(along1, uc, g[i], g[i - WIDE], 1, 1);
-        const real_t d2 = flux_divergence_taps(along2, uc, g[AREA + i],
-                                               g[AREA + i - 1], 1, 1);
+        const real_t d1 = flux_divergence_taps(along1, uc, gp1, gm1, 1, 1);
+        const real_t d2 = flux_divergence_taps(along2, uc, gp2, gm2, 1, 1);
         // the axes and the leapfrog rounded as nvcc compiles fd_kernel's
         const real_t laplacian = FMA_RN(f2, d2, FMA_RN(f0, d0, MUL_RN(f1, d1)));
 #ifdef USE_DAMPING
@@ -874,6 +895,16 @@ __global__ void __launch_bounds__(TILE1 *TILE2)
     for (int n = STEPS - 1; n > 0; --n)
       MI[n] = MI[n - 1];
     MI[0] = derive_inertia ? 1.f / ls : lm;
+#ifdef INTERIOR
+#pragma unroll
+    for (int n = STEPS - 1; n > 0; --n)
+#pragma unroll
+      for (int e = 0; e < 4; ++e)
+        M[n][e] = M[n - 1][e];
+#pragma unroll
+    for (int e = 0; e < 4; ++e)
+      M[0][e] = mz[e];
+#endif
     slot = slot == STEPS ? 0 : slot + 1;
   }
 }
