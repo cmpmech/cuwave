@@ -333,14 +333,15 @@ __device__ __forceinline__ void memory_force(const real_t *p, const int e,
 extern "C" {
 
 // ------------------------------------------------------------------------------------
-__global__ void
-fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
-          real_t *__restrict__ u2, const real_t *__restrict__ minv,
-          const real_t *__restrict__ cell,
+__global__ void fd_kernel(const real_t *__restrict__ u0,
+                          const real_t *__restrict__ u1,
+                          real_t *__restrict__ u2,
+                          const real_t *__restrict__ minv,
+                          const real_t *__restrict__ cell,
 #ifdef USE_DAMPING
-          const real_t *__restrict__ damping, const real_t dt,
+                          const real_t *__restrict__ damping, const real_t dt,
 #endif
-          const int cs, AXIS_PARAMS) {
+                          const int cs, AXIS_PARAMS) {
   INTERIOR_OR_RETURN;
   AXIS_GEOM;
 
