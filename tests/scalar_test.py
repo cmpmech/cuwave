@@ -277,7 +277,14 @@ class BlockedTest(unittest.TestCase):
                 self.assertIsNone(each.define_blocked_step(mat, source, taken))
         # fields L2 serves, past the waves launches bound: the plain step's ground
         middle = ScalarWave(
-            (1024, 1024), (0.1, 0.1), 6, 1e-3, (4, 32), wavespeed=1.0, density=1.0
+            (1024, 1024),
+            (0.1, 0.1),
+            6,
+            1e-3,
+            (4, 32),
+            space_order=4,
+            wavespeed=1.0,
+            density=1.0,
         )
         self.assertIsNone(middle.define_blocked_step(mat, source, None))
 

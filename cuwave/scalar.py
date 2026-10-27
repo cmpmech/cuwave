@@ -53,6 +53,8 @@ SMALL_BLOCKS = (
 )
 LARGE_BLOCKS = (((64, 64), 16, 6), ((64, 64), 16, 4))  # by radius, fields past L2
 LARGE_SMS = (0, 64)  # by radius, the multiprocessors from which the large tier pays
+MIDDLE_WAVES = (9, 0)  # by radius, the waves of threads below which it pays in L2 too
+LARGE_L2 = 1.4  # the multiple of L2 past which DRAM bounds the plain step
 SMALL_WAVES = (2, 1.25)  # by radius, the waves of resident threads launches bound
 MARCHED_BLOCK = ((32, 32), 4, 64)  # 3D order 2: (tile in the plane, steps, planes)
 STREAM_ORDER = 6  # below it L1 serves the plain step as well as the stream would
@@ -307,9 +309,9 @@ class PressureWave(Simulation):
                 ),
             )
         elif (
-            16 * nodes > device["L2CacheSize"]
-            and device["MultiProcessorCount"] >= LARGE_SMS[radius - 1]
-        ):
+            16 * nodes > LARGE_L2 * device["L2CacheSize"]
+            or nodes <= MIDDLE_WAVES[radius - 1] * resident
+        ) and device["MultiProcessorCount"] >= LARGE_SMS[radius - 1]:
             # a power-capped mobile GPU, few multiprocessors, cannot afford the halo
             block = LARGE_BLOCKS[radius - 1]
         else:
