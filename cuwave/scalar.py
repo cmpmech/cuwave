@@ -197,6 +197,8 @@ class PressureWave(Simulation):
             if len(cp.unique(flat)) != len(flat):
                 return None
             return self._define_folded(kernels, mat, source.position)
+
+        # below 3D the step writes the ghosts, then the excitation launches
         points = source.position.get()
         mirrors = (points == 2) | (points == np.asarray(self.Nx)[:, None] - 3)
         if mirrors.any():
@@ -219,6 +221,8 @@ class PressureWave(Simulation):
         """The 3D step with the sources at `position` folded in, listed per thread block, or none."""
         fd_kernel = kernels.get_function("fd_kernel")
         grid, block = grid_block(self)
+
+        # an empty list of one-entry placeholders unless there are sources
         lists = [cp.zeros(1, dtype=cp.int32), cp.zeros(1, dtype=self.dtype)]
         lists.append(cp.zeros(1, dtype=cp.int32))
         starts = np.zeros(math.prod(grid) + 1, dtype=np.int32)
@@ -235,6 +239,8 @@ class PressureWave(Simulation):
             lists = [flat[order], weights[order], order.astype(cp.int32)]
             starts[1:] = np.cumsum(np.bincount(owner, minlength=len(starts) - 1))
             num = position.shape[1]
+
+        # the step's arguments, then the signal, its row offset and the list
         args = [None, None, None, *self.step_kernel_args(mat)]
         args += axis_geometry(self, self.step_factors())
         args += [lists[1], np.int32(0), cp.asarray(starts), *lists]
