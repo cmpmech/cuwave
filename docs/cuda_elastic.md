@@ -13,7 +13,7 @@ The forward kernels of the staggered [elastic](elastic.md) equation: one pass fo
 | `STENCIL_RADIUS` | `space_order // 2` | taps per staggered difference, prepended by [stencils](stencils.md) |
 | `STAG_COEFFS` | `staggered_weights` | the graded coefficient table, prepended alongside |
 | `TILE0`, `TILE1`, `TILE2` | `FUSED_TILE`, by `ElasticWave.define_step` without a pml where the fields spill out of L2 and the ring at most doubles the tile | compiles `fused_kernel`, the tile one block steps |
-| `STEPS`, `TILE0`, `TILE1`, `ROWS` | `BLOCKED`, by `ElasticWave.define_blocked_step` in 2D without a pml on a small grid | compiles `blocked_kernel` instead of `fused_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
+| `STEPS`, `TILE0`, `TILE1`, `ROWS` | `BLOCKED` or `LARGE_BLOCKED`, by `ElasticWave.define_blocked_step` in 2D without a pml, on a small grid or past L2 | compiles `blocked_kernel` instead of `fused_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
 
 `NPAIRS` is $\textrm{ndim}\left(\textrm{ndim}-1\right)/2$ and `NVOIGT` is `NDIM + NPAIRS`, the stress components held back to back in the `sigma` scratch. `SG_W(r, k)` reads coefficient $k$ of the radius-$r$ row from `__constant__` memory, collapsing to 1 at `STENCIL_RADIUS` 1. `PAIR_ROW(k, l)` maps an axis pair onto its Voigt row, `NDIM + 3 - k - l` in 3D and 2 in 2D
 
@@ -221,7 +221,7 @@ a 2D launch of `(TILE1, ROWS)` threads per block, one block per tile of `TILE0` 
 - per step the stresses of the tile go to shared memory, a barrier, then the update of both components, a barrier; a component the update skips (its own axis' staggered ghost) and every non-interior node keep their value of two steps back, as the plain buffers do
 - the edge nodes of a tile read the guard ring and go wrong, one reach deeper every step; after `STEPS` steps the error stops short of the core
 - the damped update is rounded as nvcc compiles `fd_kernel`'s, $\Delta t\,\beta$ fused into $1\mp\beta$ with $\beta$ held over $\Delta t$, and the source term rounded apart as `excitation_kernel` adds it
-- a block steps a node a thread: on the small grids it serves, a step is bound by the latency of one tile's stresses and update, which several nodes a thread would serialize
+- on a small grid a block steps a node a thread, since a step there is bound by the latency of one tile's stresses and update, which several nodes a thread would serialize; past L2 two nodes a thread on a wider tile trade that latency for the halo's traffic
 
 ### excitation_kernel
 From the shared prelude, so this file does not carry it; see [cuda_scalar](cuda_scalar.md). A vector source is `NDIM` entries of `lin_index`, one per component, at `d * cs + idx`, so the `atomicAdd` covers a source and a sensor landing on the same point and component

@@ -1055,8 +1055,7 @@ def simulate(
         if um is not None:
             get_signal(u, um, t)
 
-    # several steps a launch where the simulation has a blocked step for this run and
-    # the memory for its second pair of fields
+    # several steps a launch where there is a blocked step and memory for its pair
     blocked = None
     if record_every is None and not active():
         blocked = sim.define_blocked_step(mat, source, sensors)

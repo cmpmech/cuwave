@@ -49,6 +49,7 @@ FUSED_TILE = ((16, 32), (4, 8, 32))  # in 2D, 3D: the fused step's tile, a threa
 # by radius, candidates (tile, thread rows, steps) a node a thread: the fewest waves
 BLOCKED = ((((32, 32), 32, 6), ((32, 32), 32, 4)), (((32, 32), 32, 2),))
 BLOCKED_WAVES = (4, 1)  # by radius, the waves of tiles the blocked step pays to
+LARGE_BLOCKED = (((32, 64), 16, 4), None)  # by radius, for fields well past L2
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -218,8 +219,7 @@ class ElasticWave(Simulation):
 
     def _define_pair(self, kernels: cp.RawModule, mat: dict, adjoint: bool) -> Callable:
         """The stress and update launches, a pml folded into both; fused past L2 without one."""
-        # one launch where DRAM bounds the pair (u three times, the stresses, the
-        # design) and the ring at most doubles the stresses formed
+        # one launch where DRAM bounds the pair and the ring at most doubles the stresses
         device = cp.cuda.Device().attributes
         nodes = math.prod(self.Nx)
         fields = (3 * self.ndim + self.nvoigt + 1) * nodes * self.dtype().itemsize
@@ -287,11 +287,12 @@ class ElasticWave(Simulation):
         Each thread block loads a tile of both components with a halo of as many strain
         and divergence reaches as it takes steps, forms the stresses and steps the tile
         in shared memory and writes back its core: bitwise the pair, the excitation and
-        the record launched one by one. Taken where launches bound the pair: the
+        the record launched one by one. Taken where launches bound the pair (the
         candidate of `BLOCKED` with the fewest waves of tiles, while those stay within
-        `BLOCKED_WAVES`; else None, as in 1D and 3D, in float64, above order 4, with a
-        pml, a source on a point the step holds, a sensor off the interior, or two
-        sources or sensors on one point.
+        `BLOCKED_WAVES`) or DRAM does (`LARGE_BLOCKED`, order 2, fields past 2.25 times
+        L2); else None, as in 1D and 3D, in float64, above order 4, with a pml, a source
+        on a point the step holds, a sensor off the interior, or two sources or sensors
+        on one point.
         """
         radius = self.radius
         if (
@@ -303,7 +304,7 @@ class ElasticWave(Simulation):
         ):
             return None
 
-        # launches bound the pair while its tiles fill few waves of multiprocessors
+        # launches bound a grid of few waves of tiles, DRAM one whose fields pass L2
         device = cp.cuda.Device().attributes
         sms = device["MultiProcessorCount"]
         reach = 2 * radius - 1
@@ -311,9 +312,18 @@ class ElasticWave(Simulation):
             -(-math.prod(tile_counts(self.Nx, b[0], b[2] * reach)) // sms)
             for b in BLOCKED[radius - 1]
         ]
-        if min(waves) > BLOCKED_WAVES[radius - 1]:
+        fields = (3 * self.ndim + self.nvoigt + 1) * math.prod(self.Nx) * 4
+
+        # the candidate, then a core and a halo as wide as its steps reach
+        if min(waves) <= BLOCKED_WAVES[radius - 1]:
+            block = BLOCKED[radius - 1][waves.index(min(waves))]
+        elif fields > 2.25 * device["L2CacheSize"]:
+            block = LARGE_BLOCKED[radius - 1]
+        else:
+            block = None
+        if block is None:
             return None
-        tile, rows, steps = BLOCKED[radius - 1][waves.index(min(waves))]
+        tile, rows, steps = block
         halo = steps * reach
         core = [t - 2 * halo for t in tile]
         cores = tile_counts(self.Nx, tile, halo)

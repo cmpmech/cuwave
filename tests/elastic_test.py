@@ -542,6 +542,7 @@ class BlockedTest(unittest.TestCase):
             ((32, 32), 32, 3),
             ((32, 64), 8, 4),
             ((32, 32), 16, 2),
+            ((32, 64), 16, 4),
         )
         for order, block in [(o, b) for o in (2, 4) for b in blocks]:
             if min(block[0]) - 2 * block[2] * (order - 1) < 8:
