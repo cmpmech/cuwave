@@ -57,6 +57,7 @@ BLOCKED_WAVES = (2, 1)  # by radius, the waves of tiles the blocked step pays to
 LARGE_BLOCKED = (((32, 128), 8, 6), ((32, 128), 8, 2))  # by radius, past those waves
 LARGE_L2 = (1, 2.25)  # by radius, the multiple of L2 past which it pays
 LARGE_SMS = (64, None)  # by radius, the multiprocessors from which it pays in L2
+PAST_SMS = (0, 64)  # by radius, the multiprocessors from which it pays past LARGE_L2
 FUSED_TILE = ((16, 32), (4, 8, 32))  # in 2D, 3D: the fused step's tile, a thread each
 FUSED_SMS = (0, 64)  # in 2D, 3D: the multiprocessors from which the ring's curl pays
 
@@ -365,9 +366,9 @@ class MaxwellWave(Simulation):
         memory and writes back its core: bitwise the pair, the excitation and the record
         launched one by one. Taken where launches bound the pair (the candidate of
         `BLOCKED` with the fewest waves of tiles, while those stay within
-        `BLOCKED_WAVES`) and past them where the fields pass `LARGE_L2` times L2 or,
-        at order 2, from `LARGE_SMS` multiprocessors (`LARGE_BLOCKED`), where it beats
-        the fused launch too; else None, as in 3D, in float64, above order 4, with a pml or
+        `BLOCKED_WAVES`) and past them where the fields pass `LARGE_L2` times L2 (at
+        order 4 from `PAST_SMS` multiprocessors) or, at order 2, from `LARGE_SMS`
+        multiprocessors (`LARGE_BLOCKED`), where it beats the fused launch too; else None, as in 3D, in float64, above order 4, with a pml or
         a designed permeability, a source on a point the step holds, a sensor off the
         interior, or two sources or sensors on one point.
         """
@@ -394,9 +395,10 @@ class MaxwellWave(Simulation):
         # the candidate, then a core and a halo as wide as its steps reach
         if min(waves) <= BLOCKED_WAVES[radius - 1]:
             block = BLOCKED[radius - 1][waves.index(min(waves))]
-        elif fields > LARGE_L2[radius - 1] * device["L2CacheSize"] or (
-            LARGE_SMS[radius - 1] is not None and sms >= LARGE_SMS[radius - 1]
-        ):
+        elif (
+            fields > LARGE_L2[radius - 1] * device["L2CacheSize"]
+            and sms >= PAST_SMS[radius - 1]
+        ) or (LARGE_SMS[radius - 1] is not None and sms >= LARGE_SMS[radius - 1]):
             block = LARGE_BLOCKED[radius - 1]
         else:
             block = None
