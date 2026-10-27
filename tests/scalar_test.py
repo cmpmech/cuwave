@@ -12,6 +12,8 @@ A 2D float32 run on a small or a DRAM-bound grid advances several steps a launch
 (`define_blocked_step`), the excitation, the ghost refill and the record inside the tile.
 It claims the plain run bit for bit, so it is compared with `array_equal` over orders,
 boundaries, damping, inertia, tiles, step counts and sources and sensors on the wall.
+A 2D run past L2 marches runs of columns along axis 0 with the same claim, checked on
+runs and chunks small enough that a test grid holds many, the last of each one node.
 A 3D order-2 run past L2 marches columns of tiles along axis 0 with the same claim,
 checked on a grid whose last tile and last chunk of planes hold one node each.
 """
@@ -287,6 +289,81 @@ class BlockedTest(unittest.TestCase):
             density=1.0,
         )
         self.assertIsNone(middle.define_blocked_step(mat, source, None))
+
+
+def _shot_walls(sim, seed):
+    """A source beside each wall and a corner, sensors along the walls and inside."""
+    n = sim.Nx
+    signal = np.random.default_rng(seed).standard_normal((sim.N, 6))
+    position = [[2, n[0] // 2, n[0] - 3, n[0] // 3, 1, n[0] // 2]]
+    position += [[n[1] // 3, 2, n[1] // 2, n[1] - 3, 1, n[1] // 2]]
+    near = [[a, 3] for a in range(1, 9)] + [[1, n[1] - 2], [n[0] - 2, 1]]
+    sensors = np.array(near + [[n[0] - 2, n[1] - 2], [n[0] // 2, 40]]).T
+    source = Source(cp.array(position, dtype=cp.int32), cp.asarray(signal, sim.dtype))
+    return source, _random(sim, seed)[0], cp.array(sensors, dtype=cp.int32)
+
+
+def _marched_runs(sim, seed, rows):
+    """The (field, record) of a 2D run marched in `rows`, then of the plain run."""
+    source, indicator, sensors = _shot_walls(sim, seed)
+    with mock.patch.multiple(scalar, MARCHED_ROWS=rows, LARGE_L2=0):
+        mat = sim.build_materials(indicator)
+        assert sim._define_marched_rows(mat, source, sensors) is not None
+        marched = simulate(sim, source, indicator, sensors=sensors)
+    with mock.patch.object(type(sim), "define_blocked_step", lambda *a, **k: None):
+        plain = simulate(sim, source, indicator, sensors=sensors)
+    return marched, plain
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class MarchedRowsTest(unittest.TestCase):
+    ROWS = ((64, 4, 16), (64, 3, 16))  # runs and chunks a test grid holds many of
+
+    def _assert_bitwise(self, marched, plain):
+        self.assertGreater(float(cp.abs(plain[0]).max()), 0.0)
+        for a, b in zip(marched, plain):
+            self.assertTrue(bool(cp.array_equal(a, b)))
+
+    def test_a_marched_run_is_the_plain_run_bit_for_bit(self):
+        mixed = ((Neumann, Dirichlet), (Dirichlet, Neumann))
+        for order in (2, 4):
+            for boundary in (None, Dirichlet, mixed):
+                for N in (5, 61):
+                    with self.subTest(order=order, boundary=boundary, N=N):
+                        sim = _scalar(order, "float32", boundary, N=N, Nx=(301, 257))
+                        self._assert_bitwise(*_marched_runs(sim, order, self.ROWS))
+
+    def test_a_last_run_and_chunk_of_one_node(self):
+        # cores of 56 columns and chunks of 16 rows: the last of each holds one node
+        sim = _scalar(2, "float32", Dirichlet, N=24, Nx=(147, 115))
+        self._assert_bitwise(*_marched_runs(sim, 5, self.ROWS))
+
+    def test_the_damped_update_and_a_formed_inertia(self):
+        for order in (2, 4):
+            sim = AcousticWave(
+                (301, 257),
+                (0.1, 0.1),
+                40,
+                1e-5,
+                (4, 32),
+                space_order=order,
+                rho1=1.2,
+                rho2=2600.0,
+                kappa1=1.4e5,
+                kappa2=6.9e8,
+            )
+            damped = replace(sim, damping=sponge(sim, _random(sim, 7)[0], 30, 0.1))
+            for each in (sim, damped):
+                with self.subTest(order=order, damped=each.damping is not None):
+                    self._assert_bitwise(*_marched_runs(each, 7, self.ROWS))
+
+    def test_a_sensor_on_a_ghost_takes_the_tiles(self):
+        sim = _scalar(2, "float32", N=6, Nx=(301, 257))
+        source, indicator, sensors = _shot(sim, 8)
+        mat = sim.build_materials(indicator)
+        with mock.patch.object(scalar, "LARGE_L2", 0):
+            self.assertIsNone(sim._define_marched_rows(mat, source, sensors))
+            self.assertIsNotNone(sim.define_blocked_step(mat, source, sensors))
 
 
 def _scalar3d(boundary, N, Nx=(259, 243, 243)):

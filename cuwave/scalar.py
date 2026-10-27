@@ -57,6 +57,7 @@ MIDDLE_WAVES = (9, 0)  # by radius, the waves of threads below which it pays in 
 LARGE_L2 = 1.4  # the multiple of L2 past which DRAM bounds the plain step
 SMALL_WAVES = (2, 1.25)  # by radius, the waves of resident threads launches bound
 MARCHED_BLOCK = ((32, 32), 4, 64)  # 3D order 2: (tile in the plane, steps, planes)
+MARCHED_ROWS = ((256, 12, 128), (256, 6, 128))  # 2D by radius: (columns, steps, rows)
 STREAM_ORDER = 6  # below it L1 serves the plain step as well as the stream would
 STREAM_BLOCKS = 8  # per multiprocessor the stream needs to fill the device
 
@@ -85,6 +86,37 @@ def _column_lists(
     entries = np.stack([plane[order], hits.j[order]], axis=1).astype(np.int32)
     columns = cores[0] * cores[1] * tile[0] * tile[1]
     starts = np.searchsorted(keys[order], np.arange(columns + 1))
+    return [cp.asarray(starts, dtype=cp.int32), cp.asarray(entries)]
+
+
+def _run_lists(
+    points: npt.NDArray[np.int64],
+    columns: int,
+    core: int,
+    halo: int,
+    runs: int,
+    covering: bool,
+) -> list[cpt.NDArray]:
+    """The points each column of a 2D marched run holds: CSR starts, (row, j) entries by row.
+
+    Args:
+        points: (2, num) grid indices.
+        columns: columns of a run, halo included.
+        core: columns of a run's core.
+        halo: columns each side between a run's edge and its core.
+        runs: runs along axis 1.
+        covering: every run whose columns take a point, else the one whose core does.
+    """
+    start = 1 + np.arange(runs)[:, None] * core - halo
+    if covering:
+        hit = (points[1] >= start) & (points[1] < start + columns)
+    else:
+        hit = (points[1] - 1) // core == np.arange(runs)[:, None]
+    b, j = np.nonzero(hit)
+    keys = b * columns + points[1][j] - start[b, 0]
+    order = np.lexsort((points[0][j], keys))
+    entries = np.stack([points[0][j][order], j[order]], axis=1).astype(np.int32)
+    starts = np.searchsorted(keys[order], np.arange(runs * columns + 1))
     return [cp.asarray(starts, dtype=cp.int32), cp.asarray(entries)]
 
 
@@ -276,7 +308,8 @@ class PressureWave(Simulation):
         takes steps, steps it in shared memory, refills its ghosts there and writes back
         its core: bitwise the step, excitation, refill and record launched one by one.
         Taken where launches or DRAM bound the plain step (`SMALL_BLOCKS`,
-        `LARGE_BLOCKS`). In 3D see `_define_marched_step`. None in 1D, in float64, above
+        `LARGE_BLOCKS`); past L2 the march of `_define_marched_rows` first. In 3D see
+        `_define_marched_step`. None in 1D, in float64, above
         order 4, with a pml, a domain mask, a condition other than Neumann or Dirichlet,
         a source off the interior, two sources or sensors on one node, or an axis of
         fewer than 4 nodes.
@@ -298,7 +331,11 @@ class PressureWave(Simulation):
         # launches bound a grid of a wave or two of threads, DRAM one whose fields pass L2
         device = cp.cuda.Device().attributes
         resident = device["MultiProcessorCount"] * device["MaxThreadsPerMultiProcessor"]
-        nodes = math.prod(self.Nx)
+        nodes = math.prod(map(int, self.Nx))  # a caller may pass numpy int32
+        if 16 * nodes > LARGE_L2 * device["L2CacheSize"]:
+            marched = self._define_marched_rows(mat, source, sensors)
+            if marched is not None:
+                return marched
         if nodes <= SMALL_WAVES[radius - 1] * resident:
             # one tile a multiprocessor at a time: the candidate with the fewest waves
             sms = device["MultiProcessorCount"]
@@ -377,7 +414,7 @@ class PressureWave(Simulation):
         """
         # L2 serves the plain step's fields up to about one and a half times its size
         device = cp.cuda.Device().attributes
-        nodes = math.prod(self.Nx)
+        nodes = math.prod(map(int, self.Nx))  # a caller may pass numpy int32
         if self.space_order != 2 or 16 * nodes <= 1.5 * device["L2CacheSize"]:
             return None
         tile, steps, planes = MARCHED_BLOCK
@@ -447,6 +484,84 @@ class PressureWave(Simulation):
         args += [face_mask(self, Dirichlet), *axis_geometry(self, self.step_factors())]
         args += [None, np.int32(cores[1])]
         return blocked_launches(steps, launches, tile[::-1], shared, args, slots)
+
+    def _define_marched_rows(
+        self, mat: dict, source: Source, sensors: cpt.NDArray[cp.int32] | None
+    ) -> Blocked | None:
+        """The 2D step marching runs of columns along axis 0, excitation and record included, else None.
+
+        Each thread block marches a chunk of rows of a run of columns with a halo as
+        wide as the steps reach, each step a stencil radius behind the one before, so u
+        of a row is loaded and stored once a launch (`MARCHED_ROWS`): bitwise the step,
+        excitation, refill and record launched one by one. None on what
+        `define_blocked_step` refuses, or a sensor off the interior.
+        """
+        radius = self.space_order // 2
+        columns, steps, rows = MARCHED_ROWS[radius - 1]
+        halo = steps * radius
+        core = columns - 2 * halo
+        runs = -(-(self.Nx[1] - 2) // core)
+        chunks = -(-(self.Nx[0] - 2) // rows)
+        # u of every step on radius + 1 rows, the stiffness on two
+        shared = ((radius + 1) * steps + 2) * (columns + 2 * radius) * 4
+        if runs >= 2**16 or chunks >= 2**15:
+            return None  # the block list packs 16 bits a run and 15 a chunk
+
+        # sources and sensors in the interior, no node holding two of either
+        sources = flatten_indices(self, source.position)
+        targets = flatten_indices(self, sensors) if sensors is not None else sources[:0]
+        flat = [index.get() for index in (sources, targets)]
+        points = [np.stack(np.divmod(f, self.Nx_padded[1])) for f in flat]
+        upper = np.asarray(self.Nx)[:, None] - 2
+        for point, index in zip(points, flat):
+            inside = ((point >= 1) & (point <= upper)).all()
+            if not inside or len(np.unique(index)) != len(index):
+                return None
+
+        # a column's sources wherever its run reaches, its sensors where its core does
+        lists = []
+        for point, covering in zip(points, (True, False)):
+            lists += _run_lists(point, columns, core, halo, runs, covering)
+
+        # blocks whose valid rows and columns tap no ghost
+        b0, b1 = np.meshgrid(np.arange(chunks), np.arange(runs), indexing="ij")
+        first = 1 + np.arange(chunks) * rows
+        last = np.minimum(first + rows, self.Nx[0] - 1)
+        start = 1 + np.arange(runs) * core - halo
+        rows_clear = (first >= 2 * halo + 1) & (last + halo <= self.Nx[0] - 1)
+        columns_clear = (start >= 1) & (start + columns + 2 <= self.Nx[1])
+        clear = rows_clear[b0] & columns_clear[b1]
+
+        # and of a source's reach and a sensor of the core
+        spans = ((0, columns), (halo, halo + core))
+        for point, reach, span in zip(points, (halo, 0), spans):
+            row, column = point[0][:, None], point[1][:, None]
+            near = (row >= first - reach) & (row < last + reach)
+            touched = (column >= start + span[0]) & (column < start + span[1])
+            clear &= ~(near[:, :, None] & touched[:, None, :]).any(0)
+        packed = b0 << 16 | b1
+
+        # each kind of block its kernel and its list
+        flags = (f"-DSTEPS={steps}", f"-DTILE1={columns}", f"-DPLANES={rows}")
+        launches = []
+        for kind in (True, False):
+            if not (clear == kind).any():
+                continue
+            extra = ("-DINTERIOR",) if kind else ()
+            kernels = compile_kernels(self, flags=flags + extra)
+            kernel = kernels.get_function("blocked_kernel")
+            kernel.max_dynamic_shared_size_bytes = shared
+            blocks = cp.asarray(packed[clear == kind], dtype=cp.int32)
+            launches.append((kernel, (len(blocks),), blocks))
+
+        # the arguments both share, the pointers swapped per launch
+        weights = self.excitation_weights(mat, sources)
+        args = [None, None, None, None, *self.step_kernel_args(mat), None, weights]
+        args += [np.int32(len(sources)), None, np.int32(len(targets)), *lists, None]
+        slots = LaunchSlots(len(args) - 10, len(args) - 7, len(args) - 1, len(args) + 6)
+        args += [face_mask(self, Dirichlet), *axis_geometry(self, self.step_factors())]
+        args += [None]
+        return blocked_launches(steps, launches, (columns,), shared, args, slots)
 
     def step_kernel_args(self, mat: dict) -> tuple:
         """Material and damping arguments for the finite-difference step kernel."""

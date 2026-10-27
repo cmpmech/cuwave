@@ -5,6 +5,7 @@
 //   USE_DOMAIN
 //   USE_STREAM, STREAM_TX
 //   STEPS, TILE0, TILE1, ROWS (2D)
+//   STEPS, TILE1, PLANES (2D marched)
 //   STEPS, TILE1, TILE2, PLANES, INTERIOR (3D, order 2)
 
 // spatial finite difference stencil for Laplacian, `u(j)` the tap j nodes on
@@ -418,7 +419,7 @@ __global__ void homogeneous_dirichlet_kernel(real_t *__restrict__ u,
 }
 
 #ifdef STEPS
-#if NDIM == 2
+#if NDIM == 2 && !defined(PLANES)
 // ------------------------------------------------------------------------------------
 // the core a tile writes back, its halo STEPS stencil radii wide
 #define HALO (STEPS * STENCIL_RADIUS)
@@ -616,6 +617,262 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
       v0[a0 * s0 + a1] = up[k];
       v1[a0 * s0 + a1] = uc[k];
     }
+  }
+}
+#elif NDIM == 2
+// ------------------------------------------------------------------------------------
+// the core a run of columns writes back, its halo as wide as the steps reach
+#define HALO (STEPS * STENCIL_RADIUS)
+#define C1 (TILE1 - 2 * HALO)
+#define WIDE (TILE1 + 2 * STENCIL_RADIUS) // a row with its guard columns
+#define DEPTH (2 * STENCIL_RADIUS + 1)    // the rows a step's taps span
+#define SLOTS (STENCIL_RADIUS + 1)        // the rows a step's row waits
+#ifdef INTERIOR
+#define WALLS 0 // a march clear of the walls, the sources and the sensors
+#else
+#define WALLS 1
+#endif
+
+// march a run of columns along axis 0, step k k radii behind the row loaded:
+// the step, excitation, refill and record, bitwise the plain launches
+__global__ void __launch_bounds__(TILE1)
+    blocked_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
+                   real_t *__restrict__ v0, real_t *__restrict__ v1,
+                   const real_t *__restrict__ stiff,
+                   const real_t *__restrict__ minv, const int derive_inertia,
+#ifdef USE_DAMPING
+                   const real_t *__restrict__ damping, const real_t dt,
+#endif
+                   const real_t *__restrict__ signal,
+                   const real_t *__restrict__ weights, const int num_sources,
+                   real_t *__restrict__ record, const int num_sensors,
+                   const int *__restrict__ source_starts,
+                   const int2 *__restrict__ source_entries,
+                   const int *__restrict__ sensor_starts,
+                   const int2 *__restrict__ sensor_entries, const int t0,
+                   const int dirichlet, const real_t f0, const int N0,
+                   const real_t f1, const int N1, const int s0,
+                   const int *__restrict__ blocks) {
+  // u of steps 0 .. STEPS - 1 on SLOTS rows each, the stiffness on two
+  extern __shared__ real_t shared[];
+  real_t *su = shared, *ss = shared + SLOTS * STEPS * WIDE;
+  const int tx = threadIdx.x, i = tx + STENCIL_RADIUS;
+  const int block = blocks[blockIdx.x]; // chunk << 16 | run
+  const int run = block & 0xffff, lo1 = 1 + run * C1, a1 = lo1 - HALO + tx;
+  const int first = 1 + (block >> 16) * PLANES;
+  const int last = min(first + PLANES, N0 - 1);
+  const bool col = !WALLS || a1 >= 0 && a1 <= N1 - 1;
+  const bool inner = !WALLS || a1 > 0 && a1 < N1 - 1;
+  const bool side = WALLS && col && !inner; // a ghost column
+  const int k1 = owner(a1, N1);
+  const bool owned = col && k1 >= lo1 && k1 < lo1 + C1;
+  // the face ghost this column mirrors, if the tile holds it, and its sign
+  const int mirror = !WALLS || !inner                 ? 0
+                     : a1 == 2 && tx >= 2             ? -2
+                     : a1 == N1 - 3 && tx + 2 < TILE1 ? 2
+                                                      : 0;
+  const bool flip = dirichlet >> (mirror < 0 ? 2 : 3) & 1;
+  const bool low = dirichlet & 1, high = dirichlet & 2;
+
+  // the column's sources and sensors by row, from the march's first: `se` the
+  // first a step still adds, `sz` the first past the row loaded
+  const int key = run * TILE1 + tx;
+  int se = WALLS ? source_starts[key] : 0, re = WALLS ? sensor_starts[key] : 0;
+  const int se_end = WALLS ? source_starts[key + 1] : 0;
+  const int re_end = WALLS ? sensor_starts[key + 1] : 0;
+  while (se < se_end && source_entries[se].x < first - HALO)
+    ++se;
+  while (re < re_end && sensor_entries[re].x < first)
+    ++re;
+  int sz = se, rz = re;
+  unsigned sourced = 0, sensed = 0; // bit n: the row n back holds one
+
+  for (int e = tx; e < SLOTS * STEPS * WIDE; e += TILE1)
+    su[e] = 0;
+  for (int e = tx; e < 2 * WIDE; e += TILE1)
+    ss[e] = 1;
+  __syncthreads(); // before the first row lands in them
+  // u^k on rows z - k R - 2 R .. z - k R, u^-1 on z - R .. z, the axis-0 cell
+  // means from rows z - HALO - 1 on, 1 / m and the axis-1 means from z - 1 on
+  real_t Q[STEPS][DEPTH], P[STENCIL_RADIUS + 1], G[HALO + 1], MI[HALO];
+  real_t M[HALO][2];
+#pragma unroll
+  for (int k = 0; k < STEPS; ++k)
+#pragma unroll
+    for (int n = 0; n < DEPTH; ++n)
+      Q[k][n] = 0;
+#pragma unroll
+  for (int n = 0; n <= STENCIL_RADIUS; ++n)
+    P[n] = 0;
+#pragma unroll
+  for (int n = 0; n < HALO; ++n) {
+    G[n] = 1;
+    MI[n] = 0;
+    M[n][0] = M[n][1] = 1;
+  }
+  G[HALO] = 1;
+  real_t sprev = 1;
+
+  const int end = last + HALO;
+  int z = first - HALO, slot = 0; // this row's u at slot, the one read next
+  bool load = col && z >= 0;
+  real_t nu0 = load ? u0[z * s0 + a1] : 0, nu1 = load ? u1[z * s0 + a1] : 0;
+  real_t ns = load ? stiff[z * s0 + a1] : (real_t)1;
+  real_t nm = load && !derive_inertia ? minv[z * s0 + a1] : 0;
+  for (; z < end; ++z) {
+    // this row, the next one fetched behind it
+    const real_t lu0 = nu0, lu1 = nu1, ls = ns, lm = nm;
+    real_t *ssz = ss + (z & 1) * WIDE;
+    ssz[i] = ls;
+    load = col && (!WALLS || z + 1 >= 0 && z + 1 <= N0 - 1) && z + 1 < end;
+    const int ahead = (z + 1) * s0 + a1;
+    nu0 = load ? u0[ahead] : 0;
+    nu1 = load ? u1[ahead] : 0;
+    ns = load ? stiff[ahead] : (real_t)1;
+    nm = load && !derive_inertia ? minv[ahead] : 0;
+    __syncthreads();
+
+    // what nothing steps keeps through the launch: a corner
+    if (WALLS && side && (z == 0 || z == N0 - 1) && owned) {
+      const int kz = owner(z, N0);
+      if (kz >= first && kz < last) {
+        v0[z * s0 + a1] = STEPS % 2 ? lu1 : lu0;
+        v1[z * s0 + a1] = STEPS % 2 ? lu0 : lu1;
+      }
+    }
+    sourced <<= 1;
+    sensed <<= 1;
+    if (sz < se_end && source_entries[sz].x == z) {
+      sourced |= 1;
+      ++sz;
+    }
+    if (rz < re_end && sensor_entries[rz].x == z) {
+      sensed |= z < last;
+      ++rz;
+    }
+
+    // the row's cell means, harmonic as flux_divergence_axis forms them
+    const real_t mz0 = ls * ssz[i - 1] / (ls + ssz[i - 1]);
+    const real_t mz1 = ls * ssz[i + 1] / (ls + ssz[i + 1]);
+#pragma unroll
+    for (int n = 0; n < DEPTH - 1; ++n)
+      Q[0][n] = Q[0][n + 1];
+    Q[0][DEPTH - 1] = lu1;
+#pragma unroll
+    for (int n = 0; n < STENCIL_RADIUS; ++n)
+      P[n] = P[n + 1];
+    P[STENCIL_RADIUS] = lu0;
+#pragma unroll
+    for (int n = 0; n < HALO; ++n)
+      G[n] = G[n + 1];
+    G[HALO] = sprev * ls / (sprev + ls);
+    sprev = ls;
+
+    // step k on row z - k R from step k - 1 around it, the axis-1 taps from the
+    // row stored R rows back
+    const real_t *cur = su + (slot + 1) % SLOTS * STEPS * WIDE;
+    real_t *nxt = su + slot * STEPS * WIDE;
+    nxt[i] = lu1;
+#pragma unroll
+    for (int k = 1; k <= STEPS; ++k) {
+      const int q = z - k * STENCIL_RADIUS, n = k * STENCIL_RADIUS - 1;
+      const real_t uc = Q[k - 1][STENCIL_RADIUS];
+      real_t u = k == 1 ? P[0] : Q[k - 2][0]; // held where nothing steps
+      if (inner && (!WALLS || q > 0 && q < N0 - 1)) {
+        const real_t *cu = cur + (k - 1) * WIDE;
+        const auto along0 = [&](const int j) {
+          return Q[k - 1][STENCIL_RADIUS + j];
+        };
+        const auto along1 = [&](const int j) { return cu[i + j]; };
+        const real_t d0 =
+            flux_divergence_taps(along0, uc, G[HALO - n], G[HALO - n - 1], 1,
+                                 WALLS ? CLOSURE(q, N0) : STENCIL_RADIUS);
+        const real_t d1 =
+            flux_divergence_taps(along1, uc, M[n][1], M[n][0], 1,
+                                 WALLS ? CLOSURE(a1, N1) : STENCIL_RADIUS);
+        // one axis fused onto the other, as nvcc contracts fd_kernel's sum
+#if STENCIL_RADIUS == 1
+        const real_t laplacian = FMA_RN(f0, d0, MUL_RN(f1, d1));
+#else
+        const real_t laplacian = FMA_RN(f1, d1, MUL_RN(f0, d0));
+#endif
+        // the leapfrog rounded as nvcc compiles fd_kernel's
+#ifdef USE_DAMPING
+        const real_t beta = 0.5f * MI[n] * damping[q * s0 + a1]; // over dt
+        u = FMA_RN(MI[n], laplacian,
+                   FMA_RN(-u, FMA_RN(-dt, beta, 1.f), 2.f * uc)) /
+            FMA_RN(dt, beta, 1.f);
+#else
+        u = FMA_RN(MI[n], laplacian, 2.f * uc - u);
+#endif
+        if (WALLS && sourced >> (n + 1) & 1) {
+          int e = se;
+          while (source_entries[e].x != q)
+            ++e;
+          const int j = source_entries[e].y;
+          u += MUL_RN(weights[j],
+                      signal[(size_t)(t0 + k - 1) * num_sources + j]);
+        }
+        if (WALLS && sensed >> (n + 1) & 1) {
+          int e = re;
+          while (sensor_entries[e].x != q)
+            ++e;
+          record[(size_t)(t0 + k - 1) * num_sensors + sensor_entries[e].y] = u;
+        }
+
+        // the ghost columns' refill through the stored row, the last step's
+        // written back with the ghost rows'
+        if (k < STEPS) {
+          if (mirror)
+            nxt[k * WIDE + i + mirror] = flip ? -u : u;
+        } else if (owned && q >= first && q < last) {
+          const int idx = q * s0 + a1;
+          const real_t w = Q[STEPS - 1][STENCIL_RADIUS];
+          v0[idx] = w;
+          v1[idx] = u;
+          if (mirror) {
+            v0[idx + mirror] = flip ? -w : w;
+            v1[idx + mirror] = flip ? -u : u;
+          }
+          if (WALLS && q == 2) {
+            v0[a1] = low ? -w : w;
+            v1[a1] = low ? -u : u;
+          }
+          if (WALLS && q == N0 - 3) {
+            v0[(N0 - 1) * s0 + a1] = high ? -w : w;
+            v1[(N0 - 1) * s0 + a1] = high ? -u : u;
+          }
+        }
+      }
+
+      // the ghost rows' refill through the queue
+      if (k < STEPS) {
+        if (WALLS && inner && q == N0 - 1)
+          u = high ? -Q[k][DEPTH - 2] : Q[k][DEPTH - 2];
+#pragma unroll
+        for (int m = 0; m < DEPTH - 1; ++m)
+          Q[k][m] = Q[k][m + 1];
+        Q[k][DEPTH - 1] = u;
+        if (WALLS && inner && q == 2)
+          Q[k][DEPTH - 3] = low ? -u : u;
+        if (!side || q <= 0 || q >= N0 - 1)
+          nxt[k * WIDE + i] = u;
+      }
+    }
+    while (se < sz && source_entries[se].x <= z - HALO)
+      ++se;
+    while (re < rz && sensor_entries[re].x <= z - HALO)
+      ++re;
+#pragma unroll
+    for (int m = HALO - 1; m > 0; --m) {
+      MI[m] = MI[m - 1];
+      M[m][0] = M[m - 1][0];
+      M[m][1] = M[m - 1][1];
+    }
+    MI[0] = derive_inertia ? 1.f / ls : lm;
+    M[0][0] = mz0;
+    M[0][1] = mz1;
+    slot = slot == STENCIL_RADIUS ? 0 : slot + 1;
   }
 }
 #elif NDIM == 3 && STENCIL_RADIUS == 1

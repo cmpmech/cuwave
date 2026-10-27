@@ -221,7 +221,7 @@ class ElasticWave(Simulation):
         """The stress and update launches, a pml folded into both; fused past L2 without one."""
         # one launch where DRAM bounds the pair and the ring at most doubles the stresses
         device = cp.cuda.Device().attributes
-        nodes = math.prod(self.Nx)
+        nodes = math.prod(map(int, self.Nx))  # a caller may pass numpy int32
         fields = (3 * self.ndim + self.nvoigt + 1) * nodes * self.dtype().itemsize
         tile = FUSED_TILE[self.ndim - 2] if self.ndim >= 2 else ()
         ring = math.prod(t + self.space_order for t in tile)
@@ -312,7 +312,7 @@ class ElasticWave(Simulation):
             -(-math.prod(tile_counts(self.Nx, b[0], b[2] * reach)) // sms)
             for b in BLOCKED[radius - 1]
         ]
-        fields = (3 * self.ndim + self.nvoigt + 1) * math.prod(self.Nx) * 4
+        fields = (3 * self.ndim + self.nvoigt + 1) * math.prod(map(int, self.Nx)) * 4
 
         # the candidate, then a core and a halo as wide as its steps reach
         if min(waves) <= BLOCKED_WAVES[radius - 1]:

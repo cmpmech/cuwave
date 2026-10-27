@@ -105,7 +105,9 @@ pressure run (`simulate` only) takes `PressureWave.define_blocked_step`: tiles s
 several steps a launch in shared memory, the excitation, the Neumann/Dirichlet refill and
 the record inside the tile, launched through `march`'s graphs; only where launches
 (`SMALL_BLOCKS`, `SMALL_WAVES` waves of threads) or DRAM (`LARGE_BLOCKS`, fields past `LARGE_L2` times L2, at order 2 also inside it up to `MIDDLE_WAVES`) bound the
-plain step, at orders 2 and 4, without pml or mask. In 3D at order 2 (interior
+plain step, at orders 2 and 4, without pml or mask. Past `LARGE_L2` times L2 with
+interior sensors a 2D run marches first (`_define_marched_rows`, `MARCHED_ROWS`: runs of
+columns walking axis 0, step k k radii behind). In 3D at order 2 (interior
 sensors) the same call returns a marched step (`MARCHED_BLOCK`: columns of tiles walking
 axis 0, step k k planes behind) where the fields pass 1.5 times L2. Ghosts are written
 back by the tile whose core holds their mirror. The elastic stress and update pair

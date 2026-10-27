@@ -11,6 +11,7 @@
 | `-DUSE_DOMAIN`                | `sim.compile_flags`, once `Simulation.domain` is set  | launches `fd_kernel` over a tile list and grades the cells at the domain wall, two extra kernel parameters |
 | `-DUSE_STREAM`, `-DSTREAM_TX` | `sim.compile_flags`, where `PressureWave.streams` (a wide unmasked 2D stencil on a full grid) | compiles the streaming `fd_kernel` below instead of the per-thread one, its tile `STREAM_TX = threads[-1]` wide |
 | `-DSTEPS`, `-DTILE0`, `-DTILE1`, `-DROWS` | `PressureWave.define_blocked_step` in 2D, from `SMALL_BLOCKS` or `LARGE_BLOCKS` | compiles `blocked_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
+| `-DSTEPS`, `-DTILE1`, `-DPLANES`, `-DINTERIOR` | `PressureWave._define_marched_rows` in 2D past L2, from `MARCHED_ROWS` | compiles the 2D marched `blocked_kernel`: the steps a launch advances, the columns of a run, the rows a block marches, and under `-DINTERIOR` the variant without the walls, the sources and the sensors |
 | `-DSTEPS`, `-DTILE1`, `-DTILE2`, `-DPLANES`, `-DINTERIOR` | `PressureWave.define_blocked_step` in 3D, from `MARCHED_BLOCK` | compiles the 3D `blocked_kernel` (order 2): the steps a launch advances, the tile in the plane, the planes a block marches, and under `-DINTERIOR` the variant without the walls, the sources and the sensors |
 | `STENCIL_RADIUS`, `OP_COEFFS` | `stencils.preamble(space_order)`                                      | the radius $R$ and the cell-coefficient table                 |
 | `--use_fast_math`             | always                                                                |                                                               |
@@ -166,6 +167,21 @@ a 2D launch of `(TILE1, ROWS)` threads per block, one block per tile of `TILE0` 
 - the edge nodes of a tile read the guard ring and go wrong, one radius deeper every step; after `STEPS` steps the error stops short of the core
 - the laplacian, the update and $\beta$'s two divisors $1\mp\beta$ are rounded by `FMA_RN` and `MUL_RN` as nvcc contracts them in `fd_kernel` ($\Delta t\,d/2m$ fused into $1\mp\beta$, one axis fused onto the other), and the source term rounded apart as `excitation_kernel` adds it atomically
 - a ghost is written back by the tile whose core holds its mirror, the one tile where the mirror is valid after the last step; a core of one node beside the ghost would leave it to a tile that reads the mirror past its valid region, so the halo is at least 2
+
+### blocked_kernel (2D marched)
+`STEPS` steps of `fd_kernel` between one load and one store of every row, the excitation, the ghost refill and the record included, bitwise the launches one at a time; float32 only
+**parallelization**
+a 1D block of `TILE1` threads per run of columns, one thread a column, decoded from `blocks`: the runs along axis 1 times the chunks of `PLANES` rows along axis 0, split into two launches as in 3D, the blocks whose valid rows and columns tap no ghost and hold no source or sensor compiled `-DINTERIOR`. Runs overlap by a halo of `HALO` $=$ `STEPS` $\cdot R$ columns each side and write back their core of `C1`; a chunk marches `HALO` rows past each of its ends
+**input args**
+as the 3D `blocked_kernel`, the lists per column of every run and the entries `(row, source)`; `f0, N0, f1, N1, s0`: as `fd_kernel`; `blocks`: the launch's thread blocks, `chunk << 16 | run`
+**internal args**
+`su`: $u$ of steps $0$ to `STEPS` $-1$ on the `SLOTS` $=R+1$ rows each waits before the next step reads it, `ss`: the stiffness of the row loaded (twice), each row with $R$ guard columns; `Q`: $u^k$ of the thread's column on the `DEPTH` $=2R+1$ rows around the one step $k+1$ updates; `P`: $u^{-1}$ on the last $R+1$ rows; `G`: the axis-0 cell stiffnesses between the last `HALO` $+2$ rows; `MI`, `M`: $1/m$ and the two axis-1 cell stiffnesses on the last `HALO` rows; `sourced, sensed`: bit $n$ set where the row $n$ behind the one loaded holds a source or a sensor of the column
+**how?**
+- iteration $z$ loads row $z$, then step $k$ updates row $z-kR$ from step $k-1$ on rows $z-(k+1)R$ to $z-(k-1)R$, the axis-0 taps from the thread's registers, the last of them pushed by step $k-1$ the same iteration, and the axis-1 taps from the row that step stored $R$ iterations before, so one barrier per row separates the steps
+- a ghost column is refilled by its mirror's thread, which stores the signed value into the ghost's slot of the stored row and writes it back with the last step; a ghost row is refilled in the column's queue, from row 2 when it passes and from row $N_0-3$ when the ghost is pushed; corners keep their values, the two levels swapped with the parity of `STEPS`
+- at order 4 the stencil narrows beside a wall as in `fd_kernel` (`CLOSURE`), so a step's taps never pass the ghosts; the variant without walls takes the full radius everywhere
+- the edge columns of a run read the guard columns and the first and last rows of a chunk lack their neighbours; both errors spread one radius a step and stop short of the core
+- the rounding is the 2D `blocked_kernel`'s; per row and step it loads nothing but the next row, so past L2 it moves a tenth of the plain step's bytes at order 2, while a small grid leaves too few blocks to hide the latency of a row and keeps the tiles
 
 ### blocked_kernel (3D)
 `STEPS` steps of the order-2 `fd_kernel` between one load and one store of every plane, the excitation, the ghost refill and the record included, bitwise the launches one at a time; float32 only
