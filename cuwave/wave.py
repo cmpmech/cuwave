@@ -1046,13 +1046,24 @@ def simulate(
     fd_step = sim.define_step(kernels, mat)
     bc_step = define_boundary(sim, kernels)
     excitation_step = define_excitation(sim, source.position, kernels, mat)
-    folded = sim.define_folded_step(kernels, mat, source)
     windows = [Window(source.signal)]
     if sensors is not None:
         get_signal = define_get_signal(sim, sensors, kernels)
         um = cp.zeros((sim.N, sensors.shape[1]), dtype=sim.dtype)
         windows.append(Window(um, store=True))
     interior = (Ellipsis, *(slice(0, n) for n in sim.Nx))
+
+    # several steps a launch where there is a blocked step and memory for its pair
+    blocked = None
+    if record_every is None and not active():
+        blocked = sim.define_blocked_step(mat, source, sensors)
+    if blocked is not None:
+        try:
+            spare = cp.zeros_like(U)
+        except cp.cuda.memory.OutOfMemoryError:
+            blocked = None
+    # else the step, the excitation and the refill in fewer launches where it can
+    folded = sim.define_folded_step(kernels, mat, source) if blocked is None else None
 
     # U[t % 2] takes u^t over u^(t - 2), so the rotation is a function of t alone
     def step(t, signal, um=None):
@@ -1065,15 +1076,6 @@ def simulate(
         if um is not None:
             get_signal(u, um, t)
 
-    # several steps a launch where there is a blocked step and memory for its pair
-    blocked = None
-    if record_every is None and not active():
-        blocked = sim.define_blocked_step(mat, source, sensors)
-    if blocked is not None:
-        try:
-            spare = cp.zeros_like(U)
-        except cp.cuda.memory.OutOfMemoryError:
-            blocked = None
     if blocked is not None:
         # whole blocks alternate between U and a second pair, the rest step by step
         S = blocked.steps
