@@ -55,6 +55,7 @@ BLOCKED = (
 )
 BLOCKED_WAVES = (2, 1)  # by radius, the waves of tiles the blocked step pays to
 FUSED_TILE = ((16, 32), (4, 8, 32))  # in 2D, 3D: the fused step's tile, a thread each
+FUSED_SMS = (0, 64)  # in 2D, 3D: the multiprocessors from which the ring's curl pays
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -286,6 +287,7 @@ class MaxwellWave(Simulation):
             and fields > device["L2CacheSize"]
             and ring <= 2 * math.prod(tile)
             and shared <= device["MaxSharedMemoryPerBlockOptin"]
+            and device["MultiProcessorCount"] >= FUSED_SMS[self.ndim - 2]
         ):
             return self._define_fused(mat, tile, shared)
 

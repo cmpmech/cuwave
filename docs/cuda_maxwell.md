@@ -98,7 +98,7 @@ one block per tile of `FUSED_TILE` points, a thread per point; the block first f
 `sh`: `NPAIRS` planes of the weighted curl over the tile and its ring, zero where `curl_kernel` writes nothing
 **how?**
 - the ring's curl reads `u1` from global memory through `curl_component`, the update reads `sh` through `curl_force` with the tile strides `T`, so every value is the pair's own expression
-- the curl scratch the pair needs is never allocated, and one launch replaces two; the ring recomputes $\left(1+2R/T_d\right)$ times the tile's curl per axis, which is why the caller takes it only while that stays under twice the tile: 2D at every order, 3D at order 2
+- the curl scratch the pair needs is never allocated, and one launch replaces two; the ring recomputes $\left(1+2R/T_d\right)$ times the tile's curl per axis, which is why the caller takes it only while that stays under twice the tile: 2D at every order, 3D at order 2 on a GPU of at least `FUSED_SMS` multiprocessors, since a power-capped mobile one spends more on the ring than the launch saves
 
 ### blocked_kernel
 `STEPS` steps of `curl_kernel` and `fd_kernel` between one load and one store of a tile, the excitation and the record included, bitwise the launches one at a time; 2D float32 only

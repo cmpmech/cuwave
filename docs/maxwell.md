@@ -109,7 +109,7 @@ $w_p$ is computed inside the kernel rather than stored: it is identically 1 in 2
 | curl components | `npairs` | one per axis pair, 1 in 2D and 3 in 3D |
 | strip radius | `reach` | $2r-1$, the nodes one step reads past a point |
 | materials | `build_materials(indicator)` | the point inverse permittivity per component, the pair inverse permeability, and `damping` |
-| step | `define_step(kernels, mat)` | the two-launch closure: the curl kernel, then the update, each followed by its [pml](boundary.md) terms when `pml` is set; past L2 without a pml one launch that forms the curl of each tile and its ring in shared memory, where the ring at most doubles the tile (2D, and 3D at order 2) |
+| step | `define_step(kernels, mat)` | the two-launch closure: the curl kernel, then the update, each followed by its [pml](boundary.md) terms when `pml` is set; past L2 without a pml one launch that forms the curl of each tile and its ring in shared memory, where the ring at most doubles the tile (2D, and 3D at order 2 from `FUSED_SMS` multiprocessors) |
 | blocked step | `define_blocked_step(mat, source, sensors)` | in 2D on a small grid, several steps a launch in shared memory, the curl, the update, the excitation and the record inside the tile, bitwise the pair; None in 3D, past `BLOCKED_WAVES` waves of tiles, with a pml, `magnetic`, or two sources on one point |
 | adjoint step | `define_adjoint_step(kernels, sens_kernels, mat)` | the step itself, or with a pml its transpose, which pushes each memory back through the other pass |
 | pml margin | `pml_margin` | $r-1$, the undamped layer nodes before the front, since a corrected curl is read that far |
