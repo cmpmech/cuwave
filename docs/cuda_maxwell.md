@@ -9,6 +9,7 @@ The forward kernels of the vector curl-curl [maxwell](maxwell.md) equation: one 
 | `NDIM` | `len(Nx)` | selects the interior guard and the geometry macros; 1 is an `#error` |
 | `USE_DAMPING` | `damping is not None` | adds the damped update and its two extra arguments |
 | `USE_MAGNETIC` | `magnetic` | the pair coefficient arrives as a field rather than a scalar |
+| `STEPS`, `TILE0`, `TILE1`, `ROWS` | `BLOCKED`, by `MaxwellWave.define_blocked_step` in 2D without a pml or `magnetic`, on a small grid | compiles `blocked_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
 
 `real_t`, `STENCIL_RADIUS`, `SG_W`, `NPAIRS`, `PAIR_ROW`, `rad_half` and the transfer kernels all come from the prelude; see [cuda_elastic](cuda_elastic.md), which documents them
 
@@ -54,6 +55,9 @@ the axis-$e$ part of the force on $E_c$, as `fd_kernel` takes it, signed $+$ whe
 **aim**
 add $\nu$ times the curl terms `t` of axis `e` onto the pair points, with `pair_weight` or, under `USE_MAGNETIC`, `nu_pair`, as `curl_kernel` weights them
 
+### curl_force
+the force `fd_kernel` forms on component `c`, the curl rows of the pairs it belongs to differenced along the partner axis, read `hs` a row and `S` an axis from `idx`, so the update reads the global scratch and `blocked_kernel` its tile through the same code
+
 ## kernels
 
 ### curl_kernel
@@ -82,6 +86,20 @@ one thread per grid point, updating every component whose unknown it carries
 $$f_c=\sum_{m\ne c}\pm\frac{1}{\Delta x_m}\sum_jc_j^{\left(r\left(a\right)\right)}\left(h_{cm}^{i+j-1}-h_{cm}^{i-j}\right)$$
 - every tap carries the coefficient of the **pair point it reads**, evaluated by `rad_half` at that point rather than at the thread's own, which is exactly what makes the two launches an exact transpose pair
 - the march is the three-term recursion of [cuda_scalar](cuda_scalar.md), component by component, `USE_DAMPING` dividing by $1+\beta$ with one conductivity field serving every component
+
+### blocked_kernel
+`STEPS` steps of `curl_kernel` and `fd_kernel` between one load and one store of a tile, the excitation and the record included, bitwise the launches one at a time; 2D float32 only
+**parallelization**
+a 2D launch of `(TILE1, ROWS)` threads per block, one block per tile of `TILE0` $\times$ `TILE1` points; a thread owns `NODES` $=$ `TILE0 / ROWS` consecutive points of its column. Tiles overlap by a halo of `HALO` $=$ `STEPS` $\left(2R-1\right)$ points each side and write back only their core
+**input args**
+`u0, u1`: both components at $t-1, t$; `v0, v1`: the arrays receiving them at $t+S-1, t+S$; `minv`, `nu`, under `USE_DAMPING` `damping, dt`: as `curl_kernel` and `fd_kernel`; `signal, weights, num_sources, record, num_sensors, t0`, `source_starts, source_entries, sensor_starts, sensor_entries`: as the elastic `blocked_kernel`, entries `component node | point << 16`; `cs`: component stride; `e0, e1`: $1/\Delta x_d$; `f0, N0, f1, N1, s0`: as `fd_kernel`
+**internal args**
+`su, sh`: both components and the curl in shared memory, each with a guard ring $R$ wide, read by `curl_component` and `curl_force` through the tile strides `T`; `up, uc, mi, beta, tag`: per owned point and component in registers; `paired, moving`: bit masks of the owned pair points and of the components the update moves
+**how?**
+- per step the curl of the tile goes to shared memory, a barrier, then the update of both components, a barrier; a component the update skips, its own axis' staggered ghost, and every point off the interior keep their value of two steps back, as the plain buffers do
+- the edge points of a tile read the guard ring and go wrong, one reach deeper every step; after `STEPS` steps the error stops short of the core
+- the curl and the update are the plain kernels' expressions, the damped one rounded by `FMA_RN` as in the elastic `blocked_kernel`, and the source term rounded apart as `excitation_kernel` adds it; a conductor needs no refill, its zeroed `minv` holds the tangential field
+- two sources on one point are refused by the caller: the excitation's atomics add them in no fixed order, so no single order is bitwise the plain run
 
 ### pml_curl_kernel, pml_force_kernel, pml_adjoint_curl_kernel, pml_adjoint_force_kernel, pml_adjoint_memory_kernel
 Flat 1D launches over the slab of each lined axis: `pml_curl_kernel` after `curl_kernel`, `pml_force_kernel` after `fd_kernel`, their adjoints in the same places, and `pml_adjoint_memory_kernel` last in every adjoint step. They carry the terms [cuda_elastic](cuda_elastic.md) folds into its step kernels (`stress_memory`, `force_memory`, `settle_memory`), with `curl_term`, `divergence_term` and `add_curl` in place of the strain, divergence and stress helpers, and `h` in place of `sigma`

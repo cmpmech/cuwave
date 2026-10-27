@@ -24,20 +24,36 @@ from .boundary import Conductor, Magnetic, faces_with
 from .scalar import PressureWave
 from .wave import (
     PAIRS,
+    Blocked,
+    LaunchSlots,
     Simulation,
+    Source,
     apply_cell_weights,
     axis_geometry,
+    blocked_launches,
+    compile_kernels,
+    covering_hits,
     define_pair_pml,
+    flatten_indices,
     grid_block,
+    owner_hits,
     pair_average,
     pair_average_adjoint,
     point_harmonic,
     point_harmonic_adjoint,
+    tile_counts,
+    tile_lists,
     wall_weights,
 )
 
 KERNEL_PATH = Path(__file__).parent / "kernels" / "maxwell.cu"
 SENSITIVITY_PATH = Path(__file__).parent / "kernels" / "maxwell_sensitivity.cu"
+# by radius, candidates (tile, thread rows, steps): the first with the fewest waves
+BLOCKED = (
+    (((32, 32), 32, 6), ((32, 32), 32, 4), ((32, 64), 16, 6), ((64, 64), 16, 12)),
+    (((32, 32), 32, 2),),
+)
+BLOCKED_WAVES = (2, 1)  # by radius, the waves of tiles the blocked step pays to
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -296,6 +312,104 @@ class MaxwellWave(Simulation):
 
         pml_step.memory = curl_pml.memory
         return pml_step
+
+    def define_blocked_step(
+        self, mat: dict, source: Source, sensors: cpt.NDArray[cp.int32] | None
+    ) -> Blocked | None:
+        """The 2D step advancing several steps a launch on a small grid, excitation and record included, else None.
+
+        Each thread block loads a tile of both components with a halo of as many curl
+        and force reaches as it takes steps, forms the curl and steps the tile in shared
+        memory and writes back its core: bitwise the pair, the excitation and the record
+        launched one by one. Taken where launches bound the pair (the candidate of
+        `BLOCKED` with the fewest waves of tiles, while those stay within
+        `BLOCKED_WAVES`); else None, as in 3D, in float64, above order 4, with a pml or
+        a designed permeability, a source on a point the step holds, a sensor off the
+        interior, or two sources or sensors on one point.
+        """
+        radius = self.radius
+        if (
+            self.ndim != 2
+            or self.precision != "float32"
+            or radius > len(BLOCKED)
+            or self.pml is not None
+            or self.magnetic
+            or min(self.Nx) < 4
+        ):
+            return None
+
+        # launches bound a grid of few waves of tiles
+        sms = cp.cuda.Device().attributes["MultiProcessorCount"]
+        waves = [
+            -(-math.prod(tile_counts(self.Nx, b[0], b[2] * self.reach)) // sms)
+            for b in BLOCKED[radius - 1]
+        ]
+        if min(waves) > BLOCKED_WAVES[radius - 1] or (
+            BLOCKED[radius - 1][waves.index(min(waves))][2] * self.reach < 2
+        ):
+            return None  # a halo under 2 leaves a ghost's mirror outside its tile
+        tile, rows, steps = BLOCKED[radius - 1][waves.index(min(waves))]
+        halo = steps * self.reach
+        core = [t - 2 * halo for t in tile]
+        cores = tile_counts(self.Nx, tile, halo)
+
+        # sources on points the step moves, sensors in the interior, none twice
+        sources = flatten_indices(self, source.position)
+        targets = flatten_indices(self, sensors) if sensors is not None else sources[:0]
+        upper = np.asarray(self.Nx)[:, None] - 2
+        points, layers = [], []
+        for index in (sources, targets):
+            flat = index.get()
+            layer, node = np.divmod(flat, self.comp_stride)
+            point = np.stack(np.divmod(node, self.Nx_padded[1]))
+            # in the interior, each point once, the index fitting an entry's half
+            if not ((point >= 1) & (point <= upper)).all():
+                return None
+            if len(flat) >= 2**16 or len(np.unique(flat)) != len(flat):
+                return None
+            points.append(point)
+            layers.append(layer)
+        held = points[0][layers[0], np.arange(len(layers[0]))] > upper[layers[0], 0] - 1
+        if held.any():
+            return (
+                None  # a source on its own axis' staggered ghost, which nothing steps
+            )
+
+        # a tile's sources wherever its nodes reach, its sensors where its core does
+        hits = [
+            covering_hits(points[0], tile, core, halo, cores),
+            owner_hits(points[1], points[1], core),
+        ]
+        lists = []
+        for hit, layer in zip(hits, layers):
+            lists += tile_lists(hit, tile, core, halo, cores, layer)
+
+        # the kernel: both components and the curl, each in a guard ring
+        flags = (f"-DSTEPS={steps}", f"-DTILE0={tile[0]}", f"-DTILE1={tile[1]}")
+        kernels = compile_kernels(self, flags=(*flags, f"-DROWS={rows}"))
+        kernel = kernels.get_function("blocked_kernel")
+        shared = 3 * (tile[0] + 2 * radius) * (tile[1] + 2 * radius) * 4
+        kernel.max_dynamic_shared_size_bytes = shared
+
+        # the arguments, the pointers and the per-call values filled in per launch
+        weights = self.excitation_weights(mat, sources)
+        args = [
+            None,
+            None,
+            None,
+            None,
+            mat["minv"],
+            self.dtype(1.0 / self.permeability),
+        ]
+        if self.damping is not None:
+            args += [mat["damping"], self.dtype(self.dt)]
+        args += [None, weights, np.int32(len(sources)), None, np.int32(len(targets))]
+        args += [*lists, None]
+        slots = LaunchSlots(len(args) - 10, len(args) - 7, len(args) - 1, None)
+        args += [np.int32(self.comp_stride), *(self.dtype(1.0 / d) for d in self.dx)]
+        args += axis_geometry(self, self.step_factors())
+        launches = [(kernel, tuple(cores[::-1]), None)]
+        return blocked_launches(steps, launches, (tile[1], rows), shared, args, slots)
 
     def excitation_weights(
         self, mat: dict, lin_index: cpt.NDArray[cp.int32]

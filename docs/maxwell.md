@@ -110,6 +110,7 @@ $w_p$ is computed inside the kernel rather than stored: it is identically 1 in 2
 | strip radius | `reach` | $2r-1$, the nodes one step reads past a point |
 | materials | `build_materials(indicator)` | the point inverse permittivity per component, the pair inverse permeability, and `damping` |
 | step | `define_step(kernels, mat)` | the two-launch closure: the curl kernel, then the update, each followed by its [pml](boundary.md) terms when `pml` is set |
+| blocked step | `define_blocked_step(mat, source, sensors)` | in 2D on a small grid, several steps a launch in shared memory, the curl, the update, the excitation and the record inside the tile, bitwise the pair; None in 3D, past `BLOCKED_WAVES` waves of tiles, with a pml, `magnetic`, or two sources on one point |
 | adjoint step | `define_adjoint_step(kernels, sens_kernels, mat)` | the step itself, or with a pml its transpose, which pushes each memory back through the other pass |
 | pml margin | `pml_margin` | $r-1$, the undamped layer nodes before the front, since a corrected curl is read that far |
 | inertia | `inverse_inertia(indicator)` | nodal $1/\left(\varepsilon W\right)$, what a [sponge](boundary.md) scales its conductivity by |

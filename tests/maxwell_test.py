@@ -17,6 +17,11 @@ curl-curl recursion, so wherever both codes place the permittivity alike the tra
 agree at round-off, and where they do not (the 3D component mean, the TE cell mean)
 the gap is pinned to the placement alone. `spectral_sensitivity` is pinned to the stored
 gradient on a damped domain, where both of its runs decay.
+
+A 2D float32 vector run on a small grid advances several steps a launch
+(`define_blocked_step`), the curl, the update, the excitation and the record inside the
+tile. It claims the curl and update pair bit for bit, so it is compared with
+`array_equal` over orders, faces, damping, tiles and sources on both components.
 """
 
 import math
@@ -35,6 +40,7 @@ except Exception:
     HAS_CUDA = False
 
 if HAS_CUDA:
+    from cuwave import maxwell
     from cuwave.boundary import (
         Conductor,
         Dirichlet,
@@ -42,6 +48,7 @@ if HAS_CUDA:
         Neumann,
         Pml,
         Traction,
+        sponge,
     )
     from cuwave.geometry import box
     from cuwave.maxwell import (
@@ -486,6 +493,95 @@ class VectorMaxwellTest(unittest.TestCase):
     def test_an_unshifted_layer_is_refused(self):
         with self.assertRaises(ValueError):
             _vector((40, 40), pml=Pml(6, 1.0))
+
+
+def _blocked_runs(order, Nx, N, boundary, damped=False, blocks=None):
+    """The (field, record) of a 2D float32 run forced blocked, then of the plain pair."""
+    dx = tuple(1.0 / (n - 3) for n in Nx)
+    dt = 0.9 * stable_dt(dx, 1.0, order)
+    sim = DielectricWave(
+        Nx,
+        dx,
+        N,
+        dt,
+        (8, 32),
+        space_order=order,
+        permittivity1=1.0,
+        permittivity2=4.0,
+        permeability=1.0,
+        boundary=boundary,
+    )
+    rng = np.random.default_rng(order)
+    indicator = cp.asarray(rng.random(sim.Nx_padded), dtype=sim.dtype)
+    if damped:
+        sim = replace(sim, damping=sponge(sim, indicator, 12, 0.3))
+    n = sim.Nx
+    position = [[0, 1, 1], [0, n[0] // 2, 7], [1, 3, n[1] - 3], [1, n[0] - 3, 2]]
+    position = cp.array(np.array(position).T, dtype=cp.int32)
+    signal = cp.asarray(rng.standard_normal((N, position.shape[1])), dtype=sim.dtype)
+    near = [[c, a, 5] for c in (0, 1) for a in range(1, 12)]
+    sensors = near + [[0, 1, 1], [1, n[0] - 2, n[1] - 2], [0, n[0] - 3, n[1] - 2]]
+    sensors = cp.array(np.array(sensors).T, dtype=cp.int32)
+    source = Source(position, signal)
+    patches = {"BLOCKED_WAVES": (1000, 1000)}
+    patches |= {"BLOCKED": blocks} if blocks is not None else {}
+    with mock.patch.multiple(maxwell, **patches):
+        mat = sim.build_materials(indicator)
+        assert sim.define_blocked_step(mat, source, sensors) is not None
+        blocked = simulate(sim, source, indicator, sensors=sensors)
+    with mock.patch.object(DielectricWave, "define_blocked_step", lambda *a, **k: None):
+        plain = simulate(sim, source, indicator, sensors=sensors)
+    return blocked, plain
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class BlockedTest(unittest.TestCase):
+    def _assert_bitwise(self, blocked, plain):
+        self.assertGreater(float(cp.abs(plain[0]).max()), 0.0)
+        for a, b in zip(blocked, plain):
+            self.assertTrue(bool(cp.array_equal(a, b)))
+
+    def test_a_blocked_run_is_the_plain_pair_bit_for_bit(self):
+        mixed = ((Conductor, Magnetic), (Magnetic, Conductor))
+        for order in (2, 4):
+            for boundary in (Conductor, Magnetic, mixed):
+                for damped in (False, True):
+                    with self.subTest(order=order, b=boundary, damped=damped):
+                        runs = _blocked_runs(order, (150, 127), 41, boundary, damped)
+                        self._assert_bitwise(*runs)
+
+    def test_every_tile_and_step_count(self):
+        blocks = (
+            ((32, 32), 32, 6),
+            ((32, 64), 16, 6),
+            ((64, 64), 16, 12),
+            ((32, 64), 8, 3),
+            ((32, 32), 32, 2),
+        )
+        for order, block in [(o, b) for o in (2, 4) for b in blocks]:
+            if min(block[0]) - 2 * block[2] * (order - 1) < 8:
+                continue
+            with self.subTest(order=order, block=block):
+                runs = _blocked_runs(
+                    order, (147, 115), 30, Conductor, False, ((block,),) * 2
+                )
+                self._assert_bitwise(*runs)
+
+    def test_what_the_pair_keeps(self):
+        dx = (0.01, 0.01)
+        common = dict(permittivity1=1.0, permittivity2=4.0, permeability=1.0)
+        sim = DielectricWave((150, 127), dx, 6, 1e-3, (8, 32), **common)
+        signal = cp.zeros((6, 2), dtype=sim.dtype)
+        once = Source(cp.array([[0, 0], [50, 60], [40, 40]], dtype=cp.int32), signal)
+        twice = Source(cp.array([[0, 0], [50, 50], [40, 40]], dtype=cp.int32), signal)
+        indicator = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
+        with mock.patch.object(maxwell, "BLOCKED_WAVES", (1000, 1000)):
+            mat = sim.build_materials(indicator)
+            self.assertIsNotNone(sim.define_blocked_step(mat, once, None))
+            self.assertIsNone(sim.define_blocked_step(mat, twice, None))
+            wide = replace(sim, precision="float64")
+            mat = wide.build_materials(indicator.astype(wide.dtype))
+            self.assertIsNone(wide.define_blocked_step(mat, once, None))
 
 
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")

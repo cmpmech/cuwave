@@ -115,7 +115,9 @@ becomes one `fused_kernel` (stresses of a tile and its ring in shared memory) wh
 fields spill out of L2 and the ring at most doubles the tile (2D, and 3D at order 2). A
 small 2D elastic grid (`BLOCKED_WAVES`), or an order-2 one past 2.25 times L2
 (`LARGE_BLOCKED`), takes `ElasticWave.define_blocked_step`: the stresses and update of
-several steps in shared memory.
+several steps in shared memory. A small 2D `MaxwellWave` grid without pml or `magnetic`
+takes `MaxwellWave.define_blocked_step` (`BLOCKED`, `BLOCKED_WAVES` of maxwell.py) the
+same way, the curl in place of the stresses; two sources on one point keep the pair.
 
 **2D Maxwell needs none of that.** Out of plane one component survives and the curl-curl
 collapses to a flux divergence, so `maxwell.ElectricWave` (E_z, permittivity as inertia)
