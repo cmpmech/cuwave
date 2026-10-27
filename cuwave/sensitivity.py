@@ -426,10 +426,15 @@ def sensitivity(
     grads = sim.gradient_fields(mat)
 
 # ------------------------------------ forward pass -----------------------------------
+    # its host checks wait on the device, so they run before the history is zeroed
+    folded = sim.define_folded_step(kernels, mat, source)
     # stepped straight into the history, so the leading zeros are u^-2 / u^-1
     V = cp.zeros((sim.N + 2, *sim.field_shape), dtype=sim.dtype)
 
     def forward(t, signal, history):
+        if folded is not None:
+            folded(history[t], history[t + 1], history[t + 2], signal, t)
+            return
         u = fd_step(history[t], history[t + 1], history[t + 2])
         excitation_step(u, signal, t)
         bc_step(u)
