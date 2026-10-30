@@ -554,12 +554,13 @@ class MaxwellWave(Simulation):
     def excitation_weights(
         self, mat: dict, lin_index: cpt.NDArray[cp.int32]
     ) -> cpt.NDArray:
-        """Source weights `dt**2 / (eps V)`: the kernel inertia leaves the volume out."""
+        """Source weights `dt**2 / (eps V)`: the kernel inertia, and so its `beta`, leaves the volume out."""
         volume = self.dtype(1.0 / float(np.prod(self.dx)))
-        weight = mat["minv"].ravel()[lin_index] * volume
+        minv = mat["minv"].ravel()[lin_index]
+        weight = minv * volume
         if self.damping is not None:
             node = lin_index % np.int32(self.comp_stride)
-            beta = 0.5 * weight * mat["damping"].ravel()[node] * self.dt
+            beta = 0.5 * minv * mat["damping"].ravel()[node] * self.dt
             weight = weight / (1.0 + beta)
         return (self.dtype(self.dt**2 * self.source_factor()) * weight).astype(
             self.dtype

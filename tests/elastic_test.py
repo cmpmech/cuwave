@@ -25,6 +25,11 @@ when broken: the CFS shift, without which the cross terms grow a static mode, an
 clamped wall behind the layer, since a traction wall there holds a growing surface wave.
 Held to both, a long run through a heterogeneous model with a free surface crossing the
 layer has to decay rather than grow.
+
+A point force inside a uniformly damped body has to deliver the momentum of a damped
+particle: the internal forces cancel in the sum over the body, so the summed displacement,
+over the undamped run's, follows the particle's recursion to round-off. That pins the
+source's share of the damped divisor `1 + beta` to the inertia the kernel divides by.
 """
 
 import itertools
@@ -143,6 +148,14 @@ def _finite_difference(cost_of, indicator, nodes, h=1e-6):
         minus[node] -= h
         out.append((cost_of(plus) - cost_of(minus)) / (2.0 * h))
     return np.array(out)
+
+
+def _particle(beta, signal):
+    """Displacement of a unit particle after the damped three-term recursion under `signal`."""
+    x = np.zeros(len(signal) + 2)
+    for t, s in enumerate(signal):
+        x[t + 2] = (2.0 * x[t + 1] - (1.0 - beta) * x[t] + s) / (1.0 + beta)
+    return x[-1]
 
 
 def _divergence_error(order, n):
@@ -712,6 +725,22 @@ class TransducerTest(unittest.TestCase):
         for wall in walls:
             self.assertEqual(float(cp.abs(wall).max()), 0.0)
         self.assertGreater(float(cp.abs(field).max()), 0.0)
+
+    def test_a_damped_body_sums_to_a_damped_particle(self):
+        alpha = 8.0
+        for order in (2, 4):
+            with self.subTest(order=order):
+                sim = _sim((64, 64), N=40, space_order=order)
+                gamma = cp.ones(sim.Nx_padded, dtype=sim.dtype)
+                damping = 2.0 * alpha / sim.inverse_inertia(gamma)
+                damped = replace(sim, damping=damping.astype(sim.dtype))
+                signal = np.ones(sim.N)
+                source = point_source(sim, [[0.5, 0.5]], signal, direction=[1.0, 0.0])
+                undamped, found = (  # the x components, along the force
+                    float(cp.sum(simulate(s, source, gamma)[0])) for s in (sim, damped)
+                )
+                expected = _particle(alpha * sim.dt, signal) / _particle(0.0, signal)
+                self.assertLess(abs(found / undamped - expected), 1e-9 * expected)
 
 
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")

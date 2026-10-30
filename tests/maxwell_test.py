@@ -28,6 +28,11 @@ The adjoint pair that carries the gradients is pinned on both tiers to the step 
 gradient kernel launched apart: the step and the permeability density bit for bit, the
 permittivity density to its sum by parts in time. A pml keeps the two apart, since its
 own launches amend the update after the kernel has read it.
+
+A current source inside a uniformly conducting body has to act on it as on a damped
+particle: the curl terms cancel in the sum over the body, so the summed field, over the
+lossless run's, follows the particle's recursion to round-off. That pins the source's
+share of the damped divisor `1 + beta` to the inertia the kernel divides by.
 """
 
 import itertools
@@ -334,6 +339,14 @@ class GradientTest(unittest.TestCase):
 
 
 # ---------------------------------- the vector case ----------------------------------
+def _particle(beta, signal):
+    """Displacement of a unit particle after the damped three-term recursion under `signal`."""
+    x = np.zeros(len(signal) + 2)
+    for t, s in enumerate(signal):
+        x[t + 2] = (2.0 * x[t + 1] - (1.0 - beta) * x[t] + s) / (1.0 + beta)
+    return x[-1]
+
+
 def _vector(Nx, N=150, space_order=2, cls=None, **kwargs):
     dx = tuple(1.0 / (n - 3) for n in Nx)
     return (cls or DielectricWave)(
@@ -500,6 +513,22 @@ class VectorMaxwellTest(unittest.TestCase):
     def test_an_unshifted_layer_is_refused(self):
         with self.assertRaises(ValueError):
             _vector((40, 40), pml=Pml(6, 1.0))
+
+    def test_a_conducting_body_sums_to_a_damped_particle(self):
+        alpha = 8.0
+        for order in (2, 4):
+            with self.subTest(order=order):
+                sim = _vector((64, 64), N=40, space_order=order)
+                gamma = cp.ones(sim.Nx_padded, dtype=sim.dtype)
+                damping = 2.0 * alpha / sim.inverse_inertia(gamma)
+                damped = replace(sim, damping=damping.astype(sim.dtype))
+                signal = np.ones(sim.N)
+                source = point_source(sim, [[0.5, 0.5]], signal, direction=[1.0, 0.0])
+                undamped, found = (  # the x components, along the force
+                    float(cp.sum(simulate(s, source, gamma)[0])) for s in (sim, damped)
+                )
+                expected = _particle(alpha * sim.dt, signal) / _particle(0.0, signal)
+                self.assertLess(abs(found / undamped - expected), 1e-9 * expected)
 
 
 def _blocked_runs(
