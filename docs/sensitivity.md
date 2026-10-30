@@ -11,6 +11,7 @@ Four variants compute it, with the same arguments (the spectral one adds its fre
 | gradient | exact transpose of the discretization | the same transpose, wherever the strip shields it | consistent, not exact | the exact derivative of the cost on the run continued to infinity |
 | `sim.damping` | supported | supported: a weak one is run backwards, a strong one is what the strip pays for | rejected | supported |
 | `sim.pml` | supported, the layer frozen | supported, the layer behind the strip | rejected | supported, the layer frozen |
+| `ElasticWave.relaxation` | supported, the step its own transpose | rejected: the memory cannot be reversed | rejected | rejected |
 | cost | any | any | any | read through the DFT at `frequencies` only |
 | knobs | none | `strip_dtype`, `checkpoints` | `scale`, the superposition $k$ | `frequencies`, `region` |
 | reports | none | `info["strip"]`, `info["drift"]`, `info["segment"]`, `info["sweeps"]` | `info["cancellation"]` | `info["decay"]`, `info["fit"]` |

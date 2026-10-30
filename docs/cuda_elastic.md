@@ -15,6 +15,7 @@ The forward kernels of the staggered [elastic](elastic.md) equation: one pass fo
 | `TILE0`, `TILE1`, `TILE2` | `FUSED_TILE`, by `ElasticWave.define_step` without a pml where the fields spill out of L2 and the ring at most doubles the tile | compiles `fused_kernel`, the tile one block steps |
 | `STEPS`, `TILE0`, `TILE1`, `ROWS` | `BLOCKED` or `LARGE_BLOCKED`, by `ElasticWave.define_blocked_step` in 2D without a pml, on a small grid or past L2 | compiles `blocked_kernel` instead of `fused_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
 | `GRADIENT` | `ElasticWave.define_adjoint_gradient` | `stress_kernel`, `fd_kernel` and `fused_kernel` add the gradient densities of the adjoint `u1` against the forward `v1`, their accumulators appended to the arguments |
+| `RELAXATION` | `relaxation.mechanisms`, never with a pml, `TILE` or `STEPS` | `stress_kernel` relaxes through that many memory variables per stress, the stresses after the stiffness, under `GRADIENT` the strains before it; appends `memory` and `coef` |
 
 `NPAIRS` is $\textrm{ndim}\left(\textrm{ndim}-1\right)/2$ and `NVOIGT` is `NDIM + NPAIRS`, the stress components held back to back in the `sigma` scratch. `SG_W(r, k)` reads coefficient $k$ of the radius-$r$ row from `__constant__` memory, collapsing to 1 at `STENCIL_RADIUS` 1. `PAIR_ROW(k, l)` maps an axis pair onto its Voigt row, `NDIM + 3 - k - l` in 3D and 2 in 2D
 
@@ -34,6 +35,9 @@ Declare the compile-time arrays the family loops index: `A` the per-axis grid in
 
 ### STIFFNESS_GRADIENT, MASS_GRADIENT, SHEAR_ROWS
 Under `GRADIENT`, the arguments appended to `stress_kernel` (`g_normal`, `g_shear` from 2D on, `v1`) and to `fd_kernel` (`g_mass`, `v1`, `mf`) ahead of the pml ones, and `SHEAR_ROWS` the shear accumulator a call passes on; empty otherwise
+
+### RELAXATION_ARGS
+Under `RELAXATION`, `memory` and `coef` appended to `stress_kernel` after the pml arguments, which a relaxation never comes with; empty otherwise
 
 ## device functions
 
@@ -114,9 +118,33 @@ $$m_c^{-1}=\frac{1}{\rho_0\,W\,\tfrac12\left(\gamma_i+\gamma_{i+e_c}\right)}$$
 
 ## step helpers
 
-### stress_point
+### strain_point
 **aim**
-every stress of the node at `idx`, zero off the point a family does not carry, as `stress_kernel` writes them; see there for the formulas
+every strain of the node at `idx`, the normal ones of `normal_strains` and the engineering shear ones of `shear_strain`, zero off the point a family does not carry
+**output args**
+`eps`: `NVOIGT` strains in Voigt order; the return value: the bitmask of zeroed axes
+
+### stress_of
+**aim**
+the stresses of the strains `eps` at the node at `idx`, through the condensed $\lambda$ and the point means of the design; see `stress_kernel` for the formulas
+**input args**
+`eps`, `zeroed`: as `strain_point` returns them; `gamma`, `lam`, `mu`: as `stress_kernel`; `idx`, `A`, `S`, `NN`: geometry
+**output args**
+`sig`: `NVOIGT` stresses, zero off their points
+
+### stress_point
+`strain_point` then `stress_of`, every stress of the node as `stress_kernel` writes it without a relaxation
+
+### relax
+**aim**
+relax the node's `NVOIGT` rows `s` through their memory variables, settling each in place
+**input args**
+`memory`: `RELAXATION * NVOIGT` grids, the variable of mechanism $l$ and Voigt row $v$ at row `l * NVOIGT + v`; `coef`: $c_0$, then $a_l, h_l, b_l$ per mechanism; `idx`, `cs`: node and component stride
+**how?**
+- the trapezoidal update centred on the step, the rows read before the memory moves
+$$s\leftarrow c_0\,s-\sum_lh_l\,\zeta_l,\qquad\zeta_l\leftarrow a_l\,\zeta_l+b_l\,s,\qquad c_0=1-\frac12\sum_lb_l,\quad h_l=\frac{1+a_l}{2}$$
+which is $\sigma_U-\tfrac12\sum_l\left(\zeta_l^{n+\frac12}+\zeta_l^{n-\frac12}\right)$ of [elastic](elastic.md)
+- forwards `s` are the stresses of `stress_point` and $\zeta$ stress memories; under `GRADIENT` `s` are the adjoint's strains of `strain_point` and $\zeta$ strain memories, equivalent since the stiffness is pointwise and constant in time
 
 ### nodal_force
 **aim**
@@ -136,6 +164,9 @@ subtract the stiffness densities of the adjoint against the forward field at the
 **how?**
 - the graded strains of both fields, never the deep shortcut, so the densities are bit for bit those of `gradient_kernel`
 $$g_n\mathrel{-}=2\mu\,\boldsymbol{\varepsilon}\left(\lambda\right):\boldsymbol{\varepsilon}\left(u\right)+\lambda_\textrm{eff}\,\textrm{tr}\,\boldsymbol{\varepsilon}\left(\lambda\right)\textrm{tr}\,\boldsymbol{\varepsilon}\left(u\right)\qquad g_{kl}\mathrel{-}=\mu\,2\varepsilon_{kl}\left(\lambda\right)\,2\varepsilon_{kl}\left(u\right)$$
+
+### relaxed_density
+Under `RELAXATION` as well, `stiffness_density` with the adjoint's strains `eps` already relaxed by `relax` in place of the strains of `u1`: the density of the relaxed recursion, whose stiffness acts on the relaxed strain
 
 ## pml helpers
 The pml terms are folded into `stress_kernel` and `fd_kernel`: a thread whose node lies on the slab of a lined axis `e` adds that axis' memory terms in registers, so a lined step costs no launch beyond the unlined one. The memory `aux` of axis `e` holds `2 * NDIM` rows: the strain memories $\psi_k$ of $\partial_eu_k$ at the strain point $\left(k,e\right)$, then the divergence memories $\zeta_c$ of the axis-$e$ part of $\nabla\cdot\sigma_c$. The adjoint adds a second block of `NDIM` strain rows at `2 * NDIM`: `fd_kernel` reads one block at the neighbours while settling the other at its own node, and the two swap every step. Its slab row `t` is `slab_index` of the node ([cuda_scalar](cuda_scalar.md)). The `profile` rows are read at the node or at the half point $a+\tfrac12$, whichever the quantity sits on along `e`
@@ -192,14 +223,15 @@ read off the block `phase` names and written into the other, so no thread overwr
 **parallelization**
 one thread per grid point, writing every stress family whose point it carries
 **input args**
-`u1`: the field at $t-1$; `gamma`: the nodal design, which `node_gamma` and `shear_gamma` take onto the stress points; `lam`, `mu`: $\lambda$ (plane-reduced on the host) and $\mu$; `clamped`: the face bitmask; `cs`: component stride; `f0..f2`: $1/\Delta x_d$; `N0..N2`, `s0, s1`: geometry; under `GRADIENT`, `v1`: the forward field `u1` pairs with; under `USE_PML`, per axis `m`, `p`, `lo`, `hi`: its memory, profile and slab rows, 0 unlined, then `phase`: 0 forwards, 1 or 2 the adjoint reading its strain memory off row 0 or `2 * NDIM`
+`u1`: the field at $t-1$; `gamma`: the nodal design, which `node_gamma` and `shear_gamma` take onto the stress points; `lam`, `mu`: $\lambda$ (plane-reduced on the host) and $\mu$; `clamped`: the face bitmask; `cs`: component stride; `f0..f2`: $1/\Delta x_d$; `N0..N2`, `s0, s1`: geometry; under `GRADIENT`, `v1`: the forward field `u1` pairs with; under `USE_PML`, per axis `m`, `p`, `lo`, `hi`: its memory, profile and slab rows, 0 unlined, then `phase`: 0 forwards, 1 or 2 the adjoint reading its strain memory off row 0 or `2 * NDIM`; under `RELAXATION`, `memory`, `coef`: as `relax`, the memory settled in place
 **output args**
-`sigma`: `NVOIGT` fields, the normal stresses first and the pairs in Voigt order, assigned rather than accumulated; points no family writes stay at the zero the scratch was allocated with; under `GRADIENT`, `g_normal`, `g_shear`: the stiffness densities of `stiffness_density`, accumulated with `-=`
+`sigma`: `NVOIGT` fields, the normal stresses first and the pairs in Voigt order, assigned rather than accumulated; points no family writes stay at the zero the scratch was allocated with; under `GRADIENT`, `g_normal`, `g_shear`: the stiffness densities of `stiffness_density`, or `relaxed_density` under `RELAXATION`, accumulated with `-=`
 **how?**
 - the normal family couples through the (possibly condensed) $\lambda$, a zeroed axis writing an explicit zero
 $$\sigma_{dd}=W\gamma\left(2\mu\,\varepsilon_{dd}+\lambda_\textrm{eff}\,\textrm{tr}\,\boldsymbol{\varepsilon}\right)$$
 - each shear point is one multiply on its own strain
 $$\sigma_{kl}=w_s\gamma_s\,\mu\left(2\,\varepsilon_{kl}\right)$$
+- under `RELAXATION`, `relax` on those stresses before the store; under `GRADIENT` as well, `relax` on the strains of `strain_point` instead, then `relaxed_density`, then `stress_of`
 
 ### fd_kernel
 **parallelization**

@@ -2,7 +2,7 @@
 
 A subdomain runs the unmodified kernels over its rows and a halo, so the only thing
 that can go wrong is the halo: too thin, exchanged too late, or missing a piece of the
-state (a pml memory, a stored history row). Every one of those shows as a difference on
+state (a pml or relaxation memory, a stored history row). Every one of those shows as a difference on
 the owned rows, so the split run is pinned bitwise against the whole one, with a source
 and sensors inside the halos and on a cut. Several entries naming the same GPU make
 the subdomains threads on one card, which is all a test machine is sure to have.
@@ -23,7 +23,7 @@ except Exception:
 
 if HAS_CUDA:
     from cuwave.boundary import Clamped, Pml
-    from cuwave.elastic import ElasticWave
+    from cuwave.elastic import ElasticWave, Relaxation
     from cuwave.maxwell import DielectricWave
     from cuwave.scalar import AcousticWave, ScalarWave
     from cuwave.sensitivity import (
@@ -68,6 +68,7 @@ def _elastic(order=4, absorber=None, Nx=(220, 130)):
     dx = (0.01,) * len(Nx)
     dt = 0.8 * stable_dt(dx, 2.0, order)
     pml = Pml(10, 2.0, frequency=5.0) if absorber == "pml" else None
+    relaxation = Relaxation(20.0, (2.0, 40.0), 10.0) if absorber == "relaxation" else None
     sim = ElasticWave(
         Nx,
         dx,
@@ -78,6 +79,7 @@ def _elastic(order=4, absorber=None, Nx=(220, 130)):
         space_order=order,
         boundary=Clamped if pml else None,
         pml=pml,
+        relaxation=relaxation,
         density=1.0,
         wavespeed_p=2.0,
         wavespeed_s=1.0,
@@ -117,7 +119,7 @@ class ForwardTest(unittest.TestCase):
                     self._check(*_scalar(order, absorber, Nx=(300, 130)))
 
     def test_the_split_elastic_field_is_the_whole_one(self):
-        for absorber in (None, "pml"):
+        for absorber in (None, "pml", "relaxation"):
             with self.subTest(absorber=absorber):
                 self._check(*_elastic(4, absorber, Nx=(300, 130)))
 
@@ -149,6 +151,9 @@ class GradientTest(unittest.TestCase):
                 for adjoint in (sensitivity, reconstruction_sensitivity):
                     with self.subTest(make=make.__name__, absorber=absorber):
                         self._check(*make(4, absorber), adjoint)
+
+    def test_the_split_relaxed_gradient_is_the_whole_one(self):
+        self._check(*_elastic(4, "relaxation"), sensitivity)
 
     def test_the_acoustic_and_maxwell_gradients_split_alike(self):
         common = dict(precision="float64", space_order=4)

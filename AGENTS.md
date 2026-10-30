@@ -85,6 +85,11 @@ axis `c`, declared via `component_offsets`, which `utils.distribute` honours), c
 even `space_order` at per-axis cost, and is the exact transpose at every order. Its kernels
 read `gamma` alone and average it onto each point per read (no inertia or shear grids), and
 `deep_node` sends threads 2r inside every wall down a template path with no wall terms.
+`ElasticWave.relaxation` (an `elastic.Relaxation`) is the material's own attenuation: a
+generalized Zener body, `-DRELAXATION` memory variables per stress settled in the stress
+pass, fitted by `zener` to a constant Q over a band. The relaxed step is its own transpose,
+so `sensitivity` and `source_sensitivity` take it; the reversing variants, the fused and
+blocked steps and a pml refuse it.
 `anisotropic.AnisotropicElasticWave` is the collocated cell assembly: order 2 only (the
 gather costs `(2r)**(2*ndim)`), but it takes an arbitrary symmetric Voigt `C`, which the
 staggered layout cannot. Both are lossless-reversible with kernel-less Traction/Clamped
@@ -303,6 +308,9 @@ the `docs/cuda_*.md` pages are the only ones that document arguments.
 
 ## Traps
 
+- **`damping` is an absorber, not a material loss.** It decays every frequency at the same
+  rate in time, so its Q grows with frequency; an elastic material's attenuation is
+  `ElasticWave.relaxation`. In Maxwell the same term is ohmic conductivity, which is physical.
 - **A pml on a vector equation needs `frequency` > 0** (the CFS shift): unshifted, a static
   mode grows (elastic) or never decays (Maxwell). Elastic lined faces must be `Clamped`
   (a traction wall behind the layer grows a surface wave), and `AnisotropicElasticWave`

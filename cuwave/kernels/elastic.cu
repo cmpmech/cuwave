@@ -3,6 +3,7 @@
 //   NDIM = 1 | 2 | 3
 //   USE_DAMPING
 //   USE_PML
+//   RELAXATION = L (no pml, no TILE, no STEPS): L memory variables a stress
 //   TILE0, TILE1, TILE2 (no pml): the fused step's tile
 //   STEPS, TILE0, TILE1, ROWS (2D, no pml): the blocked step's
 //   GRADIENT (no STEPS): the step adds the gradient densities of u1 against v1
@@ -107,6 +108,14 @@
 #else
 #define STIFFNESS_GRADIENT
 #define MASS_GRADIENT
+#endif
+
+// the memory variables, RELAXATION rows per Voigt row, and their coefficients
+#ifdef RELAXATION
+#define RELAXATION_ARGS                                                        \
+  , real_t *__restrict__ memory, const real_t *__restrict__ coef
+#else
+#define RELAXATION_ARGS
 #endif
 
 // a node 2R inside every wall: full radius on every tap, no wall terms
@@ -264,16 +273,35 @@ point_minv(const real_t *__restrict__ gamma, const int idx, const int c,
 }
 
 // ----------------------------------- step helpers
-// every stress of the node at idx, zero off its point
+// every strain of the node at idx, zero off its point, and the axes a traction
+// wall zeroes
 template <bool DEEP = false>
-__device__ __forceinline__ void
-stress_point(const real_t *__restrict__ u, const real_t *__restrict__ gamma,
-             const int idx, const int cs, const int *A, const int *S,
-             const int *NN, const real_t *F, const real_t lam, const real_t mu,
-             const int clamped, real_t *sig) {
-  real_t eps[NDIM];
+__device__ __forceinline__ int
+strain_point(const real_t *__restrict__ u, const int idx, const int cs,
+             const int *A, const int *S, const int *NN, const real_t *F,
+             const int clamped, real_t *eps) {
   const int zeroed =
       normal_strains<DEEP>(u, idx, cs, A, S, NN, F, clamped, eps);
+#if NDIM >= 2
+#pragma unroll
+  for (int k = 0; k < NDIM - 1; ++k)
+#pragma unroll
+    for (int l = k + 1; l < NDIM; ++l)
+      eps[PAIR_ROW(k, l)] =
+          (!DEEP && (A[k] > NN[k] - 3 || A[l] > NN[l] - 3))
+              ? (real_t)0
+              : shear_strain<DEEP>(u, idx, cs, k, l, A, S, NN, F);
+#endif
+  return zeroed;
+}
+
+// the stresses of the strains eps at the node at idx, zero off their points
+template <bool DEEP = false>
+__device__ __forceinline__ void
+stress_of(const real_t *eps, const int zeroed,
+          const real_t *__restrict__ gamma, const int idx, const int *A,
+          const int *S, const int *NN, const real_t lam, const real_t mu,
+          real_t *sig) {
   const real_t lam_eff = condensed_lame(lam, mu, zeroed);
   real_t tr = (real_t)0;
 #pragma unroll
@@ -294,9 +322,22 @@ stress_point(const real_t *__restrict__ u, const real_t *__restrict__ gamma,
       sig[v] = (!DEEP && (A[k] > NN[k] - 3 || A[l] > NN[l] - 3))
                    ? (real_t)0
                    : shear_gamma<DEEP>(gamma, idx, k, l, A, S, NN) * mu *
-                         shear_strain<DEEP>(u, idx, cs, k, l, A, S, NN, F);
+                         eps[v];
     }
 #endif
+}
+
+// every stress of the node at idx, zero off its point
+template <bool DEEP = false>
+__device__ __forceinline__ void
+stress_point(const real_t *__restrict__ u, const real_t *__restrict__ gamma,
+             const int idx, const int cs, const int *A, const int *S,
+             const int *NN, const real_t *F, const real_t lam, const real_t mu,
+             const int clamped, real_t *sig) {
+  real_t eps[NVOIGT];
+  const int zeroed =
+      strain_point<DEEP>(u, idx, cs, A, S, NN, F, clamped, eps);
+  stress_of<DEEP>(eps, zeroed, gamma, idx, A, S, NN, lam, mu, sig);
 }
 
 // the stress divergence on component c's point, off the accessor (sigma, cs, S)
@@ -352,6 +393,27 @@ nodal_force(const real_t *__restrict__ sigma, const int idx, const int cs,
   return force;
 }
 
+#ifdef RELAXATION
+// the node's Voigt rows s relaxed by their memory variables, each settled in
+// place: s <- c0 s - sum read_l m_l, then m_l <- a_l m_l + drive_l s
+__device__ __forceinline__ void relax(real_t *__restrict__ memory,
+                                      const real_t *__restrict__ coef,
+                                      const int idx, const int cs, real_t *s) {
+#pragma unroll
+  for (int v = 0; v < NVOIGT; ++v) {
+    real_t out = coef[0] * s[v];
+#pragma unroll
+    for (int l = 0; l < RELAXATION; ++l) {
+      real_t *__restrict__ m = memory + (l * NVOIGT + v) * cs + idx;
+      const real_t old = *m;
+      out -= coef[3 * l + 2] * old;
+      *m = coef[3 * l + 1] * old + coef[3 * l + 3] * s[v];
+    }
+    s[v] = out;
+  }
+}
+#endif
+
 #ifdef GRADIENT
 // ------------------------------------ gradient helpers
 // the normal bilinear form of two strain sets under the condensed coupling
@@ -400,6 +462,36 @@ stiffness_density(const real_t *__restrict__ u1, const real_t *__restrict__ v1,
     }
 #endif
 }
+
+#ifdef RELAXATION
+// dJ/dgamma under a relaxation: the relaxed adjoint strains eps against v1's
+__device__ __forceinline__ void
+relaxed_density(const real_t *eps, const real_t *__restrict__ v1,
+                real_t *__restrict__ g_normal,
+#if NDIM >= 2
+                real_t *__restrict__ g_shear,
+#endif
+                const int idx, const int cs, const int *A, const int *S,
+                const int *NN, const real_t *F, const real_t lam,
+                const real_t mu, const int clamped) {
+  real_t eu[NDIM];
+  const int zeroed = normal_strains(v1, idx, cs, A, S, NN, F, clamped, eu);
+  g_normal[idx] -= normal_form(eps, eu, lam, mu, zeroed);
+
+#if NDIM >= 2
+#pragma unroll
+  for (int k = 0; k < NDIM - 1; ++k)
+#pragma unroll
+    for (int l = k + 1; l < NDIM; ++l) {
+      if (A[k] > NN[k] - 3 || A[l] > NN[l] - 3)
+        continue;
+      const int v = PAIR_ROW(k, l);
+      g_shear[(v - NDIM) * cs + idx] -=
+          mu * eps[v] * shear_strain(v1, idx, cs, k, l, A, S, NN, F);
+    }
+#endif
+}
+#endif
 #endif
 
 // ------------------------------------- pml helpers
@@ -658,11 +750,28 @@ __global__ void
 stress_kernel(const real_t *__restrict__ u1, real_t *__restrict__ sigma,
               const real_t *__restrict__ gamma, const real_t lam,
               const real_t mu, const int clamped, const int cs,
-              AXIS_PARAMS STIFFNESS_GRADIENT PML_FOLD) {
+              AXIS_PARAMS STIFFNESS_GRADIENT PML_FOLD RELAXATION_ARGS) {
   INTERIOR_OR_RETURN;
   AXIS_GEOM;
   AXIS_FACTORS;
 
+#if defined(RELAXATION) && defined(GRADIENT)
+  // the memory in strains, so the gradient pairs the relaxed ones with v1's
+  real_t eps[NVOIGT], sig[NVOIGT];
+  const bool deep = deep_node(A, NN);
+  const int zeroed =
+      deep ? strain_point<true>(u1, idx, cs, A, S, NN, F, clamped, eps)
+           : strain_point(u1, idx, cs, A, S, NN, F, clamped, eps);
+  relax(memory, coef, idx, cs, eps);
+#ifdef GRADIENT
+  relaxed_density(eps, v1, g_normal SHEAR_ROWS, idx, cs, A, S, NN, F, lam, mu,
+                  clamped);
+#endif
+  if (deep)
+    stress_of<true>(eps, zeroed, gamma, idx, A, S, NN, lam, mu, sig);
+  else
+    stress_of(eps, zeroed, gamma, idx, A, S, NN, lam, mu, sig);
+#else
 #ifdef GRADIENT
   stiffness_density(u1, v1, g_normal SHEAR_ROWS, idx, cs, A, S, NN, F, lam, mu,
                     clamped);
@@ -680,6 +789,10 @@ stress_kernel(const real_t *__restrict__ u1, real_t *__restrict__ sigma,
     if (LO[e] + HI[e])
       stress_memory(u1, gamma, idx, cs, e, M[e], P[e], LO[e], HI[e], phase, A,
                     S, NN, F, lam, mu, clamped, sig);
+#endif
+#ifdef RELAXATION
+  relax(memory, coef, idx, cs, sig);
+#endif
 #endif
 #pragma unroll
   for (int v = 0; v < NVOIGT; ++v)

@@ -30,9 +30,16 @@ A point force inside a uniformly damped body has to deliver the momentum of a da
 particle: the internal forces cancel in the sum over the body, so the summed displacement,
 over the undamped run's, follows the particle's recursion to round-off. That pins the
 source's share of the damped divisor `1 + beta` to the inertia the kernel divides by.
+
+A `Relaxation` is pinned where it can fail independently: the fit against its own
+complex modulus at the frequencies the step sees, a plane wave between two receivers of
+a 1D line against the target Q and the reference phase speed, and its adjoint as the
+exact transpose (a linear objective, so the forward impulse responses are the oracle at
+round-off) and against finite differences for the material gradient.
 """
 
 import itertools
+import math
 import unittest
 from dataclasses import replace
 from unittest import mock
@@ -49,7 +56,7 @@ except Exception:
 if HAS_CUDA:
     from cuwave import elastic
     from cuwave.boundary import Clamped, Pml, Traction, pad_for_sponge, sponge
-    from cuwave.elastic import ElasticWave
+    from cuwave.elastic import ElasticWave, Relaxation, zener
     from cuwave.scalar import ScalarWave
     from cuwave.sensitivity import (
         l2_misfit,
@@ -72,6 +79,7 @@ if HAS_CUDA:
 
 CP, CS, RHO = 2.0, 1.0, 1.3
 THREADS = {1: (128,), 2: (8, 8), 3: (4, 4, 8)}
+RELAXATION = Relaxation(20.0, (2.0, 20.0), 6.0) if HAS_CUDA else None
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -376,6 +384,20 @@ class GradientTest(unittest.TestCase):
     def test_it_matches_finite_differences_on_a_clamped_wall(self):
         sim = _sim((24, 26), space_order=4, boundary=Clamped)
         self._check(sim, [(6, 9), (1, 10), (1, 1)])
+
+    def test_it_matches_finite_differences_under_a_relaxation(self):
+        for boundary in (Traction, Clamped):
+            for order in (2, 4):
+                with self.subTest(boundary=boundary, order=order):
+                    sim = _sim(
+                        (24, 26),
+                        space_order=order,
+                        boundary=boundary,
+                        relaxation=RELAXATION,
+                    )
+                    self._check(sim, [(6, 9), (12, 12), (1, 10), (22, 11), (1, 1)])
+        sim = _sim((14, 13, 15), N=50, space_order=4, relaxation=RELAXATION)
+        self._check(sim, [(6, 6, 7), (1, 6, 7), (12, 5, 8)])
 
     def test_a_ghost_node_carries_no_gradient(self):
         sim = _sim((24, 26))
@@ -802,6 +824,112 @@ class ValidationTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             _sim((10, 10), N=1, boundary=Neumann)
+
+
+# ------------------------------------- relaxation ------------------------------------
+def _line(quality, frequency):
+    """The direct pulse at x = 1.6 and 2.6 of a relaxed 1D line fired at x = 0.6, and the line."""
+    dx = 2.5e-3
+    dt = 0.5 * stable_dt((dx,), 1.0, 4)
+    sim = ElasticWave(
+        (round(3.6 / dx) + 3,),
+        (dx,),
+        math.ceil(2.6 / dt),
+        dt,
+        THREADS[1],
+        precision="float64",
+        space_order=4,
+        density=1.0,
+        wavespeed_p=1.0,
+        wavespeed_s=0.5,
+        relaxation=Relaxation(quality, (2.0, 20.0), 6.0),
+    )
+    t = np.arange(sim.N) * dt
+    source = point_source(sim, [[0.6]], ricker(t, 1.0, frequency))
+    sensors = cp.asarray([[round(1.6 / dx) + 1, round(2.6 / dx) + 1]], dtype=cp.int32)
+    gamma = cp.ones(sim.Nx_padded, dtype=sim.dtype)
+    traces = simulate(sim, source, gamma, sensors=sensors)[1].get()
+    # flat over the pulse, zero before the wall echoes arrive 1.2 behind it
+    arrival = np.array([1.0, 2.0]) + 1.0 / frequency
+    ramp = np.clip((0.35 - np.abs(t[:, None] - arrival)) / 0.1, 0.0, 1.0)
+    return traces * (0.5 - 0.5 * np.cos(np.pi * ramp)), sim
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class RelaxationTest(unittest.TestCase):
+    def test_a_relaxed_line_holds_its_quality_and_its_reference_speed(self):
+        traces, sim = _line(20.0, 12.0)
+        f = np.fft.rfftfreq(8 * sim.N, sim.dt)
+        spectra = np.fft.rfft(traces, 8 * sim.N, axis=0)
+        ratio = spectra[:, 1] / spectra[:, 0]
+        # the wavenumber over the unit between the receivers, its modulus ~ 1 / k**2
+        k = -np.unwrap(np.angle(ratio)) + 1j * np.log(np.abs(ratio))
+        modulus = 1.0 / k[(f >= 3.0) & (f <= 18.0)] ** 2
+        quality = np.abs(modulus.real / modulus.imag)
+        self.assertLess(np.abs(quality / 20.0 - 1.0).max(), 0.02)
+        at = np.argmin(np.abs(f - 6.0))
+        self.assertLess(abs(2.0 * np.pi * f[at] / k[at].real - 1.0), 1e-3)
+
+    def test_the_fit_holds_quality_where_the_step_sees_the_band(self):
+        dt = 1e-3
+        for quality, band, count in ((10.0, (1.0, 10.0), 3), (130.0, (1.0, 100.0), 5)):
+            with self.subTest(quality=quality, band=band):
+                rates, weights, _ = zener(Relaxation(quality, band, 1.0, count), dt)
+                f = np.geomspace(*band, 400)
+                omega = 2.0 / dt * np.tan(np.pi * f * dt)[:, None]
+                modulus = 1.0 - np.sum(weights * rates / (rates + 1j * omega), axis=1)
+                found = modulus.real / modulus.imag
+                self.assertLess(np.abs(found / quality - 1.0).max(), 0.01)
+
+    def test_the_relaxed_adjoint_is_the_exact_transpose(self):
+        for sim, damped in (
+            (_sim((24, 26), space_order=4, relaxation=RELAXATION), True),
+            (_sim((14, 13, 15), N=50, space_order=4, relaxation=RELAXATION), False),
+        ):
+            with self.subTest(ndim=sim.ndim):
+                source, sensors, indicator, _ = _problem(sim)
+                if damped:
+                    sim = replace(sim, damping=sponge(sim, indicator, 4, 0.2))
+                rng = np.random.default_rng(1)
+                weights = rng.standard_normal((sim.N, sensors.shape[1]))
+                weights = cp.asarray(weights, dtype=sim.dtype)
+
+                def objective(um):
+                    return float(cp.sum(weights * um)), weights
+
+                _, gradient, _, _ = source_sensitivity(
+                    sim, source, indicator, sensors, objective
+                )
+                for t_index, column in ((5, 0), (20, 1), (41, 2)):
+                    unit = cp.zeros_like(source.signal)
+                    unit[t_index, column] = 1.0
+                    record = simulate(
+                        sim, Source(source.position, unit), indicator, sensors=sensors
+                    )[1]
+                    want = objective(record)[0]
+                    got = float(gradient[t_index, column])
+                    self.assertLess(abs(got - want), 1e-12 * abs(want))
+
+    def test_the_variants_that_reverse_or_rebuild_the_field_refuse_it(self):
+        sim = _sim((24, 26), relaxation=RELAXATION)
+        source, sensors, indicator, objective = _problem(sim)
+        for variant in (reconstruction_sensitivity, superposition_sensitivity):
+            with self.subTest(variant=variant.__name__):
+                with self.assertRaises(NotImplementedError):
+                    variant(sim, source, indicator, sensors, objective)
+
+    def test_it_refuses_a_pml_and_a_band_past_nyquist(self):
+        with self.assertRaises(ValueError):
+            _sim(
+                (30, 30),
+                N=1,
+                boundary=Clamped,
+                pml=Pml(6, 2.0, frequency=2.0),
+                relaxation=RELAXATION,
+            )
+        sim = _sim((30, 30), N=1)
+        with self.assertRaises(ValueError):
+            replace(sim, relaxation=Relaxation(20.0, (2.0, 1.0 / sim.dt), 6.0))
 
 
 if __name__ == "__main__":

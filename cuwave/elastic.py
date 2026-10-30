@@ -15,6 +15,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import cupy as cp
 import cupy.typing as cpt
@@ -75,6 +76,68 @@ def voigt(ndim: int, lame: float, shear: float, plane: str = "strain") -> npt.ND
     return C
 
 
+@dataclass(frozen=True)
+class Relaxation:
+    """Constant Q over a band, for `ElasticWave.relaxation`: a generalized Zener body.
+
+    Both moduli relax alike, so Q_P = Q_S, through `mechanisms` relaxation rates
+    log-spaced over `band`, extended by half their spacing past either end, and positive
+    weights fitted so that the step holds `quality` there (Emmerich & Korn 1987,
+    https://doi.org/10.1190/1.1442386).
+    """
+
+    quality: float  # Q of both moduli over the band
+    band: tuple[float, float]  # (low, high) frequencies it holds over, cycles per time
+    reference: float  # the frequency at which wavespeed_p and wavespeed_s are phase speeds
+    mechanisms: int = 3  # relaxation rates, Q within about 1% from 2.5 a decade
+
+
+class Zener(NamedTuple):
+    """The body a `Relaxation` fits, as the step's memory update sees it."""
+
+    rates: npt.NDArray[np.float64]  # (mechanisms,) relaxation rates omega_l, per time
+    weights: npt.NDArray[np.float64]  # (mechanisms,) positive weights Y_l
+    unrelaxed: float  # M_U over the modulus at the reference, the factor on both Lame
+
+
+def _warped(frequency: npt.ArrayLike, dt: float) -> npt.NDArray[np.float64]:
+    """The angular frequency `2 tan(pi f dt) / dt` the trapezoidal memory update sees."""
+    return 2.0 / dt * np.tan(np.pi * np.asarray(frequency, dtype=np.float64) * dt)
+
+
+def zener(relaxation: Relaxation, dt: float) -> Zener:
+    """Fit `relaxation` where the step sees it, its warped frequencies, so the discrete Q is the target.
+
+    `M(omega) = M_U (1 - sum_l Y_l omega_l / (omega_l + i omega))`; `Q = Re M / Im M`
+    is linear in the weights, solved in least squares on 8 frequencies per mechanism.
+    Raises if a weight comes out negative, which no passive material has.
+    """
+    (low, high), nyquist = relaxation.band, 0.5 / dt
+    if not (relaxation.quality > 0.0 and 0.0 < low < high < nyquist):
+        raise ValueError(f"needs Q > 0 and 0 < low < high < {nyquist}: {relaxation}")
+    if not 0.0 < relaxation.reference < nyquist or relaxation.mechanisms < 1:
+        raise ValueError(f"needs 0 < reference < {nyquist}, a mechanism: {relaxation}")
+
+    # the rates over the warped band, half their spacing past either end
+    count = relaxation.mechanisms
+    lo, hi = _warped([low, high], dt)
+    pad = (hi / lo) ** (0.5 / (count - 1)) if count > 1 else 1.0
+    rates = np.geomspace(lo / pad, hi * pad, count) if count > 1 else np.sqrt([lo * hi])
+
+    # Re M / Q = Im M at 8 frequencies a mechanism, linear in the weights
+    omega = _warped(np.geomspace(low, high, 8 * count), dt)[:, None]
+    inverse = 1.0 / relaxation.quality
+    system = (rates * omega + inverse * rates**2) / (rates**2 + omega**2)
+    weights = np.linalg.lstsq(system, np.full(len(omega), inverse), rcond=None)[0]
+    if not (weights >= 0.0).all():
+        raise ValueError(f"the fit needs a negative weight, add mechanisms: {weights}")
+
+    # the unrelaxed modulus that puts the phase speed at the reference
+    reference = _warped(relaxation.reference, dt)
+    modulus = 1.0 - np.sum(weights * rates / (rates + 1j * reference))
+    return Zener(rates, weights, float(np.real(1.0 / np.sqrt(modulus)) ** 2))
+
+
 # ------------------------------- discretization setup --------------------------------
 @dataclass
 class ElasticWave(Simulation):
@@ -90,6 +153,7 @@ class ElasticWave(Simulation):
     wavespeed_p: float = None  # pressure wave speed
     wavespeed_s: float = None  # shear wave speed
     plane: str = "strain"  # "strain" or "stress", 2D only
+    relaxation: Relaxation | None = None  # the material's own attenuation, None lossless
 
     kernel_path = KERNEL_PATH
     sensitivity_path = SENSITIVITY_PATH
@@ -121,8 +185,11 @@ class ElasticWave(Simulation):
         return self.nvoigt - self.ndim
 
     def __post_init__(self) -> None:
-        """Validate the material, the 2D plane assumption and the faces, then derive the grid."""
+        """Validate the material, the 2D plane assumption and the faces, then derive the grid and the relaxation."""
+        self.zener = None
         super().__post_init__()
+
+        # the material, the plane and the faces
         if None in (self.density, self.wavespeed_p, self.wavespeed_s):
             raise ValueError("ElasticWave requires density, wavespeed_p, wavespeed_s")
         if self.plane not in ("strain", "stress"):
@@ -139,10 +206,19 @@ class ElasticWave(Simulation):
                 if condition not in (Traction, Clamped):
                     raise ValueError(f"elastic faces are Traction or Clamped: {pair}")
 
+        # the relaxation, fitted to the step's dt
+        if self.relaxation is not None:
+            if self.pml is not None:
+                raise ValueError("a relaxation takes no pml: line the faces with a sponge")
+            self.zener = zener(self.relaxation, self.dt)
+
     @property
     def compile_flags(self) -> tuple[str, ...]:
-        """The base flags, plus `-DUSE_PML` folding the layer into both step kernels."""
-        return super().compile_flags + (("-DUSE_PML",) if self.pml is not None else ())
+        """The base flags, plus `-DUSE_PML` folding the layer into both step kernels and `-DRELAXATION` the memory."""
+        flags = super().compile_flags + (("-DUSE_PML",) if self.pml is not None else ())
+        if self.relaxation is not None:
+            flags += (f"-DRELAXATION={self.relaxation.mechanisms}",)
+        return flags
 
     @property
     def radius(self) -> int:
@@ -161,16 +237,22 @@ class ElasticWave(Simulation):
 
     @property
     def lame(self) -> float:
-        """First Lame parameter `rho0 * (c_p**2 - 2 c_s**2)`, reduced under plane stress."""
+        """First Lame parameter `rho0 * (c_p**2 - 2 c_s**2)`, reduced under plane stress, unrelaxed."""
         lam = self.density * (self.wavespeed_p**2 - 2.0 * self.wavespeed_s**2)
+        lam *= self.unrelaxed
         if self.plane == "stress":
             return 2.0 * lam * self.shear / (lam + 2.0 * self.shear)
         return lam
 
     @property
     def shear(self) -> float:
-        """Second Lame parameter `rho0 * c_s**2`."""
-        return self.density * self.wavespeed_s**2
+        """Second Lame parameter `rho0 * c_s**2`, unrelaxed."""
+        return self.density * self.wavespeed_s**2 * self.unrelaxed
+
+    @property
+    def unrelaxed(self) -> float:
+        """The factor taking the moduli at the reference frequency to the unrelaxed ones the step reads, 1 lossless."""
+        return 1.0 if self.zener is None else self.zener.unrelaxed
 
     def inverse_inertia(self, indicator: cpt.NDArray) -> cpt.NDArray:
         """Nodal `1 / (gamma rho0 W)`, what a sponge scales its damping by."""
@@ -216,7 +298,7 @@ class ElasticWave(Simulation):
     def define_adjoint_step(
         self, kernels: cp.RawModule, sens_kernels: cp.RawModule, mat: dict
     ) -> Callable:
-        """Closure stepping the adjoint: the step itself, unless a pml breaks its symmetry."""
+        """Closure stepping the adjoint: the step itself, a relaxation's memory its own transpose, unless a pml breaks its symmetry."""
         return self._define_pair(kernels, mat, adjoint=self.pml is not None)
 
     def _define_pair(self, kernels: cp.RawModule, mat: dict, adjoint: bool) -> Callable:
@@ -234,6 +316,9 @@ class ElasticWave(Simulation):
             fold, memory = self._pml_fold(adjoint)
             sargs += fold
             uargs += fold
+        if self.relaxation is not None:
+            memory = [self._relaxation_memory()]
+            sargs += [memory[0], self._relaxation_coefficients()]
 
         def fd_step(u0, u1, u2):
             sargs[0] = u1
@@ -257,6 +342,7 @@ class ElasticWave(Simulation):
         return (
             self.ndim >= 2
             and self.pml is None
+            and self.relaxation is None
             and fields > device["L2CacheSize"]
             and ring <= 2 * math.prod(tile)
             and self._fused_shared() <= device["MaxSharedMemoryPerBlockOptin"]
@@ -331,6 +417,9 @@ class ElasticWave(Simulation):
             fold, memory = self._pml_fold(True)
             sargs += fold
             uargs += fold
+        if self.relaxation is not None:
+            memory = [self._relaxation_memory()]
+            sargs += [memory[0], self._relaxation_coefficients()]
 
         def adjoint_gradient_step(l0, l1, u1):
             sargs[0], sargs[at[0]] = l1, u1
@@ -365,6 +454,7 @@ class ElasticWave(Simulation):
             or self.precision != "float32"
             or radius > len(BLOCKED)
             or self.pml is not None
+            or self.relaxation is not None
             or min(self.Nx) < 4
         ):
             return None
@@ -484,6 +574,28 @@ class ElasticWave(Simulation):
         uargs += axis_geometry(self, self.step_factors())
         return sigma, sargs, uargs
 
+    def _require_unrelaxed(self) -> None:
+        """Raise under a relaxation: only the adjoint pair of `sensitivity` carries its memory."""
+        if self.relaxation is not None:
+            raise NotImplementedError(
+                "a relaxation's memory cannot be reversed, rebuilt or left out of the "
+                "gradient; use sensitivity or source_sensitivity"
+            )
+
+    def _relaxation_memory(self) -> cpt.NDArray:
+        """The memory variables, `mechanisms` rows per Voigt row, each a padded grid."""
+        rows = self.relaxation.mechanisms * self.nvoigt
+        return cp.zeros((rows, *self.Nx_padded), dtype=self.dtype)
+
+    def _relaxation_coefficients(self) -> cpt.NDArray:
+        """`c0` then `(a, read, drive)` per mechanism, the trapezoidal update centred on the step."""
+        rates, weights, _ = self.zener
+        half = 0.5 * rates * self.dt
+        a = (1.0 - half) / (1.0 + half)
+        b = 2.0 * half * weights / (1.0 + half)
+        rows = np.stack([a, 0.5 * (1.0 + a), b], axis=1).ravel()
+        return cp.asarray([1.0 - 0.5 * b.sum(), *rows], dtype=self.dtype)
+
     def damping_args(self, mat: dict) -> list:
         """The damping field and the step it is scaled by, if there is one."""
         if self.damping is None:
@@ -563,6 +675,7 @@ class ElasticWave(Simulation):
         self, kernels: cp.RawModule, mat: dict, grads: dict
     ) -> Callable:
         """Closure accumulating the point mass and stress-point stiffness densities."""
+        self._require_unrelaxed()
         gradient_kernel = kernels.get_function("gradient_kernel")
         grid, block = grid_block(self)
         inv_dx = [self.dtype(1.0 / d) for d in self.dx]
@@ -591,6 +704,7 @@ class ElasticWave(Simulation):
         self, kernels: cp.RawModule, accs: dict, sign: float
     ) -> Callable:
         """Closure accumulating both quadratic densities of one field triplet, times `sign`."""
+        self._require_unrelaxed()
         frechet_kernel = kernels.get_function("frechet_kernel")
         grid, block = grid_block(self)
         inv_dx = [self.dtype(1.0 / d) for d in self.dx]
