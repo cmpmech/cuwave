@@ -1,8 +1,8 @@
 # CUDA elastic sensitivity
 
-The backward kernels of the staggered [elastic](elastic.md) equation. Compilation, the geometry macros, the graded radii and the strain helpers are those of [cuda_elastic](cuda_elastic.md); `USE_DAMPING` does not appear, since the damped recursion transposes itself
+The backward kernels of the staggered [elastic](elastic.md) equation. Compilation, the geometry macros, the wall closure and the strain helpers are those of [cuda_elastic](cuda_elastic.md); `USE_DAMPING` does not appear, since the damped recursion transposes itself
 
-The prelude of [cuda_elastic](cuda_elastic.md) is prepended here too, so `real_t`, the coefficient accessors and the graded radii are not repeated
+The prelude of [cuda_elastic](cuda_elastic.md) is prepended here too, so `real_t`, the coefficient accessors and the closure's derivatives and norms are not repeated
 
 ## the densities
 
@@ -10,13 +10,13 @@ The residual is the elastic form of the one [cuda_scalar_sensitivity](cuda_scala
 
 $$\frac{dJ}{dm}\bigg|_s=-\frac{1}{\Delta t^2}\sum_t\lambda_s^t\left(u_s^t-2u_s^{t-1}+u_s^{t-2}\right),\qquad\frac{dJ}{d\gamma_s}=-w_s\sum_t\boldsymbol{\varepsilon}\left(\boldsymbol{\lambda}^t\right):\mathbf{C}:\boldsymbol{\varepsilon}\left(\mathbf{u}^t\right)\bigg|_s$$
 
-with $s$ a component point for the inertia and a stress point for the stiffness. Because both kernels tap the same matrix, the second one is a derivative of the discretization with no averaging left to differentiate; the kernels accumulate the raw densities and `finalize_gradients` chains them onto the nodes on the host, through the arithmetic mean of the inertia ($1/2$ per neighbour node), the identity of the node family, and the harmonic mean of a shear point
+with $s$ a component point for the inertia and a stress point for the stiffness, and $w_s$ its closure norm `point_weights`. Because both kernels tap the same matrix, the second one is a derivative of the discretization with no averaging left to differentiate; the kernels accumulate the raw densities and `finalize_gradients` chains them onto the nodes on the host, through the arithmetic mean of the inertia ($1/2$ per neighbour node), the identity of the node family, and the harmonic mean of a shear point
 
 $$\frac{\partial\gamma_s}{\partial\gamma_i}=\frac{1}{4}\left(\frac{\gamma_s}{\gamma_i}\right)^2$$
 
 ## device functions
 
-`rad_node`, `rad_half`, `clamped_face`, `normal_strains`, `condensed_lame` and `shear_strain` as in [cuda_elastic](cuda_elastic.md), evaluated here on the forward and the adjoint field alike, plus
+`node_derivative`, `half_derivative`, `deep_node`, `clamped_face`, `normal_strains`, `condensed_lame` and `shear_strain` as in [cuda_elastic](cuda_elastic.md), taken on the path `deep_node` picks, which rounds as the general one, so the densities are bit for bit those of the step's, evaluated here on the forward and the adjoint field alike, plus
 
 ### normal_form
 **aim**

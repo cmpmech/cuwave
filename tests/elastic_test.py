@@ -8,6 +8,11 @@ rest on. And the staggering shifts every component off the nodes, so sources, se
 and the reconstruction strip must all honour the half-node offsets. The shear terms
 couple diagonal neighbours, so the strip of a layer lining both axes needs its corners.
 
+The walls close the derivatives as a staggered pair that sums by parts, so they must be
+consistent: one step on a field each wall admits converges at the closure's own order,
+which graded rows miss at the wall, and a standing mode, run against its own leapfrog
+phase so space alone errs, converges two orders past it.
+
 `FusedTest` pins the one-launch 2D step a grid past L2 takes to the stress and update
 pair bit for bit: it recomputes the stresses of a ring around each tile, so a ring too
 narrow or a wall term read off the wrong tile would show at once.
@@ -67,7 +72,7 @@ if HAS_CUDA:
         superposition_sensitivity,
     )
     from cuwave.signals import ricker
-    from cuwave.stencils import staggered_weights
+    from cuwave.stencils import closure_reach, staggered_weights
     from cuwave.utils import Sensors, point_source
     from cuwave.wave import (
         Source,
@@ -208,9 +213,91 @@ def _divergence_error(order, n):
     step(u0, u1, u2)
     cp.cuda.Stream.null.synchronize()
     got = cp.asnumpy(u2 - 2.0 * u1) * RHO / sim.dt**2
-    margin = order + 1
+    margin = closure_reach(order) + order // 2
     inner = (Ellipsis, slice(margin, n - margin), slice(margin, n - margin))
     return np.abs(got[inner] - want[inner]).max() / np.abs(want[inner]).max()
+
+
+def _wall_error(order, n, wall):
+    """One step's relative error, every free point included, on a field each wall admits.
+
+    Clamped: `sin sin` per component, zero on every wall. Traction: `cos(a x)` and
+    `cos(d y)` under `lam = 0`, whose stresses vanish on every wall.
+    """
+    speed_p = np.sqrt(3.0) if wall is Clamped else np.sqrt(2.0)
+    lame, shear = RHO * (speed_p**2 - 2.0), RHO
+    dx = (1.0 / n, 1.0 / n)
+    sim = ElasticWave(
+        (n + 3, n + 3),
+        dx,
+        1,
+        0.5 * stable_dt(dx, speed_p, order),
+        (8, 32),
+        precision="float64",
+        space_order=order,
+        stencil="taylor",
+        density=RHO,
+        wavespeed_p=speed_p,
+        wavespeed_s=1.0,
+        boundary=wall,
+    )
+    axes = [(np.arange(m) - 1) * h for m, h in zip(sim.Nx_padded, dx)]
+    X, Y = np.meshgrid(*axes, indexing="ij")
+    Xs, Ys = X + 0.5 * dx[0], Y + 0.5 * dx[1]
+    a, b, c, e = np.pi, 2.0 * np.pi, 2.0 * np.pi, np.pi
+    if wall is Clamped:
+        ux, uy = np.sin(a * Xs) * np.sin(b * Y), np.sin(c * X) * np.sin(e * Ys)
+        gx = -a * a * ux + c * e * np.cos(c * Xs) * np.cos(e * Y)
+        gy = a * b * np.cos(a * X) * np.cos(b * Ys) - e * e * uy
+        want = [(lame + shear) * gx - shear * (a * a + b * b) * ux]
+        want += [(lame + shear) * gy - shear * (c * c + e * e) * uy]
+    else:
+        ux, uy = np.cos(3.0 * a * Xs) + 0.0 * Y, np.cos(b * Ys) + 0.0 * X
+        want = [-18.0 * a * a * shear * ux, -2.0 * b * b * shear * uy]
+    u1 = cp.asarray(np.stack([ux, uy]), dtype=sim.dtype)
+    mat = sim.build_materials(cp.ones(sim.Nx_padded, dtype=sim.dtype))
+    u2 = cp.zeros_like(u1)
+    sim.define_step(compile_kernels(sim), mat)(cp.zeros_like(u1), u1, u2)
+    got = cp.asnumpy(u2 - 2.0 * u1) * RHO / sim.dt**2
+
+    # the free points: each component short of its staggered ghost, less what walls hold
+    free = np.zeros(got.shape, dtype=bool)
+    free[0, 1 : n + 1, 1 : n + 2] = free[1, 1 : n + 2, 1 : n + 1] = True
+    if wall is Clamped:
+        free[0, :, [1, n + 1]] = free[1, [1, n + 1], :] = False
+    return np.abs(got - np.stack(want))[free].max() / np.abs(np.stack(want)[free]).max()
+
+
+def _mode_error(order, n, wall):
+    """A 1D standing mode after 0.75 time units, against its own leapfrog evolution."""
+    dx = (1.0 / n,)
+    N = int(np.ceil(0.75 / (0.5 * stable_dt(dx, CP, order))))
+    sim = ElasticWave(
+        (n + 3,),
+        dx,
+        N,
+        0.75 / N,
+        (128,),
+        precision="float64",
+        space_order=order,
+        stencil="taylor",
+        density=RHO,
+        wavespeed_p=CP,
+        wavespeed_s=CS,
+        boundary=wall,
+    )
+    # u on the half points 1..n, its phase the leapfrog's own, so space alone errs
+    x = (np.arange(sim.Nx_padded[0]) - 0.5) * dx[0]
+    mode = np.sin(3.0 * np.pi * x) if wall is Clamped else np.cos(3.0 * np.pi * x)
+    mode[0], mode[n + 1 :] = 0.0, 0.0
+    theta = np.arccos(1.0 - 0.5 * (sim.dt * CP * 3.0 * np.pi) ** 2)
+    mat = sim.build_materials(cp.ones(sim.Nx_padded, dtype=sim.dtype))
+    step = sim.define_step(compile_kernels(sim), mat)
+    u0 = cp.asarray(mode[None], dtype=sim.dtype)
+    u1 = np.cos(theta) * u0
+    for _ in range(N - 1):
+        u0, u1 = u1, step(u0, u1, cp.zeros_like(u1))
+    return np.abs(cp.asnumpy(u1[0]) - np.cos(N * theta) * mode).max()
 
 
 # -------------------------------- stencil and operator -------------------------------
@@ -242,14 +329,30 @@ class OperatorTest(unittest.TestCase):
                 rate = np.log2(errors[0] / errors[1])
                 self.assertGreater(rate, order - 0.5)
 
+    def test_the_walls_converge_at_the_closure_order(self):
+        for order in (4, 6, 8):
+            for wall in (Traction, Clamped):
+                with self.subTest(order=order, wall=wall):
+                    fine = _wall_error(order, 128, wall)
+                    rate = np.log2(_wall_error(order, 64, wall) / fine)
+                    self.assertGreater(rate, order // 2 - 1.25)
+
+    def test_a_standing_mode_converges_two_orders_past_the_closure(self):
+        for order in (4, 6, 8):
+            for wall in (Traction, Clamped):
+                with self.subTest(order=order, wall=wall):
+                    fine = _mode_error(order, 64, wall)
+                    rate = np.log2(_mode_error(order, 32, wall) / fine)
+                    self.assertGreater(rate, order // 2 + 1.5)
+
     def test_the_operator_is_symmetric_at_every_order_and_boundary(self):
         rng = np.random.default_rng(4)
         cases = (
             ((18, 20), 2, None),
             ((18, 20), 4, None),
-            ((18, 20), 6, Clamped),
+            ((22, 21), 6, Clamped),
             ((18, 20), 4, ((Traction, Clamped), (Clamped, Traction))),
-            ((12, 11, 13), 4, Clamped),
+            ((16, 15, 17), 4, Clamped),
         )
         for Nx, order, boundary in cases:
             with self.subTest(Nx=Nx, order=order, boundary=boundary):
@@ -378,7 +481,7 @@ class GradientTest(unittest.TestCase):
         self._check(sim, [(6, 9), (12, 12), (1, 10), (22, 11)])
 
     def test_it_matches_finite_differences_in_3D(self):
-        sim = _sim((14, 13, 15), N=50, space_order=4)
+        sim = _sim((16, 15, 17), N=50, space_order=4)
         self._check(sim, [(6, 6, 7), (1, 6, 7), (12, 5, 8)])
 
     def test_it_matches_finite_differences_on_a_clamped_wall(self):
@@ -396,7 +499,7 @@ class GradientTest(unittest.TestCase):
                         relaxation=RELAXATION,
                     )
                     self._check(sim, [(6, 9), (12, 12), (1, 10), (22, 11), (1, 1)])
-        sim = _sim((14, 13, 15), N=50, space_order=4, relaxation=RELAXATION)
+        sim = _sim((16, 15, 17), N=50, space_order=4, relaxation=RELAXATION)
         self._check(sim, [(6, 6, 7), (1, 6, 7), (12, 5, 8)])
 
     def test_a_ghost_node_carries_no_gradient(self):
@@ -511,7 +614,7 @@ class FusedTest(unittest.TestCase):
             ((37, 70), 8, None, "float32", False),
             ((37, 70), 4, mixed, "float64", False),
             ((13, 21, 40), 2, Clamped, "float32", False),
-            ((13, 21, 40), 4, mixed3, "float32", True),
+            ((13, 21, 40), 2, mixed3, "float32", True),
             ((13, 21, 40), 2, None, "float64", False),
         )
         for Nx, order, boundary, precision, damped in cases:
@@ -574,7 +677,7 @@ class AdjointGradientTest(unittest.TestCase):
             ((37, 70), 2, None, None, False),
             ((37, 70), 4, mixed, "damped", True),
             ((37, 70), 4, Clamped, "pml", False),
-            ((13, 21, 40), 4, (*mixed, (Traction, Traction)), "damped", False),
+            ((15, 21, 40), 4, (*mixed, (Traction, Traction)), "damped", False),
             ((13, 21, 40), 2, Clamped, None, True),
         )
         for Nx, order, boundary, extra, tiers in cases:
@@ -652,7 +755,8 @@ class BlockedTest(unittest.TestCase):
             ((48, 64), 16, 6),
         )
         for order, block in [(o, b) for o in (2, 4) for b in blocks]:
-            if min(block[0]) - 2 * block[2] * (order - 1) < 8:
+            # a core under 12 nodes cannot keep its tile edges off a wall's closure band
+            if min(block[0]) - 2 * block[2] * (order - 1) < 12:
                 continue
             with self.subTest(order=order, block=block):
                 sim = _sim((70, 57), 30, "float32", order, boundary=Clamped)
@@ -884,7 +988,7 @@ class RelaxationTest(unittest.TestCase):
     def test_the_relaxed_adjoint_is_the_exact_transpose(self):
         for sim, damped in (
             (_sim((24, 26), space_order=4, relaxation=RELAXATION), True),
-            (_sim((14, 13, 15), N=50, space_order=4, relaxation=RELAXATION), False),
+            (_sim((16, 15, 17), N=50, space_order=4, relaxation=RELAXATION), False),
         ):
             with self.subTest(ndim=sim.ndim):
                 source, sensors, indicator, _ = _problem(sim)

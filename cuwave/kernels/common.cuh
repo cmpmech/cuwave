@@ -5,6 +5,7 @@
 //   STENCIL_RADIUS
 //   OP_COEFFS
 //   STAG_COEFFS
+//   NODE_CLOSURE, HALF_CLOSURE, NODE_SPAN, HALF_SPAN, NODE_ROWS_C, HALF_ROWS_C
 //   DIRICHLET_FACES (default 0)
 
 #ifdef USE_FLOAT
@@ -132,11 +133,6 @@ __device__ __forceinline__ void staged_taps(real_t *t,
 #define PAIR_ROW(k, l) 2
 #endif
 
-// radius of the node-centred derivative of a staggered field, zero on the wall
-__device__ __forceinline__ int rad_node(const int a, const int N) {
-  return min(STENCIL_RADIUS, min(a - 1, N - 2 - a));
-}
-
 // radius of a half-point derivative, whose taps may sit on the wall
 __device__ __forceinline__ int rad_half(const int a, const int N) {
   return min(STENCIL_RADIUS, min(a, N - 2 - a));
@@ -152,6 +148,129 @@ __device__ __forceinline__ bool clamped_face(const int clamped, const int d,
                                              const int side) {
   return (clamped >> (2 * d + side)) & 1;
 }
+
+// ---------------------------------- staggered closure
+#ifdef NODE_CLOSURE
+// the low wall's rows of the staggered SBP pair, row 0 the wall's; the high
+// wall reads them mirrored and negated
+__device__ const real_t NODE_ROWS[NODE_CLOSURE][NODE_SPAN] = NODE_ROWS_C;
+__device__ const real_t HALF_ROWS[HALF_CLOSURE][HALF_SPAN] = HALF_ROWS_C;
+#define CLOSURE_BAND                                                           \
+  (NODE_CLOSURE > HALF_CLOSURE ? NODE_CLOSURE : HALF_CLOSURE)
+
+// a node past every wall's closure band: the interior rows on every axis
+__device__ __forceinline__ bool deep_node(const int *A, const int *NN) {
+  bool deep = true;
+#pragma unroll
+  for (int d = 0; d < NDIM; ++d)
+    deep &= A[d] > CLOSURE_BAND && A[d] < NN[d] - 2 - CLOSURE_BAND;
+  return deep;
+}
+
+// a line through a field: u(j) the value j points along the axis from idx
+struct Line {
+  const real_t *__restrict__ p;
+  int idx, s;
+  __device__ real_t operator()(const int j) const { return p[idx + j * s]; }
+};
+
+// the closure rows off either wall
+template <class L>
+__device__ __forceinline__ real_t node_rows(const L &u, const int lo,
+                                           const int hi) {
+  real_t acc = (real_t)0;
+  if (lo < NODE_CLOSURE) {
+#pragma unroll
+    for (int m = 0; m < NODE_SPAN; ++m)
+      acc += NODE_ROWS[lo][m] * u(m - lo);
+  } else {
+#pragma unroll
+    for (int m = 0; m < NODE_SPAN; ++m)
+      acc -= NODE_ROWS[hi][m] * u(hi - 1 - m);
+  }
+  return acc;
+}
+
+template <class L>
+__device__ __forceinline__ real_t half_rows(const L &u, const int lo,
+                                           const int hi) {
+  real_t acc = (real_t)0;
+  if (lo < HALF_CLOSURE) {
+#pragma unroll
+    for (int i = 0; i < HALF_SPAN; ++i)
+      acc += HALF_ROWS[lo][i] * u(i - lo);
+  } else {
+#pragma unroll
+    for (int i = 0; i < HALF_SPAN; ++i)
+      acc -= HALF_ROWS[hi][i] * u(hi + 1 - i);
+  }
+  return acc;
+}
+
+// d/dx at node a of a half-point field along a line; past a wall it reads the
+// half-grid wall point as zero
+template <bool DEEP = false, class L>
+__device__ __forceinline__ real_t node_derivative(const L &u, const int a,
+                                                  const int N) {
+  const int lo = a - 1, hi = N - 2 - a;
+  if (!DEEP && (lo < NODE_CLOSURE || hi < NODE_CLOSURE))
+    return node_rows(u, lo, hi);
+  real_t acc = (real_t)0;
+#pragma unroll
+  for (int k = 1; k <= STENCIL_RADIUS; ++k)
+    acc += SG_W(STENCIL_RADIUS, k) * (u(k - 1) - u(-k));
+  return acc;
+}
+
+// d/dx at the half point a (a + 1/2) of a nodal field along a line
+template <bool DEEP = false, class L>
+__device__ __forceinline__ real_t half_derivative(const L &u, const int a,
+                                                  const int N) {
+  const int lo = a - 1, hi = N - 3 - a;
+  if (!DEEP && (lo < HALF_CLOSURE || hi < HALF_CLOSURE))
+    return half_rows(u, lo, hi);
+  real_t acc = (real_t)0;
+#pragma unroll
+  for (int k = 1; k <= STENCIL_RADIUS; ++k)
+    acc += SG_W(STENCIL_RADIUS, k) * (u(k) - u(1 - k));
+  return acc;
+}
+
+// the divergence of a nodal stress at the half point a: half_derivative's rows,
+// which are minus node_derivative's transpose in the norms, so the norms cancel
+// against the inertia's; inside, the taps in the order the deep path rounds
+template <bool DEEP = false, class L>
+__device__ __forceinline__ real_t node_divergence(const L &sg, const int a,
+                                                  const int N) {
+  const int lo = a - 1, hi = N - 3 - a;
+  if (!DEEP && (lo < HALF_CLOSURE || hi < HALF_CLOSURE))
+    return half_rows(sg, lo, hi);
+  real_t acc = (real_t)0;
+#pragma unroll
+  for (int k = 1; k <= STENCIL_RADIUS; ++k) {
+    acc += SG_W(STENCIL_RADIUS, k) * sg(k);
+    acc -= SG_W(STENCIL_RADIUS, k) * sg(1 - k);
+  }
+  return acc;
+}
+
+// the divergence of a half-point stress at node a: node_derivative's rows, the
+// stress at the wall point never read
+template <bool DEEP = false, class L>
+__device__ __forceinline__ real_t half_divergence(const L &sg, const int a,
+                                                  const int N) {
+  const int lo = a - 1, hi = N - 2 - a;
+  if (!DEEP && (lo < NODE_CLOSURE || hi < NODE_CLOSURE))
+    return node_rows(sg, lo, hi);
+  real_t acc = (real_t)0;
+#pragma unroll
+  for (int k = 1; k <= STENCIL_RADIUS; ++k) {
+    acc += SG_W(STENCIL_RADIUS, k) * sg(k - 1);
+    acc -= SG_W(STENCIL_RADIUS, k) * sg(-k);
+  }
+  return acc;
+}
+#endif
 
 // --------------------------------------- pml slabs
 #if NDIM == 1

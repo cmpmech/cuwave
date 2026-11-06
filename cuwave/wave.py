@@ -151,9 +151,15 @@ class Blocked(NamedTuple):
     step: Callable
 
 
-def tile_counts(Nx: tuple[int, ...], tile: tuple[int, int], halo: int) -> list[int]:
-    """Tiles per axis whose cores, `tile` less `halo` each side, cover the interior."""
-    return [-(-(n - 2) // (t - 2 * halo)) for n, t in zip(Nx, tile)]
+def tile_counts(
+    Nx: tuple[int, ...],
+    tile: tuple[int, int],
+    halo: int,
+    *,
+    origin: tuple[int, int] = (1, 1),
+) -> list[int]:
+    """Tiles per axis whose cores, `tile` less `halo` each side, cover the interior from `origin`."""
+    return [-(-(n - 1 - o) // (t - 2 * halo)) for n, t, o in zip(Nx, tile, origin)]
 
 
 class TileHits(NamedTuple):
@@ -170,6 +176,8 @@ def covering_hits(
     core: list[int],
     halo: int,
     cores: list[int],
+    *,
+    origin: tuple[int, int] = (1, 1),
 ) -> TileHits:
     """Every tile whose nodes, halo included, take one of the (2, num) `points`.
 
@@ -179,11 +187,12 @@ def covering_hits(
         core: nodes of a tile's core per axis.
         halo: nodes each side between a tile's edge and its core.
         cores: tiles per axis.
+        origin: the first core's first node per axis, 1 or before.
     """
     j = np.arange(points.shape[1])
-    # tiles starting at 1 + b C - halo hold rows up to tile - 1 past their start
-    low = [(points[d] - 1 + halo - tile[d]) // core[d] + 1 for d in (0, 1)]
-    high = [(points[d] - 1 + halo) // core[d] for d in (0, 1)]
+    # tiles starting at origin + b C - halo hold rows up to tile - 1 past their start
+    low = [(points[d] - origin[d] + halo - tile[d]) // core[d] + 1 for d in (0, 1)]
+    high = [(points[d] - origin[d] + halo) // core[d] for d in (0, 1)]
     spans = [-(-tile[d] // core[d]) for d in (0, 1)]
     hits = []
     for o0, o1 in itertools.product(range(spans[0]), range(spans[1])):
@@ -195,19 +204,30 @@ def covering_hits(
 
 
 def owner_hits(
-    points: npt.NDArray[np.int64], owners: npt.NDArray[np.int64], core: list[int]
+    points: npt.NDArray[np.int64],
+    owners: npt.NDArray[np.int64],
+    core: list[int],
+    *,
+    origin: tuple[int, int] = (1, 1),
 ) -> TileHits:
     """The one tile whose core holds each of the (2, num) `owners` nodes, for `points`."""
-    tiles = (owners - 1) // np.asarray(core)[:, None]
+    tiles = (owners - np.asarray(origin)[:, None]) // np.asarray(core)[:, None]
     return TileHits(tiles, points, np.arange(points.shape[1]))
 
 
 def column_keys(
-    hits: TileHits, tile: tuple[int, int], core: list[int], halo: int, cores: list[int]
+    hits: TileHits,
+    tile: tuple[int, int],
+    core: list[int],
+    halo: int,
+    cores: list[int],
+    *,
+    origin: tuple[int, int] = (1, 1),
 ) -> npt.NDArray[np.int64]:
     """Each hit's tile, row-major over `cores`, times the tile's nodes plus its node in it."""
     (b0, b1), (a0, a1) = hits.tiles, hits.nodes
-    local = (a0 - 1 - b0 * core[0] + halo) * tile[1] + a1 - 1 - b1 * core[1] + halo
+    first = [o + b * c - halo for o, b, c in zip(origin, (b0, b1), core)]
+    local = (a0 - first[0]) * tile[1] + a1 - first[1]
     return (b0 * cores[1] + b1) * (tile[0] * tile[1]) + local
 
 
@@ -218,6 +238,8 @@ def tile_lists(
     halo: int,
     cores: list[int],
     layers: npt.NDArray[np.int64] | None = None,
+    *,
+    origin: tuple[int, int] = (1, 1),
 ) -> list[cpt.NDArray]:
     """The points each 2D blocked tile holds: CSR row starts, entries `local | j << 16`.
 
@@ -229,8 +251,9 @@ def tile_lists(
         cores: tiles per axis.
         layers: (num,) a component per point, `local` counting the tile's nodes
             once per component before it, or None for one component.
+        origin: the first core's first node per axis, 1 or before.
     """
-    keys = column_keys(hits, tile, core, halo, cores)
+    keys = column_keys(hits, tile, core, halo, cores, origin=origin)
     ids, local = np.divmod(keys, tile[0] * tile[1])
     if layers is not None:
         local = local + layers[hits.j] * (tile[0] * tile[1])

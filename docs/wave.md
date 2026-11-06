@@ -131,7 +131,7 @@ see [boundary](boundary.md)
 | storage | `narrow(values, dtype)`, `widen(values, dtype)` | the conversions a narrowed window stages through, with `BFLOAT16`, a `uint16` record holding the upper half of each `float32`, rounded to nearest even |
 | chunk | `CHUNK = 24` | steps per graph, a multiple of every slot rotation period (2 for a pair, 3 for a triplet) |
 | blocked launches | `blocked_launches(steps, launches, block, shared, args, slots)` | the `Blocked` closure an equation's blocked step returns: its kernels over the swapped pairs, the per-call values put at `LaunchSlots` |
-| blocked tiles | `tile_counts(Nx, tile, halo)`, `covering_hits(...)`, `owner_hits(...)`, `tile_lists(...)` | tiles whose cores cover the interior, the tiles holding each source (halo included) or recording each sensor (core), and their per-tile CSR lists |
+| blocked tiles | `tile_counts(Nx, tile, halo, origin=(1, 1))`, `covering_hits(...)`, `owner_hits(...)`, `tile_lists(...)` | tiles whose cores cover the interior from `origin`, the tiles holding each source (halo included) or recording each sensor (core), and their per-tile CSR lists; an [elastic](elastic.md) step moves `origin` before node 1 so no tile edge cuts a wall's closure band |
 
 A graph holds fixed pointers and fixed scalars, so a captured step cannot move along a record. The windows therefore stage each record through a buffer of `CHUNK + halo` rows, copied in before and out after each replay, and `step` addresses that buffer at row `k` where the plain loop addresses the record at row `t`. That fixes what a `step` may do: launch kernels only, pick its slots by `t` modulo a divisor of `CHUNK` (never by rebinding a variable, which a replay would not repeat), and touch each record only through its window. A record the kernels index by row offset has to be contiguous, so a backward pass that reads one in reverse hands over a reversed copy, while the history, whose rows go to the kernels as separate pointers, can be a reversed view
 
@@ -150,7 +150,7 @@ here and both [elastic](elastic.md) and [maxwell](maxwell.md) call it
 | member | signature | description |
 |---|---|---|
 | voigt order | `PAIRS` | the $\left(k,l\right)$ pairs per dimension, the shear or curl rows being `PAIRS[ndim][ndim:]` |
-| weights | `wall_weights(sim, axes)` | the cell weights $W$ of a point family staggered along `axes` (`(c,)` for component `c`, the pair for a pair point), halved on the walls of the other axes |
+| weights | `wall_weights(sim, axes)` | the cell weights $W$ of a point family staggered along `axes` (`(c,)` for component `c`, the pair for a pair point), halved on the walls of the other axes, which [maxwell](maxwell.md) weighs its points by; [elastic](elastic.md) takes its closure's norms instead |
 | averages | `point_average(sim, field, c)`, `point_harmonic(sim, field, c)`, `pair_average(sim, field, axes)` | the arithmetic and the harmonic two-node mean at a component point (an elastic density, a permittivity) and the harmonic four-node mean at a pair point |
 | average adjoints | `point_average_adjoint(sim, density, c)`, `point_harmonic_adjoint(sim, density, field, c)`, `pair_average_adjoint(sim, density, field, axes)` | their transposes, which is how a point density is chained back onto the nodal design field |
 
@@ -164,8 +164,8 @@ equations hold in common is the lattice, and their material models, `build_mater
 `RawModule`: the coefficient tables from [stencils](stencils.md) `preamble`, then
 `kernels/common.cuh`. The prelude carries what every equation repeats, so a `.cu` holds
 only its own operator: the `real_t` typedef with its rounded `MUL_RN` and `FMA_RN` (which nvcc never contracts, so two kernels inlining one formula round alike), the `OP_W` and `SG_W` accessors and the mirrored taps of the pressure walls
-with their `__constant__ tables`, `NPAIRS` / `PAIR_ROW`, `rad_node` / `rad_half`,
-`clamped_face`, and the byte-identical `excitation_kernel`, `get_signal_kernel` and
+with their `__constant__ tables`, `NPAIRS` / `PAIR_ROW`, `rad_half`,
+the staggered SBP closure of the elastic walls, `clamped_face`, and the byte-identical `excitation_kernel`, `get_signal_kernel` and
 `set_signal_kernel`
 
 Injecting it as source rather than as an include keeps the module cache correct without an

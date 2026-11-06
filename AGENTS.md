@@ -88,10 +88,22 @@ several launches per step overrides `Simulation.define_step` instead (the stagge
 elastic's stress+update pair does), still without touching `simulate`.
 
 The vector siblings: `elastic.ElasticWave` is staggered (component `c` half a node up
-axis `c`, declared via `component_offsets`, which `utils.distribute` honours), carries any
-even `space_order` at per-axis cost, and is the exact transpose at every order. Its kernels
-read `gamma` alone and average it onto each point per read (no inertia or shear grids), and
-`deep_node` sends threads 2r inside every wall down a template path with no wall terms.
+axis `c`, declared via `component_offsets`, which `utils.distribute` honours), carries
+`space_order` 2 to 8 at per-axis cost, and is the exact transpose at every order. Its kernels
+read `gamma` alone and average it onto each point per read (no inertia or shear grids).
+Its walls are not images (a wall reflection turns P into S waves) but the staggered SBP
+closures of Prochnow et al. 2017 (`stencils.staggered_pair`, the low wall's rows in the
+preamble, mirrored onto the high wall by `node_rows`/`half_rows` of `common.cuh`):
+consistent at the wall, a run converges about two orders past their order r, where the
+old graded rows stalled. Summation by parts turns the update's `-M^-1 D+^T W` into `D-`
+(and back), so the update takes the other derivative's rows and no kernel reads a norm;
+the norms live in Python (`point_weights` for the gradient chain, `point_inverse_inertia`
+for a point load). The pml memory terms use the same rows, so their adjoint transposes
+still pair. `deep_node` sends threads past the band (`CLOSURE_BAND`: 2r rows Taylor, 3r-1
+optimized, whose `D-` follows from `Q- = B - Q+^T`) down a template path with no wall
+terms; an axis needs `2 closure_band + 3` nodes. A band reads further than a radius, so
+the fused step puts each axis' last tile flush with its end (`tile_origin`) and the
+blocked step shifts its cores (`origin`) until no tile edge cuts a band.
 `ElasticWave.relaxation` (an `elastic.Relaxation`) is the material's own attenuation: a
 generalized Zener body, `-DRELAXATION` memory variables per stress settled in the stress
 pass, fitted by `zener` to a constant Q over a band. The relaxed step is its own transpose,
@@ -105,8 +117,9 @@ which sizes the reconstruction strip.
 
 `maxwell.MaxwellWave` is the Yee lattice as `-C^T nu C`, which is the staggered elastic
 layout with the normal-stress block deleted, so it shares that whole geometry layer:
-`wall_weights`, `point_average`, `point_harmonic`, `pair_average` and their adjoints are
-free functions in `wave.py`, not methods, precisely because two equations need them. It is
+`point_average`, `point_harmonic`, `pair_average` and their adjoints are free functions in
+`wave.py`, not methods, precisely because two equations need them (`wall_weights` beside
+them is Maxwell's alone now, elastic weighing by its closure norms). It is
 2D/3D only and its kernel-less walls are `Conductor`/`Magnetic`, both mirror symmetries:
 the curl reads past a wall off the field's image and the update off the curl's
 (`node_imaged`/`half_imaged`, the parity on `-DCONDUCTOR_FACES`), so the walls keep
@@ -163,9 +176,9 @@ and the cell onto one stays open with the zero at the cell *midpoint* (radius co
 `USE_FLOAT`, `USE_DAMPING` and `USE_MAGNETIC` go in as `-D` flags, while two source blocks
 are *prepended* so CuPy's module cache keys on them without a flag: the stencil table from
 `stencils.preamble(space_order, stencil)` (`Simulation.stencil`, default `"optimized"`, the
-dispersion-fitted full-radius row, second order under refinement; `"taylor"` the formal-order one; the graded rows below it stay Taylor and serve only a `domain`'s cut cells), then `kernels/common.cuh`.
+dispersion-fitted full-radius row, second order under refinement; `"taylor"` the formal-order one; the graded rows below it stay Taylor and serve only a `domain`'s cut cells and Maxwell's pml memory terms; orders 2 to 8 add the elastic closure tables), then `kernels/common.cuh`.
 That prelude holds what every `.cu` repeated (the `real_t` typedef, the `OP_W`/`SG_W`
-accessors, `rad_node`/`rad_half`, `PAIR_ROW`, and the four transfer kernels); the `AXIS_*`
+accessors, `rad_half`, the staggered closure, `PAIR_ROW`, and the four transfer kernels); the `AXIS_*`
 macro blocks stay per file, since the anisotropic adjoint's signature genuinely differs. Any new flag is added to both the
 `.cu` header block and `Simulation.compile_flags`.
 

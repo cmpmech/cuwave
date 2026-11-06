@@ -24,20 +24,30 @@ The coefficients are not written by hand. The operator is assembled as
 
 $$\mathbf{L}=-\sum_s w_s\,\gamma_s\,\mathbf{B}_s^\top\mathbf{C}\,\mathbf{B}_s$$
 
-with $\mathbf{B}_s$ the staggered symmetric gradient onto stress point $s$, $w_s$ the cell weight (halved per wall the point sits on), and $\gamma_s$ the design field sampled there: the nodal value for the normal family, the harmonic mean of the four straddled nodes for a shear point (`pair_average`), following the volume averaging of [Moczo et al. 2002](https://doi.org/10.1785/0120010167). The inertia is the arithmetic two-node mean at each component's own point (`point_average`). Deriving the operator this way buys the same four properties the cell assembly had, and every one of them is what a later stage rests on
+with $\mathbf{B}_s$ the staggered symmetric gradient onto stress point $s$, $w_s$ the norm of the wall closure there (`point_weights`, 1 in the interior), and $\gamma_s$ the design field sampled there: the nodal value for the normal family, the harmonic mean of the four straddled nodes for a shear point (`pair_average`), following the volume averaging of [Moczo et al. 2002](https://doi.org/10.1785/0120010167). The inertia is the arithmetic two-node mean at each component's own point (`point_average`). Deriving the operator this way buys the same four properties the cell assembly had, and every one of them is what a later stage rests on
 
 | property | why it holds | what needs it |
 |---|---|---|
 | exactly symmetric | both kernels key every tap off the stress point it belongs to, so forward and transpose read the same matrix | the adjoint is the exact transpose, at **every** order |
 | negative semidefinite | $\mathbf{C}$ is positive definite | the leapfrog is stable, with no material to check |
 | material never differentiated | $\gamma_s$ enters as a point multiplier | the gradient needs no derivative of the stencil |
-| traction free without a kernel | a wall stress point grades to a zero row and its axis is condensed out | a free surface on faces, edges and corners alike |
+| traction free without a kernel | the wall node's normal stress is a zero row and its axis is condensed out | a free surface on faces, edges and corners alike |
 
 Unlike a centred difference, a staggered one does not annihilate the checkerboard $\left(-1\right)^{i+j}$, so the hourglass mode the cell scheme needed full quadrature against never arises
 
 ## higher order
 
-`space_order` is $2r$ for a stencil radius $r$, and any even order is allowed. Each staggered derivative widens to $2r$ taps with the coefficients of [stencils](stencils.md) `staggered_weights`, graded down towards a wall so no tap leaves the domain, exactly as the scalar flux grades. The cost is a handful of $2r$-tap differences per node, so order 6 runs within a factor of the memory-bound floor of order 2 and the choice of order is no longer a cost question
+`space_order` is $2r$ for a stencil radius $r$, from 2 to 8. Each staggered derivative widens to $2r$ taps with the coefficients of [stencils](stencils.md) `staggered_weights`. The cost is a handful of $2r$-tap differences per node, so order 6 runs within a factor of the memory-bound floor of order 2 and the choice of order is no longer a cost question
+
+## the walls
+
+A wall cannot take the interior row: a traction or clamped wall is no mirror symmetry of the Navier equations, since a reflection there turns pressure waves into shear ones, so the pressure equation's images do not carry over. The derivatives instead close at the walls as a staggered pair that sums by parts, the closures of [Prochnow et al. 2017](https://doi.org/10.1016/j.compfluid.2017.03.015) built in [stencils](stencils.md) `staggered_pair`: within `closure_band` nodes of a wall the node derivative $D_+$ and the half-point one $D_-$ take the published rows, and the norms $H_+$, $H_-$ weigh every point
+
+$$H_+D_++\left(H_-D_-\right)^\top=B$$
+
+with $B$ reading the wall points of the half grid alone. Each wall is a node with a half-grid wall point of zero norm, which only the wall node's own row reads: a clamped wall holds it at zero and a traction wall's normal stress, all that row feeds, is zero, so neither stores it. The operator is $-\mathbf{B}^\top\mathbf{C}\mathbf{B}$ with the norms as its weights $w_s$, each point carrying their product along its axes, $H_-$ along those it is staggered on and $H_+$ along the rest, so it is the exact transpose and negative semidefinite as before. The summation by parts turns its divergence into the other derivative, $-M^{-1}D_+^\top W=D_-$ and $-M^{-1}D_-^\top W=D_+$ on every unknown, the norms of the stress cancelling those of the inertia: the step forms $\gamma\mathbf{C}\mathbf{B}u$ and takes the rows of the other derivative, reading no norm and reaching no further than the strains. Only a point load, which divides by the inertia's norm (`point_inverse_inertia`), and the gradient chain (`point_weights`) carry them
+
+A closure row of either derivative is accurate to order $r$, half the interior's, and a run converges about two orders past it, where rows graded down to the wall are inconsistent there and stall the run. The rows assume the Taylor interior, so `stencil="optimized"` keeps them for $D_+$, and $D_-$ follows from the summation by parts; where the two meet, the step is off by the fit's distance from Taylor, smaller than the graded rows' error but enough that the formal order at the walls is `"taylor"`'s alone, and the band widens from $2r$ to $3r-1$ points. An axis needs `2 closure_band(space_order, stencil) + 3` nodes, so the two closures never meet
 
 Two prices remain, and they are the honest limits of a wide stencil rather than of this scheme:
 
@@ -50,7 +60,7 @@ The reconstruction strip of [sensitivity](sensitivity.md) follows `reach` $=2r-1
 
 | member | signature | description |
 |---|---|---|
-| constructor | `ElasticWave(Nx, dx, N, dt, threads, density=None, wavespeed_p=None, wavespeed_s=None, plane="strain", relaxation=None)` | on top of [Simulation](wave.md), the two speeds, the background density and the material's attenuation, rejecting a shear speed above the pressure one, any face that is not `Traction` or `Clamped` and a relaxation beside a pml |
+| constructor | `ElasticWave(Nx, dx, N, dt, threads, density=None, wavespeed_p=None, wavespeed_s=None, plane="strain", relaxation=None)` | on top of [Simulation](wave.md), the two speeds, the background density and the material's attenuation, rejecting a shear speed above the pressure one, any face that is not `Traction` or `Clamped`, a relaxation beside a pml, an order past 8 and an axis too short for both closures |
 | attenuation | `Relaxation(quality, band, reference, mechanisms=3)` | the frozen record `relaxation` takes: $Q$ over a band, and the frequency at which the speeds are phase speeds |
 | relaxation fit | `zener(relaxation, dt)` | the `Zener` rates, weights and `unrelaxed` factor, fitted where the step sees the band, raising on a negative weight |
 | unrelaxed moduli | `unrelaxed` | $M_U/M\left(f_r\right)$, the factor on `lame` and `shear`, 1 without a relaxation |
@@ -58,18 +68,19 @@ The reconstruction strip of [sensitivity](sensitivity.md) follows `reach` $=2r-1
 | stencil radius | `radius` | half `space_order`, each derivative reaching twice it |
 | strip radius | `reach` | $2r-1$, the nodes one step reads past a point |
 | materials | `build_materials(indicator)` | the design field alone, and `damping`: the kernels average $\gamma$ onto the stress and component points themselves, so no material grid is stored beside it |
-| point inertia | `point_inverse_inertia(gamma, lin_index)` | $1/\left(\rho_0W\bar{\gamma}\right)$ on the component points `lin_index`, zero where a clamped wall holds them, the value the kernels form, for the excitation weights |
+| norms | `point_weights(half)` | the closure norm $W$ of the points on the half grid of the axes `half` and on the nodes of the rest, which the gradient chain weighs the point densities by |
+| point inertia | `point_inverse_inertia(gamma, lin_index)` | $1/\left(\rho_0W\bar{\gamma}\right)$ on the component points `lin_index`, zero where a clamped wall holds them, the inverse mass a point load divides by: the kernels' value over the norm |
 | step | `define_step(kernels, mat)` | the two-launch closure: the stress kernel, then the update, each followed by its [pml](boundary.md) terms when `pml` is set, the stress kernel relaxing the stresses under a `relaxation`; without either, where the fields spill out of L2 and the stencil is narrow enough for the tile (2D, and order 2 in 3D), one fused launch instead (`FUSED_TILE`) |
-| blocked step | `define_blocked_step(mat, source, sensors)` | in 2D float32 without a pml or a relaxation, a `Blocked` closure advancing several steps a launch, the excitation and the record inside the tile, bitwise the pair launched step by step: on a grid whose tiles fill at most `BLOCKED_WAVES` waves of multiprocessors (four at order 2, one at order 4) the candidate of `BLOCKED` with the fewest waves, at order 2 past 2.25 times L2 `LARGE_BLOCKED`, which beats the fused launch there; else `None` |
+| blocked step | `define_blocked_step(mat, source, sensors)` | in 2D float32 without a pml or a relaxation, a `Blocked` closure advancing several steps a launch, the excitation and the record inside the tile, bitwise the pair launched step by step: on a grid whose tiles fill at most `BLOCKED_WAVES` waves of multiprocessors (four at order 2, one at order 4) the candidate of `BLOCKED` with the fewest waves, at order 2 past 2.25 times L2 `LARGE_BLOCKED`, which beats the fused launch there, its cores shifted so no tile edge cuts a wall's closure band; else `None` |
 | adjoint step | `define_adjoint_step(kernels, sens_kernels, mat)` | the step itself, a relaxation's memory included, or with a pml its transpose, which pushes each memory back through the other pass |
 | adjoint gradient | `define_adjoint_gradient(kernels, mat, grads)` | the adjoint step carrying both gradients, compiled with `-DGRADIENT` on either tier of the step, a pml included: the stress pass adds the stiffness densities of `l1` against the forward field, under a relaxation of its relaxed strains, the update the inertia density summed by parts in time; `sensitivity` takes it since `fuses_adjoint` is set |
 | pml margin | `pml_margin` | $r-1$, the undamped layer nodes before the front, since a corrected strain is read that far |
 | pml arguments | `step_args(mat)`, `stress_material(mat)` | the stress scratch and the argument lists the stress and update kernels, and their pml terms, share |
-| inertia | `inverse_inertia(indicator)` | nodal $1/\left(\gamma\rho_0W\right)$, what a [sponge](boundary.md) scales its damping by |
+| inertia | `inverse_inertia(indicator)` | nodal $1/\left(\gamma\rho_0\right)$, the inertia the damped update divides by and a [sponge](boundary.md) scales its damping by |
 | coefficients | `parametrization_jacobian(indicator)` | $\left(1,\,1\right)$, since $\gamma$ scales inertia and stiffness alike |
 | per-axis factors | `step_factors()` | $\Delta t^2/\Delta x_d$, the strain carrying the other $1/\Delta x$ |
 | source scaling | `source_factor()` | $1$; the excitation weights divide by the volume the kernel inertia leaves out |
-| lattice geometry | `wall_weights`, `point_average`, `pair_average` | the point families' cell weights and material means, shared with [maxwell](maxwell.md) and therefore living in [wave](wave.md) |
+| lattice geometry | `point_average`, `pair_average` | the point families' material means, shared with [maxwell](maxwell.md) and therefore living in [wave](wave.md) |
 | timestep | `stable_timestep(sim, indicator, ...)` | the largest stable step, measured on the step kernel; also in [wave](wave.md), since it names no elastic concept |
 | stiffness matrix | `voigt(ndim, lame, shear, plane="strain")` | the isotropic Voigt matrix, `plane` selecting strain or stress in 2D |
 
@@ -88,11 +99,11 @@ with the Lamé parameters recovered as `lame` $\lambda=\rho_0\left(c_p^2-2c_s^2\
 | condition | meaning | cost |
 |---|---|---|
 | `Traction` | $\boldsymbol{\sigma}\cdot\mathbf{n}=0$, the default: the wall stress point condenses its axis out of the coupling | no kernel and no launch |
-| `Clamped` | $\mathbf{u}=0$, the tangential wall unknowns held by a zeroed inverse inertia, the normal strain folded antisymmetrically about the wall | no kernel and no launch |
+| `Clamped` | $\mathbf{u}=0$, the tangential wall unknowns held by a zeroed inverse inertia, the wall node's normal strain reading the held wall point | no kernel and no launch |
 | `sponge` | the same damping field the pressure equation takes, shared by every component | as [boundary](boundary.md) |
 | `Pml` | a matched layer behind `Clamped` faces, `frequency` required, a free surface may cross it, no relaxation beside it | a strain and a divergence memory per lined axis, two launches a step |
 
-A traction wall condenses each graded-out axis by the plane stress reduction $\lambda\to2\lambda\mu/\left(\lambda+2\mu\right)$, so the surface-tangential stiffness is the statically condensed one rather than merely the interior one with a row deleted. The wall-normal component carries no unknown on the wall itself, so a source or receiver coordinate placed **on** a traction surface lands on the unknown half a cell inside, which is the staggered convention for a surface force
+A traction wall condenses the axis of each wall its node sits on by the plane stress reduction $\lambda\to2\lambda\mu/\left(\lambda+2\mu\right)$, so the surface-tangential stiffness is the statically condensed one rather than merely the interior one with a row deleted. The wall-normal component carries no unknown on the wall itself, so a source or receiver coordinate placed **on** a traction surface lands on the unknown half a cell inside, which is the staggered convention for a surface force
 
 A sponge behind an elastic wall has to swallow the shear and surface waves as well as the pressure one, and the shear wavelength is $c_p/c_s$ shorter at the same frequency, so a layer sized on the pressure wavelength leaks. Size it on $c_s$ and expect what is left to show in the tangential component
 

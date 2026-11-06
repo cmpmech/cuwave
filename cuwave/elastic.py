@@ -6,7 +6,8 @@ axes. Each is a pure per-axis staggered difference, which is what carries the cr
 terms a per-axis flux cannot and keeps the cost linear in the stencil radius, where the
 cell gather of `AnisotropicElasticWave` pays `(2r)**(2 ndim)`. The operator is
 `-B^T C B` with the material sampled on the stress points, so it stays the exact
-transpose at every order.
+transpose at every order. Its walls are the closures of a staggered SBP pair, whose norms
+weigh the stress and component points, so the walls keep the interior order.
 """
 
 from __future__ import annotations
@@ -23,13 +24,13 @@ import numpy as np
 import numpy.typing as npt
 
 from .boundary import Clamped, Traction, face_mask, faces_with
+from .stencils import CLOSURES, closure_band, closure_norms, closure_reach
 from .wave import (
     PAIRS,
     Blocked,
     LaunchSlots,
     Simulation,
     Source,
-    apply_cell_weights,
     axis_geometry,
     blocked_launches,
     compile_kernels,
@@ -41,7 +42,6 @@ from .wave import (
     point_average_adjoint,
     tile_counts,
     tile_lists,
-    wall_weights,
 )
 
 KERNEL_PATH = Path(__file__).parent / "kernels" / "elastic.cu"
@@ -138,6 +138,19 @@ def zener(relaxation: Relaxation, dt: float) -> Zener:
     return Zener(rates, weights, float(np.real(1.0 / np.sqrt(modulus)) ** 2))
 
 
+def _band_free_origin(n: int, tile: int, core: int, halo: int, band: int) -> int | None:
+    """The latest first core start, 1 or before, that puts no blocked tile's edge inside a wall's closure band."""
+    for origin in range(1, 1 - core, -1):
+        count = -(-(n - 1 - origin) // core)
+        firsts = [origin + b * core - halo for b in range(1, count)]
+        lasts = [first + tile - 1 for first in [origin - halo, *firsts][:-1]]
+        if all(f <= 1 or f > band for f in firsts) and all(
+            e >= n - 2 or e < n - 2 - band for e in lasts
+        ):
+            return origin
+    return None
+
+
 # ------------------------------- discretization setup --------------------------------
 @dataclass
 class ElasticWave(Simulation):
@@ -206,6 +219,16 @@ class ElasticWave(Simulation):
                 if condition not in (Traction, Clamped):
                     raise ValueError(f"elastic faces are Traction or Clamped: {pair}")
 
+        # the order the walls close at, and room for both closures
+        if self.space_order not in CLOSURES:
+            raise ValueError(f"the walls close up to order 8: {self.space_order}")
+        least = 2 * closure_band(self.space_order, self.stencil) + 3
+        if min(self.Nx) < least:
+            raise ValueError(
+                f"Nx {self.Nx} at order {self.space_order} needs {least} nodes an "
+                f"axis for both closures"
+            )
+
         # the relaxation, fitted to the step's dt
         if self.relaxation is not None:
             if self.pml is not None:
@@ -255,13 +278,31 @@ class ElasticWave(Simulation):
         return 1.0 if self.zener is None else self.zener.unrelaxed
 
     def inverse_inertia(self, indicator: cpt.NDArray) -> cpt.NDArray:
-        """Nodal `1 / (gamma rho0 W)`, what a sponge scales its damping by."""
-        mass = (
-            indicator
-            * self.density
-            * apply_cell_weights(self, cp.ones(self.Nx_padded, dtype=self.dtype))
-        )
+        """Nodal `1 / (gamma rho0)`, the inertia the update damps by and a sponge scales its damping by."""
+        mass = indicator * self.density
         return 1.0 / cp.maximum(mass, cp.finfo(self.dtype).tiny)
+
+    def point_weights(self, half: tuple[int, ...]) -> cpt.NDArray:
+        """The norm W of the points on the half grid of the axes `half` and on the nodes of the rest."""
+        w = cp.ones(self.Nx_padded, dtype=self.dtype)
+        for d, line in enumerate(self._norm_lines(half)):
+            shape = [1] * self.ndim
+            shape[d] = -1
+            w *= cp.asarray(line.reshape(shape), dtype=self.dtype)
+        return w
+
+    def _norm_lines(self, half: tuple[int, ...]) -> list[npt.NDArray[np.float64]]:
+        """Per axis the closure norms along its padded extent, 1 on the ghosts and past the walls."""
+        lines = []
+        for d, n in enumerate(self.Nx):
+            node, half_points = closure_norms(self.space_order, int(n) - 3)
+            line = np.ones(self.Nx_padded[d])
+            if d in half:
+                line[1 : n - 2] = half_points
+            else:
+                line[1 : n - 1] = node
+            lines.append(line)
+        return lines
 
     def build_materials(self, indicator: cpt.NDArray) -> dict:
         """The design field alone: the kernels average it onto the stress and component points."""
@@ -273,23 +314,34 @@ class ElasticWave(Simulation):
     def point_inverse_inertia(
         self, gamma: cpt.NDArray, lin_index: cpt.NDArray[cp.int32]
     ) -> cpt.NDArray:
-        """`1 / (rho0 W mean gamma)` on the component points `lin_index`, as `point_minv` forms it."""
+        """`1 / (rho0 W mean gamma)` on the component points `lin_index`, the inverse mass a point load divides by.
+
+        The kernels' `point_minv` leaves the norm W out, which the summation by parts
+        cancels against the stresses' (`_point_norms`), so it is this times W.
+        """
         component, node = lin_index // self.comp_stride, lin_index % self.comp_stride
         rows = [node // s % n for s, n in zip(self.strides, self.Nx_padded)]
         step = cp.asarray(self.strides, dtype=lin_index.dtype)[component]
         flat = gamma.ravel()
         mean = 0.5 * (flat[node] + flat[node + step])
-        weight = cp.ones(lin_index.shape, dtype=self.dtype)
-        for d, a in enumerate(rows):
-            for index in (1, self.Nx[d] - 2):
-                weight = cp.where((a == index) & (component != d), 0.5 * weight, weight)
-        mass = self.density * weight * mean
+        mass = self.density * self._point_norms(lin_index) * mean
         minv = 1.0 / cp.maximum(mass, cp.finfo(self.dtype).tiny)
         for face in faces_with(self, Clamped):
             d = face // 2
             wall = 1 if face % 2 == 0 else self.Nx[d] - 2
             minv = cp.where((rows[d] == wall) & (component != d), 0.0, minv)
         return minv.astype(self.dtype)
+
+    def _point_norms(self, lin_index: cpt.NDArray[cp.int32]) -> cpt.NDArray:
+        """The norm W on the component points `lin_index`: the half points' along its own axis."""
+        component, node = lin_index // self.comp_stride, lin_index % self.comp_stride
+        nodal = self._norm_lines(())
+        weight = cp.ones(lin_index.shape, dtype=self.dtype)
+        for d, line in enumerate(self._norm_lines(tuple(range(self.ndim)))):
+            a = node // self.strides[d] % self.Nx_padded[d]
+            norms = cp.asarray(np.stack([nodal[d], line]), dtype=self.dtype)
+            weight = weight * norms[(component == d).astype(cp.int32), a]
+        return weight
 
     def define_step(self, kernels: cp.RawModule, mat: dict) -> Callable:
         """Closure launching the stress kernel and then the update over (u0, u1, u2)."""
@@ -341,6 +393,7 @@ class ElasticWave(Simulation):
         ring = math.prod(t + self.space_order for t in tile)
         return (
             self.ndim >= 2
+            and min(tile) > closure_reach(self.space_order, self.stencil)
             and self.pml is None
             and self.relaxation is None
             and fields > device["L2CacheSize"]
@@ -483,7 +536,15 @@ class ElasticWave(Simulation):
         tile, rows, steps = block
         halo = steps * reach
         core = [t - 2 * halo for t in tile]
-        cores = tile_counts(self.Nx, tile, halo)
+
+        # the first cores moved until no tile edge cuts a wall's closure band
+        band = closure_band(self.space_order, self.stencil)
+        origin = [
+            _band_free_origin(*axis, halo, band) for axis in zip(self.Nx, tile, core)
+        ]
+        if None in origin:
+            return None
+        cores = tile_counts(self.Nx, tile, halo, origin=origin)
 
         # sources on points the step moves, sensors in the interior, none twice
         sources = flatten_indices(self, source.position)
@@ -509,12 +570,12 @@ class ElasticWave(Simulation):
 
         # a tile's sources wherever its nodes reach, its sensors where its core does
         hits = [
-            covering_hits(points[0], tile, core, halo, cores),
-            owner_hits(points[1], points[1], core),
+            covering_hits(points[0], tile, core, halo, cores, origin=origin),
+            owner_hits(points[1], points[1], core, origin=origin),
         ]
         lists = []
         for hit, layer in zip(hits, layers):
-            lists += tile_lists(hit, tile, core, halo, cores, layer)
+            lists += tile_lists(hit, tile, core, halo, cores, layer, origin=origin)
 
         # the kernel and its arguments, the pointers swapped per launch
         flags = (f"-DSTEPS={steps}", f"-DTILE0={tile[0]}", f"-DTILE1={tile[1]}")
@@ -534,7 +595,7 @@ class ElasticWave(Simulation):
         slots = LaunchSlots(len(args) - 10, len(args) - 7, len(args) - 1, None)
         args += [face_mask(self, Clamped), np.int32(self.comp_stride)]
         args += [self.dtype(1.0 / d) for d in self.dx]
-        args += axis_geometry(self, self.step_factors())
+        args += [*axis_geometry(self, self.step_factors()), *map(np.int32, origin)]
         launches = [(kernel, tuple(cores[::-1]), None)]
         return blocked_launches(steps, launches, (tile[1], rows), shared, args, slots)
 
@@ -614,9 +675,10 @@ class ElasticWave(Simulation):
         minv = self.point_inverse_inertia(mat["gamma"], lin_index)
         weight = minv * volume
         if self.damping is not None:
+            # the kernel's beta, whose inertia leaves the norm out
             node = lin_index % np.int32(self.comp_stride)
-            beta = 0.5 * minv * mat["damping"].ravel()[node] * self.dt
-            weight = weight / (1.0 + beta)
+            beta = 0.5 * minv * self._point_norms(lin_index)
+            weight = weight / (1.0 + beta * mat["damping"].ravel()[node] * self.dt)
         return (self.dtype(self.dt**2 * self.source_factor()) * weight).astype(
             self.dtype
         )
@@ -655,12 +717,12 @@ class ElasticWave(Simulation):
         gamma = grads["design"]
         g_mass = cp.zeros(self.Nx_padded, dtype=self.dtype)
         for c in range(self.ncomp):
-            density = grads["mass"][c] * wall_weights(self, (c,)) * self.density
+            density = grads["mass"][c] * self.point_weights((c,)) * self.density
             g_mass += point_average_adjoint(self, density, c)
         # the normal density sits on the nodes, so its chain rule is the weight alone
-        g_stiff = apply_cell_weights(self, grads["normal"].copy())
+        g_stiff = grads["normal"] * self.point_weights(())
         for p, axes in enumerate(PAIRS[self.ndim][self.ndim :]):
-            density = grads["shear"][p] * wall_weights(self, axes)
+            density = grads["shear"][p] * self.point_weights(axes)
             g_stiff += pair_average_adjoint(self, density, gamma, axes)
         return {"mass": g_mass, "stiff": g_stiff}
 

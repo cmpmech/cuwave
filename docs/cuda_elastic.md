@@ -11,7 +11,8 @@ The forward kernels of the staggered [elastic](elastic.md) equation: one pass fo
 | `USE_DAMPING` | `damping is not None` | adds the damped update and its two extra arguments |
 | `USE_PML` | `pml is not None` | folds the pml memory terms into both step kernels, adds their per-axis arguments and the `phase`, and orders the blocks along axis 0 by `BLOCK_ROW` |
 | `STENCIL_RADIUS` | `space_order // 2` | taps per staggered difference, prepended by [stencils](stencils.md) |
-| `STAG_COEFFS` | `staggered_weights` | the graded coefficient table, prepended alongside |
+| `STAG_COEFFS` | `staggered_weights` | the coefficient table one row per radius, prepended alongside, of which this file reads the full row |
+| `NODE_CLOSURE`, `HALF_CLOSURE`, `NODE_SPAN`, `HALF_SPAN`, `NODE_ROWS_C`, `HALF_ROWS_C` | `staggered_pair` for `stencil`, orders 2 to 8 | the low wall's rows of the staggered SBP pair, how many of each and how far they reach, prepended alongside |
 | `TILE0`, `TILE1`, `TILE2` | `FUSED_TILE`, by `ElasticWave.define_step` without a pml where the fields spill out of L2 and the ring at most doubles the tile | compiles `fused_kernel`, the tile one block steps |
 | `STEPS`, `TILE0`, `TILE1`, `ROWS` | `BLOCKED` or `LARGE_BLOCKED`, by `ElasticWave.define_blocked_step` in 2D without a pml, on a small grid or past L2 | compiles `blocked_kernel` instead of `fused_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
 | `GRADIENT` | `ElasticWave.define_adjoint_gradient` | `stress_kernel`, `fd_kernel` and `fused_kernel` add the gradient densities of the adjoint `u1` against the forward `v1`, their accumulators appended to the arguments |
@@ -41,41 +42,54 @@ Under `RELAXATION`, `memory` and `coef` appended to `stress_kernel` after the pm
 
 ## device functions
 
-### rad_node, rad_half
-**aim**
-the graded radius of a staggered difference, keyed off the **stress point** so the forward and the transpose read the same matrix entry
-**input args**
-`a`: the point's index along the derivative axis; `N`: logical extent
-**how?**
-- a node strain reads unknowns at $a-r\ldots a+r-1$, valid over $1\ldots N-3$, so
-$$r_\textrm{node}\left(a\right)=\min\left(R,\,a-1,\,N-2-a\right)$$
-which is zero on the wall itself; a half-point derivative reads nodes at $a+1-r\ldots a+r$, valid over $1\ldots N-2$, so
-$$r_\textrm{half}\left(a\right)=\min\left(R,\,a,\,N-2-a\right)$$
+### rad_half
+The graded radius of a half-point difference, $\min\left(R,\,a,\,N-2-a\right)$ at the half point `a`, which the [maxwell](maxwell.md) pml terms take; the elastic step and its pml close their walls by the rows below
 
 ### clamped_face
 Reads bit $2d+\textrm{side}$ of the `clamped` mask, the faces `Simulation.boundary` marks `Clamped`
 
-### deep_node, node_radius, half_radius, clamped_at
+### Line, node_rows, half_rows
 **aim**
-the wall-free path: a node more than $2R$ nodes inside every wall reads no graded tap, no wall weight and no clamped fold
+`Line`: a field along an axis, `u(j)` the value `j` points from `idx`; `node_rows`, `half_rows`: the closure row of the derivative onto node or half point `lo` points from the low wall, or mirrored and negated `hi` points from the high one
+**input args**
+`u`: any accessor of `j`, a `Line` in the step and an `Along` in the pml terms; `lo`, `hi`: the point's place from either wall
+**how?**
+- `NODE_ROWS[lo][m]` weighs the half point `m` from the wall (the wall point left out, since it is never read), `HALF_ROWS[lo][i]` the node `i`; the high wall reads row `hi` over the points from its own side, the high corner being the low one turned by half a turn
+- every loop has a compile-time bound and a runtime offset, so it unrolls; the tables are `__device__` rather than `__constant__`, since along the fast axis a warp reads them at as many rows as it holds wall points
+
+### node_derivative, half_derivative, node_divergence, half_divergence
+**aim**
+the staggered SBP pair of [stencils](stencils.md) (`staggered_pair`) along a line: the derivative $D_+$ onto node `a` of a half-point field, $D_-$ onto the half point `a` (at $a+\tfrac12$) of a nodal one, and the divergences the update takes, $D_-$ of a nodal stress and $D_+$ of a half-point one
+**input args**
+`u` or `sg`: the field along the line; `a`, `N`: the point's index along the axis and the logical extent; `DEEP`: the template switch
+**how?**
+- past the closure, the full staggered difference with `SG_W` at radius $R$
+$$D_+u\big|_a=\sum_{k=1}^{R}c_k\left(u^{a+k-1}-u^{a-k}\right)\qquad D_-u\big|_a=\sum_{k=1}^{R}c_k\left(u^{a+k}-u^{a+1-k}\right)$$
+- within `NODE_CLOSURE` nodes or `HALF_CLOSURE` half points of a wall, `node_rows` or `half_rows`
+- the divergences are the other derivative, since the pair sums by parts, $H_+D_++\left(H_-D_-\right)^\top=B$: the update's $-M^{-1}D_+^\top W\sigma$ is $D_-\sigma$ with the norms of $W$ and $M$ cancelling, and $-M^{-1}D_-^\top W\sigma$ is $D_+\sigma$, the stress at the half-grid wall point read as zero. So no kernel reads a norm, and the update reaches no further than the strains
+- `node_divergence` and `half_divergence` keep the interior taps in the order the deep path has always rounded them; with `DEEP` set the closure branches compile away, which is what `deep_node` buys
+
+### deep_node, clamped_at
+**aim**
+the wall-free path: a node more than `CLOSURE_BAND` nodes inside every wall, the larger of the two row counts, reads no closure row and no clamped wall
 **input args**
 `A`, `NN`: geometry; `DEEP`: the template switch
 **how?**
-- with `DEEP` set, `node_radius` and `half_radius` return `STENCIL_RADIUS` and `clamped_at` returns false, so the tap guards and the `SG_W` row are compile-time constants; unset, they are `rad_node`, `rad_half` and `clamped_face`
-- every helper below that reads a radius or a wall takes `DEEP` as a template argument defaulting to false, and `stress_kernel` and `fd_kernel` branch on `deep_node` per thread, so only the warps that hold a near-wall node run both paths
-- the deep path is the general one with the wall terms removed, so the two agree bitwise
+- with `DEEP` set, the derivatives take their interior branch alone and `clamped_at` returns false; unset, every helper checks its own axis' place against either wall
+- every helper below that reads a wall takes `DEEP` as a template argument defaulting to false, and every kernel branches on `deep_node` per thread, so only the warps that hold a node within the band of a wall run both paths
+- the deep path is the general one with the wall terms removed, rounded alike, so the two agree bitwise on a node they both reach and a kernel may take either there
 
 ### normal_strains
 **aim**
-the node's normal strains, one per axis, and which axes graded to a zero row
+the node's normal strains, one per axis, and which axes a traction wall zeroes
 **input args**
 `u`: a displacement field, `NDIM` components of `cs` entries back to back; `idx`, `A`, `S`, `NN`, `F`: geometry, `F` holding $1/\Delta x_d$
 **output args**
 `eps`: $\varepsilon_{dd}$ per axis; the return value: the bitmask of zeroed axes
 **how?**
-- in the interior, the graded staggered difference of the component along its own axis
-$$\varepsilon_{dd}\big|_a=\frac{1}{\Delta x_d}\sum_{k\le r}c_k^{(r)}\left(u_d^{a+k-1}-u_d^{a-k}\right)$$
-- on a clamped wall the strain folds antisymmetrically about the held wall value, $\varepsilon=\pm2u_d/\Delta x_d$ from the single unknown half a node inside
+- `node_derivative` of the component along its own axis
+$$\varepsilon_{dd}\big|_a=\frac{1}{\Delta x_d}\left(D_+u_d\right)_a$$
+- on a clamped wall the closure's wall row reads the half-grid wall point, held at zero, as nothing
 - on a traction wall the row is zero and the axis is reported for condensation
 
 ### condensed_lame
@@ -94,27 +108,25 @@ the engineering shear strain of the $\left(k,l\right)$ pair at its own staggered
 **input args**
 `u`, `idx`, `cs`, `k`, `l`, `A`, `S`, `NN`, `F`: as above
 **how?**
-- both derivatives land on the point without averaging, each at its own graded radius
-$$2\,\varepsilon_{kl}=\frac{1}{\Delta x_l}\sum_{j\le r_1}c_j\left(u_k^{a+j}-u_k^{a+1-j}\right)+\frac{1}{\Delta x_k}\sum_{j\le r_2}c_j\left(u_l^{a+j}-u_l^{a+1-j}\right)$$
+- both derivatives land on the point without averaging, each a `half_derivative` along its own axis
+$$2\,\varepsilon_{kl}=\frac{1}{\Delta x_l}\left(D_-u_k\right)_{a_l}+\frac{1}{\Delta x_k}\left(D_-u_l\right)_{a_k}$$
+- the sum is rounded by `MUL_RN` and `FMA_RN` on either path, so every kernel and both paths round it alike
 
 ## material helpers
 
-### wall_weight
-The cell weight $W$ of a node, halved on the walls of every axis outside the bitmask `skip`, which are the axes the point is staggered along
-
-### node_gamma, shear_gamma
+### shear_gamma
 **aim**
-the design on the normal and on the $\left(k,l\right)$ shear stress point, formed from `gamma` per read rather than stored
+the design on the $\left(k,l\right)$ shear stress point, formed from `gamma` per read rather than stored, the normal stress taking the nodal value itself
 **how?**
-$$W\gamma\qquad\textrm{and}\qquad w_s\gamma_s=w_s\,\frac{4}{\sum_{4\textrm{ nodes}}1/\gamma}$$
+$$\gamma_s=\frac{4}{\sum_{4\textrm{ nodes}}1/\gamma}$$
 - the harmonic mean over the four nodes around the shear point, `TINY` guarding a void node as the Python averages do
 
 ### point_minv
 **aim**
 the inverse inertia of component `c` on its own point, zero where a clamped wall holds it
 **how?**
-$$m_c^{-1}=\frac{1}{\rho_0\,W\,\tfrac12\left(\gamma_i+\gamma_{i+e_c}\right)}$$
-- the volume is left out, since the force leaves it out too; `ElasticWave.point_inverse_inertia` evaluates the same value on the host for the excitation weights
+$$m_c^{-1}=\frac{1}{\rho_0\,\tfrac12\left(\gamma_i+\gamma_{i+e_c}\right)}$$
+- the volume is left out, since the force leaves it out too, and so is the norm, which cancels against the stresses'; `ElasticWave.point_inverse_inertia` is this over the norm, the inverse mass a point load divides by
 
 ## step helpers
 
@@ -148,7 +160,10 @@ which is $\sigma_U-\tfrac12\sum_l\left(\zeta_l^{n+\frac12}+\zeta_l^{n-\frac12}\r
 
 ### nodal_force
 **aim**
-the stress divergence on component `c`'s point, as `fd_kernel` takes it; see there for the taps
+the stress divergence on component `c`'s point, as `fd_kernel` takes it: `node_divergence` of its normal stress along its own axis, then `half_divergence` of each shear stress along the others, summed through `MUL_RN` and `FMA_RN` so the pair, the fused and the blocked step round alike
+
+### wall_stresses
+`stress_point` of a ring point within a wall's band into the fused kernel's shared memory, out of line, so the registers the general path takes do not cost the ring's deep points their occupancy
 
 ## gradient helpers
 
@@ -158,15 +173,13 @@ Under `GRADIENT` only. `normal_form` is the one of [cuda_elastic_sensitivity](cu
 **aim**
 subtract the stiffness densities of the adjoint against the forward field at the node and its shear points, as `gradient_kernel` does
 **input args**
-`u1`: the adjoint field; `v1`: the forward field it pairs with; `idx`, `cs`, `A`, `S`, `NN`: geometry; `F`: $1/\Delta x_d$, the strain factors; `lam`, `mu`, `clamped`: as `stress_kernel`
+`eps`: the adjoint's `NVOIGT` strains, under `RELAXATION` already relaxed by `relax`; `v1`: the forward field they pair with; `idx`, `cs`, `A`, `S`, `NN`: geometry; `F`: $1/\Delta x_d$, the strain factors; `lam`, `mu`, `clamped`: as `stress_kernel`; `DEEP`: as `deep_node`
 **output args**
 `g_normal`, `g_shear`: the normal and shear accumulators, decremented
 **how?**
-- the graded strains of both fields, never the deep shortcut, so the densities are bit for bit those of `gradient_kernel`
+- the strains of `v1` on the path `deep_node` picks, which rounds as the general one, so the densities are bit for bit those of `gradient_kernel`
 $$g_n\mathrel{-}=2\mu\,\boldsymbol{\varepsilon}\left(\lambda\right):\boldsymbol{\varepsilon}\left(u\right)+\lambda_\textrm{eff}\,\textrm{tr}\,\boldsymbol{\varepsilon}\left(\lambda\right)\textrm{tr}\,\boldsymbol{\varepsilon}\left(u\right)\qquad g_{kl}\mathrel{-}=\mu\,2\varepsilon_{kl}\left(\lambda\right)\,2\varepsilon_{kl}\left(u\right)$$
-
-### relaxed_density
-Under `RELAXATION` as well, `stiffness_density` with the adjoint's strains `eps` already relaxed by `relax` in place of the strains of `u1`: the density of the relaxed recursion, whose stiffness acts on the relaxed strain
+- under a relaxation the density of the relaxed recursion, whose stiffness acts on the relaxed strain
 
 ## pml helpers
 The pml terms are folded into `stress_kernel` and `fd_kernel`: a thread whose node lies on the slab of a lined axis `e` adds that axis' memory terms in registers, so a lined step costs no launch beyond the unlined one. The memory `aux` of axis `e` holds `2 * NDIM` rows: the strain memories $\psi_k$ of $\partial_eu_k$ at the strain point $\left(k,e\right)$, then the divergence memories $\zeta_c$ of the axis-$e$ part of $\nabla\cdot\sigma_c$. The adjoint adds a second block of `NDIM` strain rows at `2 * NDIM`: `fd_kernel` reads one block at the neighbours while settling the other at its own node, and the two swap every step. Its slab row `t` is `slab_index` of the node ([cuda_scalar](cuda_scalar.md)). The `profile` rows are read at the node or at the half point $a+\tfrac12$, whichever the quantity sits on along `e`
@@ -178,14 +191,14 @@ the bitmask of axes a traction wall zeroes at a node, the set bits of `normal_st
 `stress_row(c, e)`: the Voigt row of $\sigma_{ce}$, normal on the diagonal, else its shear pair; `Stress`: $\sigma_{ce}$ `j` nodes along `e` from a node, the stress component the divergence of $c$ reads along `e`
 ### strain_term
 **aim**
-$\partial_eu_k$ at the strain point $\left(k,e\right)$, graded at the walls exactly as `normal_strains` and `shear_strain` take it, including the clamped fold
+$\partial_eu_k$ at the strain point $\left(k,e\right)$, the step's own `node_derivative` or `half_derivative` along an `Along`, zero on a traction wall's normal row
 **input args**
-`u`: any accessor of `(k, j)`, a `Field` forwards and a `Memory` in the adjoint; `k`, `e`: component and axis; `A`, `NN`: node indices and extents; `fe`: $1/\Delta x_e$; `clamped`: the face bitmask
+`u`: any accessor of `(k, j)`, a `Field` forwards and a `Memory` in the adjoint, which `Along` turns into a line of component `k`; `k`, `e`: component and axis; `A`, `NN`: node indices and extents; `fe`: $1/\Delta x_e$; `clamped`: the face bitmask
 ### divergence_term
 **aim**
-the axis-$e$ part of the divergence of component $c$, as `fd_kernel` takes it, with the same graded taps and clamped fold
+the axis-$e$ part of the divergence of component $c$, the step's `node_divergence` or `half_divergence`. In the weighted variables $W\sigma$ the pair is $D$ and $-D^\top$, each other's transpose, which is what the adjoint terms below rest on; the norms cancel out of the kernels as in the step
 **input args**
-`sig`: any accessor of `(c, j)`, a `Stress` forwards and a `Memory<Stress>` in the adjoint; `c`, `e`, `A`, `NN`, `fe`, `clamped`: as `strain_term`
+`sig`: any accessor of `(c, j)`, a `Stress` forwards and a `Memory<Stress>` in the adjoint; `c`, `e`, `A`, `NN`, `fe`: as `strain_term`
 ### add_stress
 **aim**
 add the stress of the strain terms `t` of axis `e` onto the node's stresses, through the same condensed $\lambda$ and shear means as `stress_kernel`
@@ -223,15 +236,17 @@ read off the block `phase` names and written into the other, so no thread overwr
 **parallelization**
 one thread per grid point, writing every stress family whose point it carries
 **input args**
-`u1`: the field at $t-1$; `gamma`: the nodal design, which `node_gamma` and `shear_gamma` take onto the stress points; `lam`, `mu`: $\lambda$ (plane-reduced on the host) and $\mu$; `clamped`: the face bitmask; `cs`: component stride; `f0..f2`: $1/\Delta x_d$; `N0..N2`, `s0, s1`: geometry; under `GRADIENT`, `v1`: the forward field `u1` pairs with; under `USE_PML`, per axis `m`, `p`, `lo`, `hi`: its memory, profile and slab rows, 0 unlined, then `phase`: 0 forwards, 1 or 2 the adjoint reading its strain memory off row 0 or `2 * NDIM`; under `RELAXATION`, `memory`, `coef`: as `relax`, the memory settled in place
+`u1`: the field at $t-1$; `gamma`: the nodal design, the normal stress point's own value and `shear_gamma`'s mean on a shear point; `lam`, `mu`: $\lambda$ (plane-reduced on the host) and $\mu$; `clamped`: the face bitmask; `cs`: component stride; `f0..f2`: $1/\Delta x_d$; `N0..N2`, `s0, s1`: geometry; under `GRADIENT`, `v1`: the forward field `u1` pairs with; under `USE_PML`, per axis `m`, `p`, `lo`, `hi`: its memory, profile and slab rows, 0 unlined, then `phase`: 0 forwards, 1 or 2 the adjoint reading its strain memory off row 0 or `2 * NDIM`; under `RELAXATION`, `memory`, `coef`: as `relax`, the memory settled in place
 **output args**
-`sigma`: `NVOIGT` fields, the normal stresses first and the pairs in Voigt order, assigned rather than accumulated; points no family writes stay at the zero the scratch was allocated with; under `GRADIENT`, `g_normal`, `g_shear`: the stiffness densities of `stiffness_density`, or `relaxed_density` under `RELAXATION`, accumulated with `-=`
+`sigma`: `NVOIGT` fields, the normal stresses first and the pairs in Voigt order, assigned rather than accumulated; points no family writes stay at the zero the scratch was allocated with; under `GRADIENT`, `g_normal`, `g_shear`: the stiffness densities of `stiffness_density`, accumulated with `-=`
 **how?**
 - the normal family couples through the (possibly condensed) $\lambda$, a zeroed axis writing an explicit zero
-$$\sigma_{dd}=W\gamma\left(2\mu\,\varepsilon_{dd}+\lambda_\textrm{eff}\,\textrm{tr}\,\boldsymbol{\varepsilon}\right)$$
+$$\sigma_{dd}=\gamma\left(2\mu\,\varepsilon_{dd}+\lambda_\textrm{eff}\,\textrm{tr}\,\boldsymbol{\varepsilon}\right)$$
 - each shear point is one multiply on its own strain
-$$\sigma_{kl}=w_s\gamma_s\,\mu\left(2\,\varepsilon_{kl}\right)$$
-- under `RELAXATION`, `relax` on those stresses before the store; under `GRADIENT` as well, `relax` on the strains of `strain_point` instead, then `relaxed_density`, then `stress_of`
+$$\sigma_{kl}=\gamma_s\,\mu\left(2\,\varepsilon_{kl}\right)$$
+- no norm weighs either, since the update's divergence is the other derivative of the pair, against which they cancel
+- under `RELAXATION`, `relax` on those stresses before the store
+- under `GRADIENT`, the adjoint's strains of `strain_point` once, for `stiffness_density` and `stress_of` alike; under a relaxation `relax` on those strains in between
 
 ### fd_kernel
 **parallelization**
@@ -241,10 +256,10 @@ one thread per grid point, updating every component whose unknown it carries
 **output args**
 `u2`: the field at $t$, same layout as `u1`, which the adjoint passes as `u0` again; under `GRADIENT`, `g_mass`: the inertia density, accumulated with `-=`
 **internal args**
-`force`: the divergence per component; `ap, am`: the stress node of the plus and minus tap; `rp, rm`: that point's own graded radius, which decides whether the tap exists
+`force`: the divergence per component, from `nodal_force`
 **how?**
-- the divergence is the exact transpose of the strain differences: every tap carries the coefficient of the stress point it reads, evaluated by the same `rad_node` / `rad_half`, with the clamped fold doubling the wall tap
-$$f_c=\frac{1}{\Delta x_c}\sum_k c_k^{\left(r\left(a\right)\right)}\left(\sigma_{cc}^{i+k}-\sigma_{cc}^{i-k+1}\right)+\sum_{l\ne c}\frac{1}{\Delta x_l}\sum_j c_j^{\left(r\left(a\right)\right)}\left(\sigma_{cl}^{i+j-1}-\sigma_{cl}^{i-j}\right)$$
+- the divergence is the transpose of the strain differences in the norms, which `node_divergence` and `half_divergence` form as the other derivative of the pair, so the inertia carries no norm either
+$$f_c=\frac{1}{\Delta x_c}\left(D_-\sigma_{cc}\right)_{a_c}+\sum_{l\ne c}\frac{1}{\Delta x_l}\left(D_+\sigma_{cl}\right)_{a_l}$$
 - the march is the three-term recursion of [cuda_scalar](cuda_scalar.md), component by component, `USE_DAMPING` dividing by $1+\beta$ with one damping field serving every component
 - under `USE_PML`, `force_memory` of every lined axis adds onto the update, $u_c^t\mathrel{+}=m_c^{-1}\zeta_c$, and the adjoint then settles its strain memories with `settle_memory`
 - under `GRADIENT`, the inertia density summed by parts in time, the forward field against the second difference of the adjoint, formed before the store so the `u0` it reads is not yet overwritten
@@ -253,13 +268,14 @@ $$g_{m,c}\mathrel{-}=\frac{1}{\Delta t^2}v_c\left(u_c^t-2u_c^{t-1}+u_c^{t-2}\rig
 ### fused_kernel
 `stress_kernel` and `fd_kernel` in one launch, bitwise the pair; without a pml
 **parallelization**
-one block per tile of `TILE0` $\times$ `TILE1` ($\times$ `TILE2`) nodes, a thread each; the block first forms the stresses of the tile and of a ring `STENCIL_RADIUS` wide around it, then updates its own nodes
+one block per tile of `TILE0` $\times$ `TILE1` ($\times$ `TILE2`) nodes, a thread each; the block first forms the stresses of the tile and of a ring `STENCIL_RADIUS` wide around it, then updates its own nodes. `tile_origin` puts each axis' last tile flush with its end and returns -1 past it, and `tile_end` stops a tile where the next begins, so the last tiles overlap their neighbour and a node is stepped once
 **input args**
-`u0`, `u1`, `u2`, `gamma`, `rho`, `damping`, `dt`, `clamped`, `cs`, `f0..f2`: as `fd_kernel`; `lam`, `mu`: as `stress_kernel`; `e0..e2`: $1/\Delta x_d$, the factors `stress_kernel` takes; under `GRADIENT`, after the geometry, `g_mass`, `g_normal`, `g_shear`, `v1`, `mf`: as the pair, both densities formed at the block's own nodes, the stiffness strains read off global memory with `e0..e2`
+`u0`, `u1`, `u2`, `gamma`, `rho`, `damping`, `dt`, `clamped`, `cs`, `f0..f2`: as `fd_kernel`; `lam`, `mu`: as `stress_kernel`; `e0..e2`: $1/\Delta x_d$, the factors `stress_kernel` takes; under `GRADIENT`, after the geometry, `g_mass`, `g_normal`, `g_shear`, `v1`, `mf`: as the pair, both densities formed at the block's own nodes, the adjoint's strains read off global memory with `e0..e2`
 **internal args**
 `ss`: the `NVOIGT` stresses of the tile and its ring in shared memory, zero where `stress_kernel` writes nothing (off the interior); `local`, `T`: the node's place and strides in it, which `nodal_force` reads through as it would the `sigma` scratch
 **how?**
-- the ring holds every stress the divergence of a tile node reaches, so a block needs nothing another block forms; the ring's stresses are formed twice, once by each block that reads them
+- the ring holds every stress the divergence of a tile node reaches, so a block needs nothing another block forms; the ring's stresses are formed twice, once by each block that reads them. A closure row reaches further than the ring, towards its wall, which the flush last tile keeps inside the block that holds the wall, as long as a tile is wider than the rows reach (`closure_reach`, which `define_step` checks)
+- ring points within a band take `wall_stresses`, and the launch bounds the registers to three blocks a multiprocessor to radius 2 and two past it, which the deep path fits without spilling
 - the stresses never travel through memory: a step reads $u^{t-1}$, $u^{t-2}$ and the design and writes $u^t$, against the pair's extra write and read of every stress, which halves the traffic where DRAM bounds the step. While the scratch fits in L2 the pair stays as fast or faster, and where the ring more than doubles the stresses a block forms (3D above order 2) their recomputation costs more than the traffic saved, so `define_step` keeps the pair there
 
 ### blocked_kernel
@@ -267,12 +283,12 @@ one block per tile of `TILE0` $\times$ `TILE1` ($\times$ `TILE2`) nodes, a threa
 **parallelization**
 a 2D launch of `(TILE1, ROWS)` threads per block, one block per tile of `TILE0` $\times$ `TILE1` nodes; a thread owns `NODES` $=$ `TILE0 / ROWS` consecutive nodes of its column. Tiles overlap by a halo of `HALO` $=$ `STEPS` $\cdot(2R-1)$ nodes each side, the reach of a strain and a divergence, and write back only their core, `C0` $\times$ `C1`
 **input args**
-`u0, u1`: $u^{t-1}, u^t$, both components; `v0, v1`: the arrays receiving $u^{t+S-1}, u^{t+S}$; `gamma, lam, mu`: as `stress_kernel`; `rho` and under `-DUSE_DAMPING` `damping, dt`: as `fd_kernel`; `signal, weights, num_sources, record, num_sensors, t0`: as the scalar `blocked_kernel`; `source_starts, source_entries`, `sensor_starts, sensor_entries`: per tile the sources its nodes hold, halo included, and the sensors its core records, as CSR rows of `component node | point << 16`, the node counted once per component before it; `clamped, cs`: as `fd_kernel`; `e0, e1`: $1/\Delta x_d$; `f0, N0, f1, N1, s0`: as `fd_kernel`
+`u0, u1`: $u^{t-1}, u^t$, both components; `v0, v1`: the arrays receiving $u^{t+S-1}, u^{t+S}$; `gamma, lam, mu`: as `stress_kernel`; `rho` and under `-DUSE_DAMPING` `damping, dt`: as `fd_kernel`; `signal, weights, num_sources, record, num_sensors, t0`: as the scalar `blocked_kernel`; `source_starts, source_entries`, `sensor_starts, sensor_entries`: per tile the sources its nodes hold, halo included, and the sensors its core records, as CSR rows of `component node | point << 16`, the node counted once per component before it; `clamped, cs`: as `fd_kernel`; `e0, e1`: $1/\Delta x_d$; `f0, N0, f1, N1, s0`: as `fd_kernel`; `o0, o1`: the first core's first node per axis, 1 or before
 **internal args**
-`su, ss, sg`: both components of $u$, the three stresses and the design in shared memory, each with a guard ring $R$ wide, read by `stress_point` and `nodal_force` through the tile strides `T` exactly as they read the global arrays (`point_minv` reads the global design once, at load); `up, uc, mi, beta, tag`: per owned node and component in registers; `inner, moving`: bit masks of the owned interior nodes and of the components the update moves
+`su, ss, sg`: both components of $u$, the three stresses and the design in shared memory, each with a guard ring $R$ wide, read by `stress_point` and `nodal_force` through the tile strides `T` exactly as they read the global arrays (`point_minv` reads the global design once, at load); `up, uc, mi, beta, tag`: per owned node and component in registers; `inner, moving`: bit masks of the owned interior nodes and of the components the update moves, leaving out a node within a wall's closure band when the tile does not hold that wall (`reads_held`), whose rows would read past the tile
 **how?**
 - per step the stresses of the tile go to shared memory, a barrier, then the update of both components, a barrier; a component the update skips (its own axis' staggered ghost) and every non-interior node keep their value of two steps back, as the plain buffers do
-- the edge nodes of a tile read the guard ring and go wrong, one reach deeper every step; after `STEPS` steps the error stops short of the core
+- the edge nodes of a tile read the guard ring and go wrong, one reach deeper every step; after `STEPS` steps the error stops short of the core. A band node `reads_held` leaves out goes wrong at once, so `define_blocked_step` shifts the cores (`o0, o1`) until no tile's edge falls inside a band it does not hold the wall of, and refuses where no shift does
 - the damped update is rounded as nvcc compiles `fd_kernel`'s, $\Delta t\,\beta$ fused into $1\mp\beta$ with $\beta$ held over $\Delta t$, and the source term rounded apart as `excitation_kernel` adds it
 - on a small grid a block steps a node a thread, since a step there is bound by the latency of one tile's stresses and update, which several nodes a thread would serialize; past L2 two nodes a thread on a wider tile trade that latency for the halo's traffic
 
