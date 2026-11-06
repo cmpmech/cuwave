@@ -51,19 +51,21 @@ __device__ __forceinline__ real_t
 curl_component(const real_t *__restrict__ u, const int idx, const int cs,
                const int k, const int l, const int *A, const int *S,
                const int *NN, const real_t *F) {
-  const auto uk = [&](const int j) { // u_k j nodes along l
-    return node_imaged(u + k * cs, idx, S[l], A[l], NN[l],
-                       CONDUCTOR_FACES >> 2 * l, j);
-  };
-  const auto ul = [&](const int j) { // u_l j nodes along k
-    return node_imaged(u + l * cs, idx, S[k], A[k], NN[k],
-                       CONDUCTOR_FACES >> 2 * k, j);
-  };
+  // u_k along l and u_l along k, nodes 1 - R .. R away
+  real_t tk[2 * STENCIL_RADIUS], tl[2 * STENCIL_RADIUS];
+  staged_taps<false>(tk, u + k * cs, idx, S[l], A[l], NN[l],
+                     CONDUCTOR_FACES >> 2 * l, 1 - STENCIL_RADIUS, 1,
+                     NN[l] - 2);
+  staged_taps<false>(tl, u + l * cs, idx, S[k], A[k], NN[k],
+                     CONDUCTOR_FACES >> 2 * k, 1 - STENCIL_RADIUS, 1,
+                     NN[k] - 2);
   real_t b = (real_t)0;
 #pragma unroll
   for (int j = 1; j <= STENCIL_RADIUS; ++j) {
-    b -= F[l] * SG_W(STENCIL_RADIUS, j) * (uk(j) - uk(1 - j));
-    b += F[k] * SG_W(STENCIL_RADIUS, j) * (ul(j) - ul(1 - j));
+    b -= F[l] * SG_W(STENCIL_RADIUS, j) *
+         (tk[STENCIL_RADIUS - 1 + j] - tk[STENCIL_RADIUS - j]);
+    b += F[k] * SG_W(STENCIL_RADIUS, j) *
+         (tl[STENCIL_RADIUS - 1 + j] - tl[STENCIL_RADIUS - j]);
   }
   return b;
 }

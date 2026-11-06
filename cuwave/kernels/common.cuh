@@ -102,6 +102,27 @@ __device__ __forceinline__ real_t half_imaged(const real_t *__restrict__ u,
   return signed_value(u[idx + (b - a) * s], sign);
 }
 
+// t[j - first] = a field at a + j, j = first .. first + 2R - 1, read in place
+// where every tap lies on stored points `lo .. hi`, else through its image
+template <bool HALF>
+__device__ __forceinline__ void staged_taps(real_t *t,
+                                            const real_t *__restrict__ u,
+                                            const int idx, const int s,
+                                            const int a, const int N,
+                                            const int odd, const int first,
+                                            const int lo, const int hi) {
+  if (a + first >= lo && a + first + 2 * STENCIL_RADIUS - 1 <= hi) {
+#pragma unroll
+    for (int j = 0; j < 2 * STENCIL_RADIUS; ++j)
+      t[j] = u[idx + (first + j) * s];
+  } else {
+#pragma unroll
+    for (int j = 0; j < 2 * STENCIL_RADIUS; ++j)
+      t[j] = HALF ? half_imaged(u, idx, s, a, N, odd, first + j)
+                  : node_imaged(u, idx, s, a, N, odd, first + j);
+  }
+}
+
 // --------------------------------- staggered lattice
 #define NPAIRS (NDIM * (NDIM - 1) / 2)
 #define NVOIGT (NDIM + NPAIRS)
