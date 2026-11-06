@@ -1,6 +1,7 @@
 // Prepended by wave.compile_kernels: stencils.preamble, then common.cuh.
 // Compile-time configuration this file responds to:
 //   NDIM = 2 | 3
+//   CONDUCTOR_FACES
 //   USE_MAGNETIC
 
 #if NDIM == 1
@@ -39,21 +40,30 @@
 #ifdef USE_MAGNETIC
 // ------------------------------------ curl helpers
 // byte-identical to maxwell.cu: each file is its own compilation unit
+#ifndef CONDUCTOR_FACES
+#define CONDUCTOR_FACES 0
+#endif
+
+// the (k, l) curl component at its own staggered point, the elastic shear
+// strain with its first term negated: both taps are half-point differences of
+// a tangential component, read past a wall off its image, odd at a conductor
 __device__ __forceinline__ real_t
 curl_component(const real_t *__restrict__ u, const int idx, const int cs,
                const int k, const int l, const int *A, const int *S,
                const int *NN, const real_t *F) {
-  const int r1 = rad_half(A[l], NN[l]); // d u_k / d x_l
-  const int r2 = rad_half(A[k], NN[k]); // d u_l / d x_k
+  const auto uk = [&](const int j) { // u_k j nodes along l
+    return node_imaged(u + k * cs, idx, S[l], A[l], NN[l],
+                       CONDUCTOR_FACES >> 2 * l, j);
+  };
+  const auto ul = [&](const int j) { // u_l j nodes along k
+    return node_imaged(u + l * cs, idx, S[k], A[k], NN[k],
+                       CONDUCTOR_FACES >> 2 * k, j);
+  };
   real_t b = (real_t)0;
 #pragma unroll
   for (int j = 1; j <= STENCIL_RADIUS; ++j) {
-    if (j <= r1)
-      b -= F[l] * SG_W(r1, j) *
-           (u[k * cs + idx + j * S[l]] - u[k * cs + idx - (j - 1) * S[l]]);
-    if (j <= r2)
-      b += F[k] * SG_W(r2, j) *
-           (u[l * cs + idx + j * S[k]] - u[l * cs + idx - (j - 1) * S[k]]);
+    b -= F[l] * SG_W(STENCIL_RADIUS, j) * (uk(j) - uk(1 - j));
+    b += F[k] * SG_W(STENCIL_RADIUS, j) * (ul(j) - ul(1 - j));
   }
   return b;
 }

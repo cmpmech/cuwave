@@ -173,22 +173,14 @@ __device__ __forceinline__ real_t transposed_divergence_axis(
 }
 
 // ------------------------------------ wall helpers
-// a field at node a + j of the line through idx, past the wall node its mirror,
-// so never a ghost the adjoint leaves unfilled: odd past a face of `odd`, whose
-// wall node reads zero
+// node_imaged, never a ghost the adjoint leaves unfilled, zero on a held node
 __device__ __forceinline__ real_t reflected(const real_t *__restrict__ u,
                                             const int idx, const int s,
                                             const int a, const int N,
                                             const int odd, const int j) {
-  int b = a + j, sign = held_wall(b, N, odd) ? 0 : 1;
-  if (b < 1) {
-    b = 2 - b;
-    sign = odd & 1 ? -1 : 1;
-  } else if (b > N - 2) {
-    b = 2 * (N - 2) - b;
-    sign = odd & 2 ? -1 : 1;
-  }
-  return signed_value(u[idx + (b - a) * s], sign);
+  int sign;
+  const int b = node_image(a + j, N, odd, sign);
+  return signed_value(u[idx + (b - a) * s], held_wall(b, N, odd) ? 0 : sign);
 }
 
 // the same near a wall, node a of N, every tap through its mirror: lambda and

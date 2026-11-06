@@ -83,7 +83,7 @@ Eliminating $\mathbf{H}$ from the classical Yee update recovers exactly this ste
 
 So `MaxwellWave` is [ElasticWave](elastic.md) with the normal-stress block deleted, and it reuses that module's whole lattice layer: `component_offsets`, `wall_weights`, the point and pair means and their adjoints, all promoted into [wave](wave.md). There are $\textrm{ndim}\left(\textrm{ndim}-1\right)/2$ curl components, one per axis pair, so one in 2D and three in 3D
 
-Every Maxwell difference is a **half-point** difference, since each term of $b_p=\partial_kE_l-\partial_lE_k$ differentiates a component along an axis it is not staggered on. The node-centred `rad_node` never appears, and with it go the zero-row closure, the plane-stress condensation and the clamped fold that the elastic normal strains need. At order 2 the curl is therefore full order everywhere including the wall-adjacent points
+Every Maxwell difference is a **half-point** difference, since each term of $b_p=\partial_kE_l-\partial_lE_k$ differentiates a component along an axis it is not staggered on, and always a component tangential to the walls of that axis. Both walls are exact mirror symmetries of the equations, so each difference keeps the full radius up to the wall and reads past it the image: about a `Conductor` wall the tangential field is odd (held at zero on the wall) and the curl even, about a `Magnetic` wall the reverse. A cavity mode is then an exact eigenvector of the discrete operator, and the wall costs no order at any `space_order`. The images keep the operator its own transpose: the gather reads the curl's image with the parity opposite the field's, and a free wall unknown, which owns half a cell, takes half of the wall-normal part it sees twice
 
 ### the operator
 

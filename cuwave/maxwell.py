@@ -20,7 +20,7 @@ import cupy.typing as cpt
 import numpy as np
 import numpy.typing as npt
 
-from .boundary import Conductor, Magnetic, faces_with
+from .boundary import Conductor, Magnetic, face_mask, faces_with
 from .scalar import PressureWave
 from .wave import (
     PAIRS,
@@ -184,8 +184,8 @@ class MaxwellWave(Simulation):
 
     @property
     def compile_flags(self) -> tuple[str, ...]:
-        """`-DUSE_MAGNETIC` on top of the damping flag, where `mu` carries the design too."""
-        flags = super().compile_flags
+        """The conductor faces the images read oddly, and `-DUSE_MAGNETIC` where `mu` carries the design too."""
+        flags = (*super().compile_flags, f"-DCONDUCTOR_FACES={face_mask(self, Conductor)}")
         return (*flags, "-DUSE_MAGNETIC") if self.magnetic else flags
 
     @property
@@ -231,6 +231,11 @@ class MaxwellWave(Simulation):
             for condition in pair:
                 if condition not in (Conductor, Magnetic):
                     raise ValueError(f"maxwell faces are Conductor or Magnetic: {pair}")
+        if min(self.Nx) < self.radius + 3:
+            raise ValueError(
+                f"Nx {self.Nx} cannot image the taps of space_order "
+                f"{self.space_order}: at least {self.radius + 3} nodes an axis"
+            )
 
     def inverse_inertia(self, indicator: cpt.NDArray) -> cpt.NDArray:
         """Nodal `1 / (eps W)`, what a sponge scales its conductivity by."""

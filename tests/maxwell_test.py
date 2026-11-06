@@ -7,9 +7,14 @@ renaming and not a rewrite. The permittivity has to reach the kernel as a permit
 so a slab has to transmit what Fabry-Perot says it transmits, which is the one check
 that ties the material units, the spectral objective and the source calibration
 together. And the design enters `ElectricWave` through the inertia but `MagneticWave`
-through the stiffness, so only the first keeps its gradient in the interior above
-`space_order` 2 (the wide wall closure spoils it only next to a wall): the wide-stencil
-gradient is pinned for one, away from the walls, and deliberately not for the other.
+through the stiffness, so both gradients are pinned against finite differences, the
+inertia design at the wide stencils too.
+
+The vector walls are pinned to the interior order: a conductor and a magnetic wall are
+both mirror symmetries of the equations, so the step reads past them off the images and
+a cavity mode stays an eigenvector of the discrete operator. One step on it converges to
+the exact curl curl at the stencil's own order; a wall graded down near the boundary
+does not converge there at all.
 
 Independently of all of that, fdtdx (Mahlau et al. 2026, an E/H Yee leapfrog) is rerun
 here from its stored probe traces: eliminating H from Yee's scheme gives exactly this
@@ -465,6 +470,52 @@ class VectorMaxwellTest(unittest.TestCase):
                     self.assertLess(
                         residual, 1e-10 * float(cp.linalg.norm(gradient[inner]))
                     )
+
+    def _cavity_error(self, n, order, wall):
+        # one step on a cavity mode, which the images keep an eigenvector
+        sim = DielectricWave(
+            (n + 3, n + 3),
+            (1.0 / n,) * 2,
+            1,
+            0.2 / n,
+            VECTOR_THREADS[2],
+            precision="float64",
+            space_order=order,
+            stencil="taylor",
+            permittivity1=1.0,
+            permittivity2=1.0,
+            boundary=wall,
+        )
+        kx, ky = 3 * np.pi, 2 * np.pi
+        x, y = ((cp.arange(m) - 1.0) / n for m in sim.Nx_padded)
+        tangent, normal = (cp.cos, cp.sin) if wall == Conductor else (cp.sin, cp.cos)
+        mode = cp.stack(
+            [
+                ky * tangent(kx * (x + 0.5 / n))[:, None] * normal(ky * y)[None, :],
+                -kx * normal(kx * x)[:, None] * tangent(ky * (y + 0.5 / n))[None, :],
+            ]
+        )
+        mat = sim.build_materials(cp.ones(sim.Nx_padded, dtype=sim.dtype))
+        # the domain's free unknowns, a conductor's held ones left out
+        free = cp.zeros(sim.field_shape, dtype=cp.bool_)
+        free[0, 1 : n + 1, 1 : n + 2] = free[1, 1 : n + 2, 1 : n + 1] = True
+        free &= mat["minv"] > 0
+        mode = cp.where(free, mode, 0.0)
+        out = sim.define_step(compile_kernels(sim), mat)(
+            cp.zeros_like(mode), mode, cp.zeros_like(mode)
+        )
+        applied = (2 * mode - out) / sim.dt**2
+        exact = (kx**2 + ky**2) / sim.permeability * mode
+        error = cp.where(free, cp.abs(applied - exact), 0.0)
+        return float(error.max() / cp.abs(exact).max())
+
+    def test_the_walls_keep_the_interior_order(self):
+        for order in (4, 6, 8):
+            for wall in (Conductor, Magnetic):
+                with self.subTest(order=order, wall=wall):
+                    fine = self._cavity_error(64, order, wall)
+                    rate = np.log2(self._cavity_error(32, order, wall) / fine)
+                    self.assertGreater(rate, order - 0.3)
 
     def test_a_conductor_wall_holds_the_tangential_field_at_zero(self):
         sim = _vector((24, 26), N=80)

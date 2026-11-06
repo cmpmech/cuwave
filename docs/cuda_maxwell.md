@@ -8,12 +8,13 @@ The forward kernels of the vector curl-curl [maxwell](maxwell.md) equation: one 
 |---|---|---|
 | `NDIM` | `len(Nx)` | selects the interior guard and the geometry macros; 1 is an `#error` |
 | `USE_DAMPING` | `damping is not None` | adds the damped update and its two extra arguments |
+| `CONDUCTOR_FACES` | `MaxwellWave.compile_flags`, always | the `Conductor` faces as bit $2d+\textrm{side}$, across which the tangential field's image is odd and the curl's even; every other face is `Magnetic`, the parities swapped |
 | `USE_MAGNETIC` | `magnetic` | the pair coefficient arrives as a field rather than a scalar |
 | `TILE0`, `TILE1`, `TILE2` | `FUSED_TILE`, by `MaxwellWave._define_pair` past L2 without a pml, where the ring at most doubles the tile | compiles `fused_kernel`: the tile a block updates |
 | `STEPS`, `TILE0`, `TILE1`, `ROWS` | `BLOCKED` or `LARGE_BLOCKED`, by `MaxwellWave.define_blocked_step` in 2D without a pml or `magnetic`, on a small grid or past it (order 4 only past `LARGE_L2` times L2, on a GPU of `PAST_SMS` multiprocessors) | compiles `blocked_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
 | `GRADIENT` | `MaxwellWave.define_adjoint_gradient`, without a pml | `fd_kernel` and `fused_kernel` add the inertia density of the adjoint `u1` against the forward `v1`, and with `USE_MAGNETIC` `curl_kernel` and `fused_kernel` the permeability density, their accumulators appended to the arguments (`MASS_GRADIENT`, `CURL_GRADIENT`) |
 
-`real_t`, `STENCIL_RADIUS`, `SG_W`, `NPAIRS`, `PAIR_ROW`, `rad_half` and the transfer kernels all come from the prelude; see [cuda_elastic](cuda_elastic.md), which documents them
+`real_t`, `STENCIL_RADIUS`, `SG_W`, `NPAIRS`, `PAIR_ROW`, `rad_half` and the transfer kernels all come from the prelude; see [cuda_elastic](cuda_elastic.md), which documents them. So do the images `node_imaged` and `half_imaged`: a field read past a wall off its reflection about the wall node (a node-centred field) or about the wall itself (a half-point one), with the sign of its parity across the face, so every difference takes the full radius up to the wall
 
 A pair index `p` is `PAIR_ROW(k, l) - NDIM`, so the curl scratch holds `NPAIRS` fields back to back in the same order the elastic shear stresses use
 
@@ -25,8 +26,8 @@ the $\left(k,l\right)$ curl component at its own staggered point
 **input args**
 `u`: an electric field, `NDIM` components of `cs` entries back to back; `idx`, `A`, `S`, `NN`, `F`: geometry, `F` holding $1/\Delta x_d$; `k`, `l`: the pair axes, `k < l`
 **how?**
-- both taps are half-point differences, since each term differentiates a component along an axis it is not staggered on, so `rad_half` grades both and `rad_node` never appears
-$$b_{kl}=\frac{1}{\Delta x_k}\sum_{j\le r_2}c_j\left(u_l^{a+j}-u_l^{a+1-j}\right)-\frac{1}{\Delta x_l}\sum_{j\le r_1}c_j\left(u_k^{a+j}-u_k^{a+1-j}\right)$$
+- both taps are half-point differences of a component tangential to the walls of the axis they run along, at the full radius, a tap past a wall read off its image (`node_imaged`): odd across a `Conductor` face, whose wall node holds it at zero, even across a `Magnetic` one
+$$b_{kl}=\frac{1}{\Delta x_k}\sum_{j=1}^{R}c_j\left(\tilde u_l^{a+j}-\tilde u_l^{a+1-j}\right)-\frac{1}{\Delta x_l}\sum_{j=1}^{R}c_j\left(\tilde u_k^{a+j}-\tilde u_k^{a+1-j}\right)$$
 - byte-identical to `shear_strain` in [cuda_elastic](cuda_elastic.md) but for the sign of the first sum, which is the whole difference between a symmetric gradient and a curl
 
 ### pair_weight
@@ -58,7 +59,7 @@ the axis-$e$ part of the force on $E_c$, as `fd_kernel` takes it, signed $+$ whe
 add $\nu$ times the curl terms `t` of axis `e` onto the pair points, with `pair_weight` or, under `USE_MAGNETIC`, `nu_pair`, as `curl_kernel` weights them
 
 ### curl_force
-the force `fd_kernel` forms on component `c`, the curl rows of the pairs it belongs to differenced along the partner axis, read `hs` a row and `S` an axis from `idx`, so the update reads the global scratch and `blocked_kernel` its tile through the same code
+the force `fd_kernel` forms on component `c`, the curl rows of the pairs it belongs to differenced along the partner axis, read `hs` a row and `S` an axis from `idx`, so the update reads the global scratch and `blocked_kernel` its tile through the same code; a pair point past a wall is read off its image (`half_imaged`), whose parity is the opposite of the tangential field's
 
 ## kernels
 
@@ -84,11 +85,11 @@ one thread per grid point, updating every component whose unknown it carries
 **output args**
 `u2`: the field at $t$, same layout as `u1`, which the adjoint passes as `u0` again; under `GRADIENT`, `g_mass`: the inertia density, accumulated with `-=`
 **internal args**
-`sgn`: $+1$ where the partner axis is below `c` and $-1$ above it; `ap, am`: the pair point of the plus and minus tap; `rp, rm`: that point's own graded radius, which decides whether the tap exists
+`sgn`: $+1$ where the partner axis is below `c` and $-1$ above it; `odd`: the faces of the partner axis across which the curl is odd, the `Magnetic` ones
 **how?**
 - component $c$ enters the pair $\left(k,l\right)$ as $+\partial_kE_l$ when $c=l$ and as $-\partial_lE_k$ when $c=k$, which is the whole of `sgn`, and the transpose is then the elastic shear gather unchanged
-$$f_c=\sum_{m\ne c}\pm\frac{1}{\Delta x_m}\sum_jc_j^{\left(r\left(a\right)\right)}\left(h_{cm}^{i+j-1}-h_{cm}^{i-j}\right)$$
-- every tap carries the coefficient of the **pair point it reads**, evaluated by `rad_half` at that point rather than at the thread's own, which is exactly what makes the two launches an exact transpose pair
+$$f_c=\sum_{m\ne c}\pm\frac{1}{\Delta x_m}\sum_{j=1}^{R}c_j\left(\tilde h_{cm}^{i+j-1}-\tilde h_{cm}^{i-j}\right)$$
+- the images make the gather the exact transpose of the curl: a tap past the wall stands for a pair point that read the tangential field's image, and the curl's parity is the opposite of that field's, so the signs agree. On a `Magnetic` wall node, whose unknown is free and owns half a cell, the gather along the wall normal sees each pair point twice, once through its image, so that axis' part is halved
 - the march is the three-term recursion of [cuda_scalar](cuda_scalar.md), component by component, `USE_DAMPING` dividing by $1+\beta$ with one conductivity field serving every component
 - under `GRADIENT`, the inertia density summed by parts in time, formed before the store so the `u0` it reads is not yet overwritten
 $$g_{m,c}\mathrel{-}=\frac{1}{\Delta t^2}v_c\left(u_c^t-2u_c^{t-1}+u_c^{t-2}\right)$$
@@ -123,7 +124,7 @@ a 2D launch of `(TILE1, ROWS)` threads per block, one block per tile of `TILE0` 
 ### pml_curl_kernel, pml_force_kernel, pml_adjoint_curl_kernel, pml_adjoint_force_kernel, pml_adjoint_memory_kernel
 Flat 1D launches over the slab of each lined axis: `pml_curl_kernel` after `curl_kernel`, `pml_force_kernel` after `fd_kernel`, their adjoints in the same places, and `pml_adjoint_memory_kernel` last in every adjoint step. They carry the terms [cuda_elastic](cuda_elastic.md) folds into its step kernels (`stress_memory`, `force_memory`, `settle_memory`), with `curl_term`, `divergence_term` and `add_curl` in place of the strain, divergence and stress helpers, and `h` in place of `sigma`
 **input args**
-flat over the slab rather than the grid, each takes the memory `aux`, its `profile`, the lined axis `e` and the slab rows `lo, hi` that `force_memory` of [cuda_elastic](cuda_elastic.md) takes, with `h`, `nu_pair` and `nu` of `curl_kernel` in place of `sigma` and the elastic material, and no `clamped` mask: a `Conductor` wall is already a zeroed `minv`
+flat over the slab rather than the grid, each takes the memory `aux`, its `profile`, the lined axis `e` and the slab rows `lo, hi` that `force_memory` of [cuda_elastic](cuda_elastic.md) takes, with `h`, `nu_pair` and `nu` of `curl_kernel` in place of `sigma` and the elastic material, and no `clamped` mask: a `Conductor` wall is already a zeroed `minv`. Their memory terms keep the graded radius of `curl_term` and `divergence_term`, whose transposes the adjoint launches already are, so a wall behind a layer is low order inside the layer alone
 **how?**
 - forwards, $\psi_k\leftarrow b\,\psi_k+a\,\partial_eE_k$ onto every pair point $\left(k,e\right)$ and $\zeta_c\leftarrow b\,\zeta_c+a\,\partial_eh_{ce}$ into the update; the component along `e` carries neither
 - the adjoint pushes each memory back through the other pass, exactly as the elastic one does

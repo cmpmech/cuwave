@@ -107,7 +107,10 @@ which sizes the reconstruction strip.
 layout with the normal-stress block deleted, so it shares that whole geometry layer:
 `wall_weights`, `point_average`, `point_harmonic`, `pair_average` and their adjoints are
 free functions in `wave.py`, not methods, precisely because two equations need them. It is
-2D/3D only and its kernel-less walls are `Conductor`/`Magnetic`. Its class switch
+2D/3D only and its kernel-less walls are `Conductor`/`Magnetic`, both mirror symmetries:
+the curl reads past a wall off the field's image and the update off the curl's
+(`node_imaged`/`half_imaged`, the parity on `-DCONDUCTOR_FACES`), so the walls keep
+the full order and the operator its own transpose; the pml memory terms stay graded. Its class switch
 `magnetic` (the `derive_inertia` idiom) adds `-DUSE_MAGNETIC` and the pair-point curl
 density; unset, both adjoint kernels carry no stencil at all, since a uniform `mu` leaves
 the stiffness with no design dependence.

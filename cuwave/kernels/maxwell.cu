@@ -1,6 +1,7 @@
 // Prepended by wave.compile_kernels: stencils.preamble, then common.cuh.
 // Compile-time configuration this file responds to:
 //   NDIM = 2 | 3
+//   CONDUCTOR_FACES
 //   USE_DAMPING
 //   USE_MAGNETIC
 //   TILE0, TILE1, TILE2 (the fused step's tile)
@@ -41,23 +42,30 @@
 #endif
 
 // ------------------------------------ curl helpers
+#ifndef CONDUCTOR_FACES
+#define CONDUCTOR_FACES 0
+#endif
+
 // the (k, l) curl component at its own staggered point, the elastic shear
-// strain with its first term negated: both taps are half-point differences
+// strain with its first term negated: both taps are half-point differences of
+// a tangential component, read past a wall off its image, odd at a conductor
 __device__ __forceinline__ real_t
 curl_component(const real_t *__restrict__ u, const int idx, const int cs,
                const int k, const int l, const int *A, const int *S,
                const int *NN, const real_t *F) {
-  const int r1 = rad_half(A[l], NN[l]); // d u_k / d x_l
-  const int r2 = rad_half(A[k], NN[k]); // d u_l / d x_k
+  const auto uk = [&](const int j) { // u_k j nodes along l
+    return node_imaged(u + k * cs, idx, S[l], A[l], NN[l],
+                       CONDUCTOR_FACES >> 2 * l, j);
+  };
+  const auto ul = [&](const int j) { // u_l j nodes along k
+    return node_imaged(u + l * cs, idx, S[k], A[k], NN[k],
+                       CONDUCTOR_FACES >> 2 * k, j);
+  };
   real_t b = (real_t)0;
 #pragma unroll
   for (int j = 1; j <= STENCIL_RADIUS; ++j) {
-    if (j <= r1)
-      b -= F[l] * SG_W(r1, j) *
-           (u[k * cs + idx + j * S[l]] - u[k * cs + idx - (j - 1) * S[l]]);
-    if (j <= r2)
-      b += F[k] * SG_W(r2, j) *
-           (u[l * cs + idx + j * S[k]] - u[l * cs + idx - (j - 1) * S[k]]);
+    b -= F[l] * SG_W(STENCIL_RADIUS, j) * (uk(j) - uk(1 - j));
+    b += F[k] * SG_W(STENCIL_RADIUS, j) * (ul(j) - ul(1 - j));
   }
   return b;
 }
@@ -174,18 +182,19 @@ __device__ __forceinline__ real_t curl_force(const real_t *__restrict__ h,
     const real_t *__restrict__ hp = h + p * hs;
     // E_c enters its pair as +d_m E_c for m < c and as -d_m E_c for m > c
     const real_t sgn = (m < c) ? (real_t)1 : (real_t)-1;
+    // the curl past a wall off its image, odd at a magnetic wall where E_c is
+    // even: the opposite parity, so the gather is the curl's exact transpose
+    const int odd = ~CONDUCTOR_FACES >> 2 * m;
     real_t acc = (real_t)0;
 #pragma unroll
     for (int j = 1; j <= STENCIL_RADIUS; ++j) {
-      const int ap = A[m] + j - 1;
-      const int rp = (ap <= NN[m] - 3) ? rad_half(ap, NN[m]) : 0;
-      if (j <= rp)
-        acc += SG_W(rp, j) * hp[idx + (j - 1) * S[m]];
-      const int am = A[m] - j;
-      const int rm = (am >= 1) ? rad_half(am, NN[m]) : 0;
-      if (j <= rm)
-        acc -= SG_W(rm, j) * hp[idx - j * S[m]];
+      acc += SG_W(STENCIL_RADIUS, j) *
+             half_imaged(hp, idx, S[m], A[m], NN[m], odd, j - 1);
+      acc -= SG_W(STENCIL_RADIUS, j) *
+             half_imaged(hp, idx, S[m], A[m], NN[m], odd, -j);
     }
+    if (A[m] == 1 || A[m] == NN[m] - 2)
+      acc *= (real_t)0.5; // a wall unknown's images double its own half cell
     force += sgn * F[m] * acc;
   }
   return force;

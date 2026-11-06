@@ -67,6 +67,41 @@ __device__ __forceinline__ real_t mirrored(const real_t *__restrict__ u,
   return signed_value(u[idx + (b - a) * s], sign);
 }
 
+// node b past the wall node its image, for a field no refill keeps beyond it:
+// odd across a face of `odd`
+__device__ __forceinline__ int node_image(const int b, const int N,
+                                          const int odd, int &sign) {
+  sign = (b < 1 && odd & 1) || (b > N - 2 && odd & 2) ? -1 : 1;
+  return b < 1 ? 2 - b : b > N - 2 ? 2 * (N - 2) - b : b;
+}
+
+// half point b, half a node up from node b, past the wall its image
+__device__ __forceinline__ int half_image(const int b, const int N,
+                                          const int odd, int &sign) {
+  sign = (b < 1 && odd & 1) || (b > N - 3 && odd & 2) ? -1 : 1;
+  return b < 1 ? 1 - b : b > N - 3 ? 2 * N - 5 - b : b;
+}
+
+// a node-centred field at a + j of the line through idx, through node_image
+__device__ __forceinline__ real_t node_imaged(const real_t *__restrict__ u,
+                                              const int idx, const int s,
+                                              const int a, const int N,
+                                              const int odd, const int j) {
+  int sign;
+  const int b = node_image(a + j, N, odd, sign);
+  return signed_value(u[idx + (b - a) * s], sign);
+}
+
+// a half-point field at a + j of the line through idx, through half_image
+__device__ __forceinline__ real_t half_imaged(const real_t *__restrict__ u,
+                                              const int idx, const int s,
+                                              const int a, const int N,
+                                              const int odd, const int j) {
+  int sign;
+  const int b = half_image(a + j, N, odd, sign);
+  return signed_value(u[idx + (b - a) * s], sign);
+}
+
 // --------------------------------- staggered lattice
 #define NPAIRS (NDIM * (NDIM - 1) / 2)
 #define NVOIGT (NDIM + NPAIRS)
