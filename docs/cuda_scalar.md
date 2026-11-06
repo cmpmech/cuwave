@@ -10,7 +10,8 @@
 | `-DUSE_DAMPING`               | `sim.compile_flags`, once `Simulation.damping` is set | compiles the damping term and its two extra kernel parameters |
 | `-DUSE_DOMAIN`                | `sim.compile_flags`, once `Simulation.domain` is set  | launches `fd_kernel` over a tile list and grades the cells at the domain wall, two extra kernel parameters |
 | `-DUSE_STREAM`, `-DSTREAM_TX` | `sim.compile_flags`, where `PressureWave.streams` (a wide unmasked 2D stencil on a full grid) | compiles the streaming `fd_kernel` below instead of the per-thread one, its tile `STREAM_TX = threads[-1]` wide |
-| `-DFOLD_REFILL`, `-DNEUMANN_FACES`, `-DDIRICHLET_FACES` | `sim.compile_flags`, unmasked, unstreamed, without a pml, at order 4 at most, every face Neumann or Dirichlet, every axis at least 4 nodes, on a GPU of at least `FOLD_SMS` multiprocessors | the per-thread `fd_kernel` writes the face ghosts from their mirrors itself (`write_ghosts`), the two face masks as bit $2d+\textrm{side}$ |
+| `-DDIRICHLET_FACES` | `sim.compile_flags`, always | the Dirichlet faces as bit $2d+\textrm{side}$, which the mirrored taps read oddly and whose wall nodes the step holds at zero |
+| `-DFOLD_REFILL`, `-DNEUMANN_FACES` | `sim.compile_flags`, unmasked, unstreamed, without a pml, at order 4 at most, every face Neumann or Dirichlet, on a GPU of at least `FOLD_SMS` multiprocessors | the per-thread `fd_kernel` writes the face ghosts from their mirrors itself (`write_ghosts`), the Neumann faces as bit $2d+\textrm{side}$ |
 | `-DFOLD_SOURCES` | `sim.compile_flags`, with `-DFOLD_REFILL` in 3D | the per-thread `fd_kernel` also adds the sources its thread block holds, from a list by block, six more arguments; a 2D stencil is too cheap to carry the list's loads, so 2D keeps the excitation launch |
 | `-DSTEPS`, `-DTILE0`, `-DTILE1`, `-DROWS` | `PressureWave.define_blocked_step` in 2D, from `SMALL_BLOCKS` or `LARGE_BLOCKS` | compiles `blocked_kernel`: the steps a launch advances, the tile and the thread rows sharing it |
 | `-DRECORD` | `PressureWave.define_recorded_step`, with the 2D tiles | `blocked_kernel` writes every level it passes into its row of a history and nothing at the end |
@@ -21,7 +22,7 @@
 
 Two source blocks are **prepended to the text** rather than passed as `-D` flags: the stencil table, then `kernels/common.cuh`. `RawModule` caches on the code string, so a different `space_order` is a different module automatically, without the order having to appear in the options, and the prelude needs no include path
 
-The prelude is where the `real_t` typedef, the `OP_W` and `CLOSURE` accessors and the four transfer kernels below actually live, so every `.cu` in the repo carries only its own operator. [wave](wave.md) lists what it holds and what it deliberately does not
+The prelude is where the `real_t` typedef, the `OP_W` accessor, the mirrored taps and the four transfer kernels below actually live, so every `.cu` in the repo carries only its own operator. [wave](wave.md) lists what it holds and what it deliberately does not
 
 `stencils.preamble(4)` for instance emits
 ```c
@@ -39,18 +40,21 @@ contain the finite difference weights:
 - `OP_C(r,k)` with `r` as stencil order and `k` as stencil index: $r, k\in[0,R-1]$
 - `OP_W(r,k)` makes it 1-index, so that $r,k\in[1,R]$
 - $R$ is the (maximum) `STENCIL_RADIUS`
-### CLOSURE
-computes the current stencil radius based on the distance `a` to the boundary in the axis direction
-- `a` and `N-1-a` are the distances to the two ghost nodes, so the radius grades **down** towards a wall: the first interior node gets radius 1 (order 2), the deep interior saturates at $R$
+### held_wall, mirror_node, signed_value, mirrored
+every node takes the full radius $R$; a tap past the stored ghost reads the node mirrored about the wall node, as if the ghost ring were $R$ layers deep
+- `held_wall(a, N, odd)`: whether node `a` of an axis of `N` nodes (ghosts included) is the wall node of a face of `odd`, the axis' two Dirichlet bits, low side first
+- `mirror_node(b, N, odd, sign)`: node `b`, reflected about the wall node where it lies past the stored ghost, $-j\to2+j$ and $N-1+j\to N-3-j$, with `sign` $-1$ past a Dirichlet face. The stored ghost itself is read in place, since the refill keeps it the mirror
+- `signed_value(v, sign)`: `v` with that sign, a negation rather than a product, so a mirror reads exactly what a refilled ghost holds
+- `mirrored(u, idx, s, a, N, odd, j)`: $u$ at node $a+j$ of the line through `idx`, read through `mirror_node`; inside, the reflection is a no-op, so every thread takes the same instructions and no warp holding a wall node runs a second path
 ### flux_divergence_taps, flux_divergence_means
 the cell-flux divergence of `flux_divergence_axis` along one axis with the two harmonic cell stiffnesses `gp, gm` given, so `blocked_kernel` can compute them once per launch; `flux_divergence_taps` takes the taps from an accessor `u(j)`, the node $j$ away, so they may come from registers, and `flux_divergence_means` reads them strided from an array. The cell differences and their difference are rounded by `MUL_RN` and `FMA_RN` exactly as nvcc contracts the plain sums in float32, which is what keeps every kernel inlining them bitwise alike
 ### flux_divergence_axis
 **aim**
 compute $\nabla\cdot(k\nabla u)$ at $i$  (`idx`)
 **input args**
-`u1`: array of $u$; `stiff`: array of $k$; `idx`: index; `s`: stride along axis; `uc`: `u1[idx]`; `sc`: `sc[idx]`; `factor`: condensed prefactor $2\Delta t^2/h^2$ from `step_factors` (see below), with $h$ as node distance in axis; `r`: radius of finite difference scheme in axis
+`u1`: array of $u$; `stiff`: array of $k$; `idx`: index; `s`: stride along axis; `uc`: `u1[idx]`; `sc`: `sc[idx]`; `a`: the node's index along the axis; `N`: the axis' extent, ghosts included; `odd`: the axis' Dirichlet bits, low side first
 **internal args**
-`sp, sm`: `stiff` at the two neighbours $k_{i\pm1}$; `gp, gm`: cell stiffnesses $k_{i\pm\frac{1}{2}}$ as the *halved* harmonic mean of `sc` with `sp`/`sm`; `Dp, Dm`: the two cell fluxes $D_i^+, D_i^-$, initialized with the $k=1$ term that every radius shares and completed in the loop
+`sp, sm`: `stiff` at the two neighbours $k_{i\pm1}$; `taps`: $u$ on the $2R+1$ nodes around $i$, read through `mirrored`; `gp, gm`: cell stiffnesses $k_{i\pm\frac{1}{2}}$ as the *halved* harmonic mean of `sc` with `sp`/`sm`; `Dp, Dm`: the two cell fluxes $D_i^+, D_i^-$
 **how?**
 - approximation of outer gradient (flux divergence)
 $$\nabla\cdot(k\nabla u)|_i\approx \frac{1}{h} (k_{i+\frac{1}{2}}\nabla u_{i+\frac{1}{2}}-k_{i-\frac{1}{2}}\nabla u_{i-\frac{1}{2}})$$
@@ -58,7 +62,8 @@ $$\nabla\cdot(k\nabla u)|_i\approx \frac{1}{h} (k_{i+\frac{1}{2}}\nabla u_{i+\fr
 - approximation of inner gradients with higher order finite differences
 $$\nabla_{i+\frac{1}{2}}\approx \frac{1}{h}\sum_{k=1}^r w_{r,k}(u_{i+k}-u_{i-(k-1)})$$
 $$\nabla_{i-\frac{1}{2}}\approx \frac{1}{h}\sum_{k=1}^r w_{r,k}(u_{i+(k-1)}-u_{i-k})$$
- - `factor` captures the condensed factor $\frac{1}{h^2}$ of the two nested differences, the $\Delta t^2$ of the time step (and $c_0^2$ for `ScalarWave`), plus the **2** that `gp, gm` are missing (they are $k_ik_{i\pm1}/(k_i+k_{i\pm1})$, so the effective cell stiffness is the full harmonic mean $2k_ik_{i\pm1}/(k_i+k_{i\pm1})$)
+ - the result comes back without the per-axis factor $f_d$, which `fd_kernel` multiplies in with the axes summed in a pinned order; the taps are staged before the arithmetic, so a node rounds as it would with no wall code at all
+ - $f_d$ captures the condensed factor $\frac{1}{h^2}$ of the two nested differences, the $\Delta t^2$ of the time step (and $c_0^2$ for `ScalarWave`), plus the **2** that `gp, gm` are missing (they are $k_ik_{i\pm1}/(k_i+k_{i\pm1})$, so the effective cell stiffness is the full harmonic mean $2k_ik_{i\pm1}/(k_i+k_{i\pm1})$)
 ## domain helpers
 Compiled only under `-DUSE_DOMAIN`; the derivation of the cell radii is in [scalar](scalar.md)
 ### flux_divergence_cells
@@ -134,9 +139,9 @@ the slab thread of row `a` beside the plane position `off`, or -1 where `a` lies
 `node_axes` unpacks a flat index into its per-axis indices `A[]`; `PML_AXES` unpacks the vector equations' `AXIS_PARAMS` tail into `NN[]`, `S[]` and `F[]`; `SLAB_OR_RETURN(ext)` decodes this thread's slab node of axis `e` with each lined side grown `ext` rows inward (a transposed kernel reaches past the front), returns past the slab, and binds `idx, a, off, w, A, plane, size` and `t`, the node's own slab thread (-1 in the grown rows)
 ### cell_differences
 **aim**
-the two cell differences $D^\pm$ of `flux_divergence_axis` at radius `r`, before the stiffness: what the pml memory filters
+the two cell differences $D^\pm$ of `flux_divergence_axis`, before the stiffness: what the pml memory filters
 **input args**
-`u1`: array of $u^n$; `idx`: index; `s`: stride along the axis; `uc`: $u^n_i$; `r`: radius, graded by `CLOSURE`
+`u1`: array of $u^n$; `idx`: index; `s`: stride along the axis; `uc`: $u^n_i$; `a, N, odd`: as `flux_divergence_axis`, every tap read through `mirrored`
 **output args**
 `Dp, Dm`: the plus and minus cell differences (by reference)
 
@@ -149,12 +154,14 @@ compute next step $u^{n+1}$ based on central difference approximation in space &
 **input args**
 `u0`: array of $u^{n-1}$; `u1`: array of $u^n$; `u2`: array of $u^{n+1}$ to be overwritten; `stiff`: array of $k$; `minv`: array of $1/m$; `derive_inertia`: true when `stiff=1/minv`, i.e., $k=m$; `damping`: array of $d$; `dt` time step size; `cells`: the packed cell radii of `domain_cells`, 0 on a node not stepped (outside `domain`, or `dirichlet`) and `DEEP` ($2^{30}$) where every radius is the full one; `tiles`: one int per launched block, its coordinates in 10-bit fields and bit 30 set when the tile holds a node that is not `DEEP`; `f0, f1, f2`: condensed per-axis factors $2\Delta t^2/h_d^2$ (times $c_0^2$ for `ScalarWave`) from `step_factors`; `N0, N1, N2`: logical grid dimensions `sim.Nx`, ghost nodes included and padding excluded; `s0, s1` strides of axis 0 and 1 over the *padded* shape
 **internal args**
-`a0, a1, a2`: grid indices; `idx`: flat index into the padded array, $a_0s_0+a_1s_1+a_2$; `r0, r1, r2`: finite difference radii in axis directions; `uc, sc`: central grid entries; `laplacian`: spatially approximated laplacian; `mi`: `minv`derived via `stiff`; `beta`: damping term
+`a0, a1, a2`: grid indices; `idx`: flat index into the padded array, $a_0s_0+a_1s_1+a_2$; `held`: whether the node is the wall node of a Dirichlet face; `d0, d1, d2`: the flux divergence per axis, before its factor; `uc, sc`: central grid entries; `laplacian`: spatially approximated laplacian; `mi`: `minv`derived via `stiff`; `beta`: damping term
 **how?**
 - central difference in time, explicit, with $\Delta t^2$ already folded into $f_d$
 $$u^{n+1}\approx\frac{1}{1+\beta}\left(2 u^{n} - u^{n-1}(1-\beta) + \frac{1}{m}\nabla\cdot (k\nabla u^n)\right),\qquad\beta=\frac{d\,\Delta t}{2m}$$
 - without `-DUSE_DAMPING` the $\beta$ branch is not compiled at all and the update is
 $$u^{n+1}=-u^{n-1}+2u^n+m^{-1}\nabla\cdot(k\nabla u^n)$$
+- the axes are summed with their factors as `blocked_kernel` sums them, `FMA_RN` and `MUL_RN` pinning the order in both precisions
+- a `held` node writes zero: a Dirichlet wall node is held at rest rather than left to the odd mirror, so it stays exactly zero whatever the rounding, and its taps need no rule of their own
 - under `-DUSE_DOMAIN` the grid is a 1D launch over `tiles`, and only a tile with bit 30 reads `cells`: a branch uniform per block, so a tile wholly inside runs the plain stencil and pays nothing. There a node outside returns before writing, which leaves it at the zero it started at, and a node near the wall replaces the plain laplacian with `wall_laplacian`
 - under `-DFOLD_SOURCES` the node stores its value, then adds the sources its block lists (`starts` the list's CSR by thread block, loaded before the stencil; `lin_index` the sources' nodes; `signal` row `offset`, read at each source's `columns` entry, times its `weights` entry) and stores again where one lands, so the plain store waits on no list
 - under `-DFOLD_REFILL` the node then writes the face ghosts it mirrors (`write_ghosts`)
@@ -168,7 +175,7 @@ as `fd_kernel` without `cells, tiles`, plus `chunk`: the rows of axis 0 a block 
 `q`: register queue of $u^n$ on rows $a_0-R\ldots a_0+R$ of the thread's column; `sm, sc, sp`: $k$ on rows $a_0-1, a_0, a_0+1$; `su, sk`: the current row of $u^n$ and $k$ in shared memory, with a halo of $R$; `old`: $u^{n-1}$, read before the barriers so its latency hides behind the tile loads
 **how?**
 - each row: shift the queues by one, load row $a_0+R$ of $u$ and row $a_0+1$ of $k$ into them, write the row's tile and its halo, barrier
-- axis 0 from the registers, axis 1 by `flux_divergence_axis` on the tile, then the update of `fd_kernel`
+- every load past a wall goes through `mirror_node`, so the queue and the tile hold the mirrors and the taps need no wall code; axis 0 from the registers, axis 1 by `flux_divergence_means` on the tile, then the update of `fd_kernel`
 - every value is read from memory once per step and the stencil's reuse along axis 0 stays in registers, which is what the plain kernel leaves to L1. That pays for a wide stencil only: below order 6, on a grid too small to fill the device with chunks, and in 3D, L1 serves the per-thread kernel as well, and a mask keeps the per-thread kernel for its tile list, which the stream would not fit
 
 ### blocked_kernel
@@ -182,7 +189,7 @@ a 2D launch of `(TILE1, ROWS)` threads per block, one block per tile of `TILE0` 
 **how?**
 - the stiffness is staged in the second $u$ array and turned into the cell stiffnesses once; products and sums commute exactly, so they are the means `flux_divergence_axis` forms. The tile's source and sensor lists are then scattered into the same array as tags, read once, and the array refilled with $u^t$
 - the axis-0 taps of a node come from the thread's own registers and only past the ends of its run from the tile, the axis-1 taps from the tile
-- each step reads `cu` and writes `nu`, so one barrier separates the steps; a tile holding a ghost takes a second one, for the ghost to read its mirror two nodes in, the sign held for Dirichlet
+- each step reads `cu` and writes `nu`, so one barrier separates the steps; a tile holding a ghost takes a second one, for each of the $R$ ghost layers to read its mirror across the wall node, the sign held for Dirichlet. The layers past the stored ghost load their mirror at the start and are never written back
 - the edge nodes of a tile read the guard ring and go wrong, one radius deeper every step; after `STEPS` steps the error stops short of the core
 - the laplacian, the update and $\beta$'s two divisors $1\mp\beta$ are rounded by `FMA_RN` and `MUL_RN` as nvcc contracts them in `fd_kernel` ($\Delta t\,d/2m$ fused into $1\mp\beta$, one axis fused onto the other), and the source term rounded apart as `excitation_kernel` adds it atomically
 - a ghost is written back by the tile whose core holds its mirror, the one tile where the mirror is valid after the last step; a core of one node beside the ghost would leave it to a tile that reads the mirror past its valid region, so the halo is at least 2
@@ -198,8 +205,7 @@ as the 3D `blocked_kernel`, the lists per column of every run and the entries `(
 `su`: $u$ of steps $0$ to `STEPS` $-1$ on the `SLOTS` $=R+1$ rows each waits before the next step reads it, `ss`: the stiffness of the row loaded (twice), each row with $R$ guard columns; `Q`: $u^k$ of the thread's column on the `DEPTH` $=2R+1$ rows around the one step $k+1$ updates; `P`: $u^{-1}$ on the last $R+1$ rows; `G`: the axis-0 cell stiffnesses between the last `HALO` $+2$ rows; `MI`, `M`: $1/m$ and the two axis-1 cell stiffnesses on the last `HALO` rows; `sourced, sensed`: bit $n$ set where the row $n$ behind the one loaded holds a source or a sensor of the column
 **how?**
 - iteration $z$ loads row $z$, then step $k$ updates row $z-kR$ from step $k-1$ on rows $z-(k+1)R$ to $z-(k-1)R$, the axis-0 taps from the thread's registers, the last of them pushed by step $k-1$ the same iteration, and the axis-1 taps from the row that step stored $R$ iterations before, so one barrier per row separates the steps
-- a ghost column is refilled by its mirror's thread, which stores the signed value into the ghost's slot of the stored row and writes it back with the last step; a ghost row is refilled in the column's queue, from row 2 when it passes and from row $N_0-3$ when the ghost is pushed; corners keep their values, the two levels swapped with the parity of `STEPS`
-- at order 4 the stencil narrows beside a wall as in `fd_kernel` (`CLOSURE`), so a step's taps never pass the ghosts; the variant without walls takes the full radius everywhere
+- the $R$ ghost columns beside a wall are refilled by their mirrors' threads, which store the signed value into the ghost's slot of the stored row, the stored ghost written back with the last step; the ghost rows are refilled in the column's queue, from rows $2..R+1$ as they pass and from rows $N_0-2-R..N_0-3$ when a ghost is pushed; the layers past the stored ghost load their mirror; corners keep their values, the two levels swapped with the parity of `STEPS`
 - the edge columns of a run read the guard columns and the first and last rows of a chunk lack their neighbours; both errors spread one radius a step and stop short of the core
 - the rounding is the 2D `blocked_kernel`'s; per row and step it loads nothing but the next row, so past L2 it moves a tenth of the plain step's bytes at order 2, while a small grid leaves too few blocks to hide the latency of a row and keeps the tiles
 
@@ -233,6 +239,7 @@ $$\psi^\pm\leftarrow b_{i\pm\frac12}\psi^\pm+a_{i\pm\frac12}D^\pm,\qquad\zeta\le
 $$u^{n+1}\mathrel{+}=\frac{1}{m}\left(f_d\left(g^+\psi^+-g^-\psi^-\right)+\zeta\right)$$
 - the minus cell of node $i$ is the plus cell of node $i-1$, so the flux memory is stored twice, once per node; that keeps every thread node-local and the launch free of atomics, at the price of one memory row
 - a node off the profile reads $a=0, b=1$, so the memories stay zero there and the slab may be wider than the layer
+- the taps are those of `fd_kernel`, through `mirrored`, and a Dirichlet wall node takes no share, held at zero as there
 
 ### homogeneous_neumann_kernel
 **parallelization**
@@ -246,7 +253,7 @@ enforce zero flux, $\partial u/\partial n=0$, on every face of the launch
 ### homogeneous_dirichlet_kernel
 Same parallelization, input args and grouping as `homogeneous_neumann_kernel`, with the odd mirror in place of the even one
 - `u[ghost] = -u[ghost + 2 * normal]`: antisymmetry about the wall node, the pressure-release or free-surface condition, and reflection comes back with flipped sign
-- homogeneous in the exact sense: the wall node is never written by this kernel, but the odd mirror makes its own `fd_kernel` update self-annihilating ($D^+-D^-=-2u_1$ at radius 1), so from $u^0=u^1=0$ it stays at exactly $0$ for all $n$
+- `u[ghost + normal] = 0`: the wall node, which `fd_kernel` holds at zero after every step anyway, so a field that never passed a step (an operator test, a power iteration) also has the odd mirror's exact fixed point there
 
 The four transfer kernels below live in `kernels/common.cuh` and not in `scalar.cu`, since every equation shares them byte for byte; a fifth there, `adjoint_excitation_kernel`, is documented with its caller in [cuda_scalar_sensitivity](cuda_scalar_sensitivity.md). They are documented here because the scalar case is the one with no component index to fold in, and the other `cuda_*` pages list only what differs
 

@@ -11,12 +11,15 @@ what `ReflectionTest` asserts, with `free` a third run of the identical setup
 translated into a domain whose own walls are out of reach within the record, so
 no arrival time has to be guessed anywhere.
 
-`WallLayerTest` pins the argument `homogeneous_dirichlet_kernel` rests on: that writing
-only the odd-mirrored ghost holds the wall node at zero without the kernel ever writing
-it (docs/cuda_scalar.md derives it). It is not held there exactly: the fma contraction
-of the two face fluxes leaves the rounding residual of a product, which then drives a
-stable recursion on the wall layer, so the assertion is against machine epsilon rather
-than against zero.
+`MirrorOrderTest` pins that the walls cost no order: the step reads the ghost layers past
+the stored one off their mirrors, so a box mode stays an eigenvector of the discrete
+operator, and one step on it converges to the exact Laplacian at the stencil's own order
+on both walls. A wall row graded down to radius 1 converges at order 2 there.
+
+`WallLayerTest` pins that a Dirichlet wall node stays at rest: the step writes it zero and
+every tap reads it as zero, so the layer is exactly zero. The bound is the machine-epsilon
+one it kept while the odd mirror alone held the node, against the rounding residual of
+the two cell fluxes.
 
 `PadTest` pins `pad_for_sponge`, the arithmetic a driver would otherwise repeat: the
 four returns have to stay consistent with each other, since a `region` that disagrees
@@ -112,6 +115,43 @@ def _wall_slices(sim):
             sel = [slice(0, n) for n in sim.Nx]
             sel[d] = index
             yield tuple(sel)
+
+
+@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
+class MirrorOrderTest(unittest.TestCase):
+    def _error(self, n, order, condition):
+        # one step on a box mode, which the mirrored taps keep an eigenvector
+        sim = ScalarWave(
+            (n + 3, n + 3),
+            (1.0 / n,) * 2,
+            1,
+            1.0 / n,
+            (4, 32),
+            precision="float64",
+            space_order=order,
+            stencil="taylor",
+            wavespeed=1.0,
+            density=1.0,
+            boundary=condition,
+        )
+        x, y = ((cp.arange(m) - 1.0) / n for m in sim.Nx_padded)
+        shape = cp.cos if condition == Neumann else cp.sin
+        mode = shape(3 * np.pi * x)[:, None] * shape(2 * np.pi * y)[None, :]
+        kernels = compile_kernels(sim)
+        mat = sim.build_materials(cp.ones(sim.Nx_padded, dtype=sim.dtype))
+        u1 = define_boundary(sim, kernels)(mode.copy())
+        u2 = sim.define_step(kernels, mat)(cp.zeros_like(u1), u1, cp.zeros_like(u1))
+        inner = (slice(1, n + 2),) * 2
+        laplacian = (u2 - 2 * u1)[inner] / sim.dt**2
+        exact = -13 * np.pi**2 * mode[inner]
+        return float(cp.abs(laplacian - exact).max() / cp.abs(exact).max())
+
+    def test_the_walls_keep_the_interior_order(self):
+        for order in (4, 6, 8):
+            for condition in (Neumann, Dirichlet):
+                fine = self._error(64, order, condition)
+                rate = np.log2(self._error(32, order, condition) / fine)
+                self.assertGreater(rate, order - 0.3, (order, condition))
 
 
 @unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")

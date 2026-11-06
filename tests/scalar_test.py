@@ -41,7 +41,7 @@ except Exception:  # cupy missing or no GPU
 
 if HAS_CUDA:
     from cuwave import scalar
-    from cuwave.boundary import Dirichlet, Neumann, Pml, sponge
+    from cuwave.boundary import Dirichlet, Neumann, Pml, faces_with, sponge
     from cuwave.scalar import AcousticWave, ScalarWave
     from cuwave.signals import ricker
     from cuwave.utils import point_source
@@ -177,6 +177,11 @@ class StreamingTest(unittest.TestCase):
 
 
 # ------------------------------------ blocked steps -----------------------------------
+def _beside(sim, d):
+    """The node beside the low wall of axis `d` a source takes: the wall node, or the next where a Dirichlet wall holds it."""
+    return 2 if 2 * d in faces_with(sim, Dirichlet) else 1
+
+
 def _shot(sim, seed):
     """Three sources, two beside a wall, and sensors in the interior, on a wall and in ghosts."""
     t = np.arange(sim.N) * sim.dt
@@ -184,7 +189,8 @@ def _shot(sim, seed):
         [ricker(t, 1.0, 2.0), -ricker(t, 0.7, 2.5), ricker(t, 1.3, 1.0)], 1
     )
     n = sim.Nx
-    position = [[n[0] // 3, 2 * n[0] // 3, n[0] - 3], [n[1] // 2, 1, n[1] - 3]]
+    position = [[n[0] // 3, 2 * n[0] // 3, n[0] - 3]]
+    position += [[n[1] // 2, _beside(sim, 1), n[1] - 3]]
     position = cp.array(position, dtype=cp.int32)
     sensors = cp.array(
         [[1, 2, n[0] - 2, 0, 5, 70, n[0] - 1], [1, n[1] - 2, 3, 4, n[1] - 1, 40, 9]],
@@ -316,8 +322,8 @@ def _shot_walls(sim, seed):
     """A source beside each wall and a corner, sensors along the walls and inside."""
     n = sim.Nx
     signal = np.random.default_rng(seed).standard_normal((sim.N, 6))
-    position = [[2, n[0] // 2, n[0] - 3, n[0] // 3, 1, n[0] // 2]]
-    position += [[n[1] // 3, 2, n[1] // 2, n[1] - 3, 1, n[1] // 2]]
+    position = [[2, n[0] // 2, n[0] - 3, n[0] // 3, _beside(sim, 0), n[0] // 2]]
+    position += [[n[1] // 3, 2, n[1] // 2, n[1] - 3, _beside(sim, 1), n[1] // 2]]
     near = [[a, 3] for a in range(1, 9)] + [[1, n[1] - 2], [n[0] - 2, 1]]
     sensors = np.array(near + [[n[0] - 2, n[1] - 2], [n[0] // 2, 40]]).T
     source = Source(cp.array(position, dtype=cp.int32), cp.asarray(signal, sim.dtype))
@@ -388,7 +394,7 @@ class MarchedRowsTest(unittest.TestCase):
             Nx=(301, 5),
         )
         signal = np.random.default_rng(4).standard_normal((sim.N, 3))
-        position = cp.array([[2, 150, 298], [1, 3, 2]], dtype=cp.int32)
+        position = cp.array([[2, 150, 298], [1, 2, 2]], dtype=cp.int32)
         source = Source(position, cp.asarray(signal, dtype=sim.dtype))
         sensors = cp.array([[5, 100, 200, 299], [1, 2, 3, 3]], dtype=cp.int32)
         indicator = _random(sim, 4)[0]
@@ -588,7 +594,6 @@ class FoldedStepTest(unittest.TestCase):
             "a pml": (replace(sim, pml=Pml(4, 1.0)), [[9], [20]]),
             "a domain": (replace(sim, domain=_random(sim, 1)[0] > 0.5), [[9], [20]]),
             "streaming": (_scalar(6), [[9], [20]]),
-            "three nodes": (_scalar(2, Nx=(3, 45)), [[1], [20]]),
             "order 6": (_scalar(6, Nx=(37, 45)), [[9], [20]]),
         }
         for name, (each, points) in kept.items():

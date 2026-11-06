@@ -39,31 +39,39 @@ __device__ __forceinline__ real_t flux_divergence_means(
   return flux_divergence_taps(u, uc, gp, gm, factor, r);
 }
 
-// spatial finite difference stencil for Laplacian
+// spatial finite difference stencil for Laplacian, node a of N on its axis
 __device__ __forceinline__ real_t flux_divergence_axis(
     const real_t *__restrict__ u1, const real_t *__restrict__ stiff,
-    const int idx, const int s, const real_t uc, const real_t sc,
-    const real_t factor, const int r) {
+    const int idx, const int s, const real_t uc, const real_t sc, const int a,
+    const int N, const int odd) {
   const real_t sp = stiff[idx + s]; // plus of sc
   const real_t sm = stiff[idx - s]; // minus of sc
-  return flux_divergence_means(u1, idx, s, uc, sc * sp / (sc + sp),
-                               sc * sm / (sc + sm), factor, r);
+  // every tap through the mirror, a no-op inside, so no warp diverges on it
+  real_t taps[2 * STENCIL_RADIUS + 1];
+#pragma unroll
+  for (int j = -STENCIL_RADIUS; j <= STENCIL_RADIUS; ++j)
+    taps[j + STENCIL_RADIUS] = mirrored(u1, idx, s, a, N, odd, j);
+  const auto u = [&](const int j) { return taps[j + STENCIL_RADIUS]; };
+  return flux_divergence_taps(u, uc, sc * sp / (sc + sp), sc * sm / (sc + sm),
+                              1, STENCIL_RADIUS);
 }
 
 // ------------------------------------- pml helpers
 // the two cell differences of flux_divergence_axis, before the stiffness
-__device__ __forceinline__ void cell_differences(const real_t *__restrict__ u1,
-                                                 const int idx, const int s,
-                                                 const real_t uc, const int r,
-                                                 real_t &Dp, real_t &Dm) {
-  Dp = OP_W(r, 1) * (u1[idx + s] - uc);
-  Dm = OP_W(r, 1) * (uc - u1[idx - s]);
+__device__ __forceinline__ void
+cell_differences(const real_t *__restrict__ u1, const int idx, const int s,
+                 const real_t uc, const int a, const int N, const int odd,
+                 real_t &Dp, real_t &Dm) {
+  const auto u = [&](const int j) {
+    return mirrored(u1, idx, s, a, N, odd, j);
+  };
+  Dp = OP_W(STENCIL_RADIUS, 1) * (u(1) - uc);
+  Dm = OP_W(STENCIL_RADIUS, 1) * (uc - u(-1));
 #pragma unroll
-  for (int k = 2; k <= STENCIL_RADIUS; ++k)
-    if (k <= r) {
-      Dp += OP_W(r, k) * (u1[idx + k * s] - u1[idx - (k - 1) * s]);
-      Dm += OP_W(r, k) * (u1[idx + (k - 1) * s] - u1[idx - k * s]);
-    }
+  for (int k = 2; k <= STENCIL_RADIUS; ++k) {
+    Dp += OP_W(STENCIL_RADIUS, k) * (u(k) - u(1 - k));
+    Dm += OP_W(STENCIL_RADIUS, k) * (u(k - 1) - u(-k));
+  }
 }
 
 // ----------------------------------- domain helpers
@@ -239,17 +247,27 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
   __shared__ real_t sk[STREAM_TX + 2 * STENCIL_RADIUS];
   const int tx = threadIdx.x, x0 = blockIdx.x * STREAM_TX, a1 = x0 + tx;
   const int cx = tx + STENCIL_RADIUS; // this node in the tile
+  const int odd0 = DIRICHLET_FACES, odd1 = DIRICHLET_FACES >> 2;
   const bool in_row = a1 < N1, inner = a1 > 0 && a1 < N1 - 1;
-  const int r1 = CLOSURE(a1, N1);
   const int a_first = 1 + blockIdx.y * chunk;
   const int a_last = min(N0 - 1, a_first + chunk);
+  // the column the thread loads u from, past the wall its mirror
+  int sign1;
+  const int c1 = mirror_node(a1, N1, odd1, sign1);
+  const bool reached = a1 <= N1 - 2 + STENCIL_RADIUS;
+  // u at row b of column c of sign `sign`, past a wall off its mirror
+  const auto load = [&](const int b, const int c, const int sign) {
+    int sign0;
+    const int row = mirror_node(b, N0, odd0, sign0);
+    return signed_value(u1[row * s0 + c], sign0 * sign);
+  };
 
   // axis 0 marches, its taps and three stiffnesses queued in registers
   real_t q[2 * STENCIL_RADIUS + 1]; // u on rows a0 - R .. a0 + R
 #pragma unroll
   for (int k = 1; k <= 2 * STENCIL_RADIUS; ++k) {
     const int row = a_first - STENCIL_RADIUS - 1 + k;
-    q[k] = (in_row && row >= 0 && row < N0) ? u1[row * s0 + a1] : (real_t)0;
+    q[k] = reached ? load(row, c1, sign1) : (real_t)0;
   }
   real_t sm, sc = in_row ? stiff[(a_first - 1) * s0 + a1] : (real_t)1;
   real_t sp = in_row ? stiff[a_first * s0 + a1] : (real_t)1;
@@ -259,8 +277,7 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
     for (int k = 0; k < 2 * STENCIL_RADIUS; ++k)
       q[k] = q[k + 1];
     const int ahead = a0 + STENCIL_RADIUS;
-    q[2 * STENCIL_RADIUS] =
-        (in_row && ahead < N0) ? u1[ahead * s0 + a1] : (real_t)0;
+    q[2 * STENCIL_RADIUS] = reached ? load(ahead, c1, sign1) : (real_t)0;
     sm = sc;
     sc = sp;
     sp = in_row ? stiff[idx + s0] : (real_t)1; // row a0 + 1 is at most a ghost
@@ -271,9 +288,12 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
     sk[cx] = sc;
     for (int e = tx; e < STENCIL_RADIUS; e += STREAM_TX) {
       const int xl = x0 - STENCIL_RADIUS + e, xr = x0 + STREAM_TX + e;
-      su[e] = xl >= 0 ? u1[a0 * s0 + xl] : (real_t)0;
+      int sl, sr;
+      const int cl = mirror_node(xl, N1, odd1, sl);
+      const int cr = mirror_node(xr, N1, odd1, sr);
+      su[e] = load(a0, cl, sl);
       su[STENCIL_RADIUS + STREAM_TX + e] =
-          xr < N1 ? u1[a0 * s0 + xr] : (real_t)0;
+          xr <= N1 - 2 + STENCIL_RADIUS ? load(a0, cr, sr) : (real_t)0;
     }
     if (tx == 0) // the cell stiffness reaches one node either way
       sk[cx - 1] = x0 > 0 ? stiff[idx - 1] : (real_t)1;
@@ -285,27 +305,33 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
 
     // axis 0 from the queue, in the order flux_divergence_axis takes its taps
     const real_t uc = q[STENCIL_RADIUS];
-    const int r0 = CLOSURE(a0, N0);
     const real_t gp = sc * sp / (sc + sp), gm = sc * sm / (sc + sm);
-    real_t Dp = OP_W(r0, 1) * (q[STENCIL_RADIUS + 1] - uc);
-    real_t Dm = OP_W(r0, 1) * (uc - q[STENCIL_RADIUS - 1]);
+    real_t Dp = OP_W(STENCIL_RADIUS, 1) * (q[STENCIL_RADIUS + 1] - uc);
+    real_t Dm = OP_W(STENCIL_RADIUS, 1) * (uc - q[STENCIL_RADIUS - 1]);
 #pragma unroll
-    for (int k = 2; k <= STENCIL_RADIUS; ++k)
-      if (k <= r0) {
-        Dp += OP_W(r0, k) * (q[STENCIL_RADIUS + k] - q[STENCIL_RADIUS - k + 1]);
-        Dm += OP_W(r0, k) * (q[STENCIL_RADIUS + k - 1] - q[STENCIL_RADIUS - k]);
-      }
+    for (int k = 2; k <= STENCIL_RADIUS; ++k) {
+      Dp += OP_W(STENCIL_RADIUS, k) *
+            (q[STENCIL_RADIUS + k] - q[STENCIL_RADIUS - k + 1]);
+      Dm += OP_W(STENCIL_RADIUS, k) *
+            (q[STENCIL_RADIUS + k - 1] - q[STENCIL_RADIUS - k]);
+    }
+    // axis 1 from the tile, which holds the mirrors past the wall
+    const real_t sp1 = sk[cx + 1], sm1 = sk[cx - 1];
     const real_t laplacian =
         f0 * (Dp * gp - Dm * gm) +
-        flux_divergence_axis(su + cx, sk + cx, 0, 1, uc, sc, f1, r1);
+        flux_divergence_means(su + cx, 0, 1, uc, sc * sp1 / (sc + sp1),
+                              sc * sm1 / (sc + sm1), f1, STENCIL_RADIUS);
 
     const real_t mi = derive_inertia ? 1.f / sc : minv[idx];
 #ifdef USE_DAMPING
     const real_t beta = 0.5f * mi * damping[idx] * dt;
-    u2[idx] = (2.f * uc - old * (1.f - beta) + mi * laplacian) / (1.f + beta);
+    real_t v = (2.f * uc - old * (1.f - beta) + mi * laplacian) / (1.f + beta);
 #else
-    u2[idx] = -old + 2.f * uc + mi * laplacian;
+    real_t v = -old + 2.f * uc + mi * laplacian;
 #endif
+    if (held_wall(a0, N0, odd0) || held_wall(a1, N1, odd1))
+      v = 0; // a Dirichlet wall node holds zero
+    u2[idx] = v;
   }
 }
 #else
@@ -344,14 +370,15 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
   if (!(a0 > 0 && a0 < N0 - 1))
     return;
   const int idx = a0;
-  const int r0 = CLOSURE(a0, N0);
+  const bool held = held_wall(a0, N0, DIRICHLET_FACES);
 #elif NDIM == 2
   const int a1 = BLOCK_X * blockDim.x + threadIdx.x;
   const int a0 = BLOCK_Y * blockDim.y + threadIdx.y;
   if (!(a0 > 0 && a0 < N0 - 1 && a1 > 0 && a1 < N1 - 1))
     return;
   const int idx = a0 * s0 + a1;
-  const int r0 = CLOSURE(a0, N0), r1 = CLOSURE(a1, N1);
+  const bool held = held_wall(a0, N0, DIRICHLET_FACES) ||
+                    held_wall(a1, N1, DIRICHLET_FACES >> 2);
 #elif NDIM == 3
   const int a2 = BLOCK_X * blockDim.x + threadIdx.x;
   const int a1 = BLOCK_Y * blockDim.y + threadIdx.y;
@@ -360,7 +387,9 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
         a2 < N2 - 1))
     return;
   const int idx = a0 * s0 + a1 * s1 + a2;
-  const int r0 = CLOSURE(a0, N0), r1 = CLOSURE(a1, N1), r2 = CLOSURE(a2, N2);
+  const bool held = held_wall(a0, N0, DIRICHLET_FACES) ||
+                    held_wall(a1, N1, DIRICHLET_FACES >> 2) ||
+                    held_wall(a2, N2, DIRICHLET_FACES >> 4);
 #endif
 #ifdef FOLD_SOURCES
   // the block's source list, loaded before the stencil so its latency hides
@@ -370,15 +399,28 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
 
   const real_t uc = u1[idx];    // load once
   const real_t sc = stiff[idx]; // load once
+  // the axes summed as blocked_kernel takes them, rounding pinned
 #if NDIM == 1
-  real_t laplacian = flux_divergence_axis(u1, stiff, idx, 1, uc, sc, f0, r0);
+  real_t laplacian = MUL_RN(f0, flux_divergence_axis(u1, stiff, idx, 1, uc, sc,
+                                                     a0, N0, DIRICHLET_FACES));
 #elif NDIM == 2
-  real_t laplacian = flux_divergence_axis(u1, stiff, idx, s0, uc, sc, f0, r0) +
-                     flux_divergence_axis(u1, stiff, idx, 1, uc, sc, f1, r1);
+  const real_t d0 = flux_divergence_axis(u1, stiff, idx, s0, uc, sc, a0, N0,
+                                         DIRICHLET_FACES);
+  const real_t d1 = flux_divergence_axis(u1, stiff, idx, 1, uc, sc, a1, N1,
+                                         DIRICHLET_FACES >> 2);
+#if STENCIL_RADIUS == 1
+  real_t laplacian = FMA_RN(f0, d0, MUL_RN(f1, d1));
+#else
+  real_t laplacian = FMA_RN(f1, d1, MUL_RN(f0, d0));
+#endif
 #elif NDIM == 3
-  real_t laplacian = flux_divergence_axis(u1, stiff, idx, s0, uc, sc, f0, r0) +
-                     flux_divergence_axis(u1, stiff, idx, s1, uc, sc, f1, r1) +
-                     flux_divergence_axis(u1, stiff, idx, 1, uc, sc, f2, r2);
+  const real_t d0 = flux_divergence_axis(u1, stiff, idx, s0, uc, sc, a0, N0,
+                                         DIRICHLET_FACES);
+  const real_t d1 = flux_divergence_axis(u1, stiff, idx, s1, uc, sc, a1, N1,
+                                         DIRICHLET_FACES >> 2);
+  const real_t d2 = flux_divergence_axis(u1, stiff, idx, 1, uc, sc, a2, N2,
+                                         DIRICHLET_FACES >> 4);
+  real_t laplacian = FMA_RN(f2, d2, FMA_RN(f0, d0, MUL_RN(f1, d1)));
 #endif
 #ifdef USE_DOMAIN
   // bit 30 marks a tile touching the wall, so the branch is uniform per block
@@ -408,6 +450,8 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
 #else
   real_t v = -u0[idx] + 2.f * uc + mi * laplacian;
 #endif
+  if (held)
+    v = 0; // a Dirichlet wall node holds zero
   u2[idx] = v;
 #ifdef FOLD_SOURCES
   // the excitation folded in: the block's sources in the order of its list,
@@ -462,7 +506,7 @@ pml_kernel(const real_t *__restrict__ u1, real_t *__restrict__ u2,
 
   const real_t uc = u1[idx], sc = stiff[idx];
   real_t Dp, Dm;
-  cell_differences(u1, idx, o, uc, CLOSURE(a, N), Dp, Dm);
+  cell_differences(u1, idx, o, uc, a, N, DIRICHLET_FACES >> 2 * d, Dp, Dm);
   const real_t sp = stiff[idx + o], sm = stiff[idx - o];
   const real_t gp = sc * sp / (sc + sp), gm = sc * sm / (sc + sm); // harmonic
 
@@ -474,7 +518,8 @@ pml_kernel(const real_t *__restrict__ u1, real_t *__restrict__ u2,
   aux[size + t] = pm;
   aux[2 * size + t] = z;
   const real_t mi = derive_inertia ? 1.f / sc : minv[idx];
-  u2[idx] += mi * (f * (gp * pp - gm * pm) + z);
+  if (!held_node(idx, n, s)) // a Dirichlet wall node holds zero
+    u2[idx] += mi * (f * (gp * pp - gm * pm) + z);
 }
 
 // ------------------------------------------------------------------------------------
@@ -497,6 +542,7 @@ __global__ void homogeneous_dirichlet_kernel(real_t *__restrict__ u,
                 normal))
     return;
   u[ghost] = -u[ghost + 2 * normal];
+  u[ghost + normal] = 0; // the wall node, which the step holds there too
 }
 
 #ifdef STEPS
@@ -555,8 +601,19 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
     const bool inside = col && a0 >= 0 && a0 <= N0 - 1;
     const bool interior = a0 > 0 && a0 < N0 - 1 && a1 > 0 && a1 < N1 - 1;
     const int idx = a0 * s0 + a1;
+    // a ghost layer past the stored one holds its mirror, as the refill will
+    int sign0, sign1;
+    const int m0 = mirror_node(a0, N0, dirichlet, sign0);
+    const int m1 = mirror_node(a1, N1, dirichlet >> 2, sign1);
+    const bool reached0 =
+        a0 >= 1 - STENCIL_RADIUS && a0 <= N0 - 2 + STENCIL_RADIUS;
+    const bool reached1 =
+        a1 >= 1 - STENCIL_RADIUS && a1 <= N1 - 2 + STENCIL_RADIUS;
+    const bool mirrored = !inside && reached0 && reached1;
     up[k] = inside ? u0[idx] : 0;
-    uc[k] = inside ? u1[idx] : 0;
+    uc[k] = inside     ? u1[idx]
+            : mirrored ? signed_value(u1[m0 * s0 + m1], sign0 * sign1)
+                       : 0;
     sc[k] = inside ? stiff[idx] : (real_t)1;
     shared[AT(x, ty)] = uc[k];
     shared[AREA + AT(x, ty)] = sc[k];
@@ -565,13 +622,14 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
     beta[k] = interior ? 0.5f * mi[k] * damping[idx] : 0; // over dt
 #endif
     stepped |= (unsigned)interior << k;
-    // a ghost of a face the refill reaches, edges and corners excluded
+    // a ghost of a face the refill reaches, R layers deep, edges and corners
+    // excluded
     const bool along0 = a1 > 0 && a1 < N1 - 1, along1 = a0 > 0 && a0 < N0 - 1;
-    const int f = along0 && a0 == 0        ? 0
-                  : along0 && a0 == N0 - 1 ? 1
-                  : along1 && a1 == 0      ? 2
-                  : along1 && a1 == N1 - 1 ? 3
-                                           : -1;
+    const int f = along0 && reached0 && a0 <= 0          ? 0
+                  : along0 && reached0 && a0 >= N0 - 1   ? 1
+                  : along1 && reached1 && a1 <= 0        ? 2
+                  : along1 && reached1 && a1 >= N1 - 1   ? 3
+                                                         : -1;
     ghost |= (unsigned)(f >= 0 && (((neumann | dirichlet) >> f) & 1)) << k;
   }
   const bool refill = __syncthreads_or(ghost);
@@ -637,9 +695,9 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
       };
       const auto along1 = [&](const int j) { return cu[i + j]; };
       const real_t d0 = flux_divergence_taps(along0, uc[k], g0[k + 1], g0[k],
-                                             1, CLOSURE(a0, N0));
+                                             1, STENCIL_RADIUS);
       const real_t d1 = flux_divergence_taps(along1, uc[k], gp1[k], gm1[k], 1,
-                                             CLOSURE(a1, N1));
+                                             STENCIL_RADIUS);
       // one axis fused onto the other, as nvcc contracts fd_kernel's sum
 #if STENCIL_RADIUS == 1
       const real_t laplacian = FMA_RN(f0, d0, MUL_RN(f1, d1));
@@ -655,6 +713,8 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
 #else
       real_t u2 = FMA_RN(mi[k], laplacian, 2.f * uc[k] - up[k]);
 #endif
+      if (held_wall(a0, N0, dirichlet) || held_wall(a1, N1, dirichlet >> 2))
+        u2 = 0; // a Dirichlet wall node holds zero
       // the product rounded apart, as excitation_kernel adds it atomically
       const int j = (tag[k] & 0xffffu) - 1;
       if (j >= 0)
@@ -670,16 +730,18 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
         uc[k] = next;
       }
 
-    // the boundary refill: a ghost takes its mirror two nodes in, the sign held
+    // the boundary refill: a ghost takes its mirror across the wall node, the
+    // sign held
     if (refill) {
       __syncthreads();
 #pragma unroll
       for (int k = 0; k < NODES; ++k)
         if ((ghost >> k) & 1) {
           const int x = x0 + k, a0 = lo0 - HALO + x;
-          const int f = a0 == 0 ? 0 : a0 == N0 - 1 ? 1 : a1 == 0 ? 2 : 3;
-          const real_t m = nu[AT(x + 2 * (f == 0) - 2 * (f == 1),
-                                 ty + 2 * (f == 2) - 2 * (f == 3))];
+          const int f = a0 <= 0 ? 0 : a0 >= N0 - 1 ? 1 : a1 <= 0 ? 2 : 3;
+          const int r0 = f == 0 ? 2 - 2 * a0 : f == 1 ? 2 * (N0 - 2 - a0) : 0;
+          const int r1 = f == 2 ? 2 - 2 * a1 : f == 3 ? 2 * (N1 - 2 - a1) : 0;
+          const real_t m = nu[AT(x + r0, ty + r1)];
           up[k] = uc[k];
           uc[k] = (dirichlet >> f) & 1 ? -m : m;
           nu[AT(x, ty)] = uc[k];
@@ -695,7 +757,8 @@ __global__ void __launch_bounds__(TILE1 *ROWS) blocked_kernel(
 #pragma unroll
       for (int k = 0; k < NODES; ++k) {
         const int a0 = lo0 - HALO + x0 + k, k0 = owner(a0, N0);
-        if (((stepped | ghost) >> k) & 1 && k0 >= lo0 && k0 < lo0 + C0)
+        if (((stepped | ghost) >> k) & 1 && a0 >= 0 && a0 <= N0 - 1 &&
+            k0 >= lo0 && k0 < lo0 + C0)
           v0[t * level + a0 * s0 + a1] = uc[k];
       }
 #endif
@@ -761,16 +824,38 @@ __global__ void __launch_bounds__(TILE1)
   const int last = min(first + PLANES, N0 - 1);
   const bool col = !WALLS || a1 >= 0 && a1 <= N1 - 1;
   const bool inner = !WALLS || a1 > 0 && a1 < N1 - 1;
-  const bool side = WALLS && col && !inner; // a ghost column
+  const bool reached =
+      !WALLS || a1 >= 1 - STENCIL_RADIUS && a1 <= N1 - 2 + STENCIL_RADIUS;
+  const bool side = WALLS && reached && !inner; // a ghost column, R deep
   const int k1 = owner(a1, N1);
   const bool owned = col && k1 >= lo1 && k1 < lo1 + C1;
   // the face ghost this column mirrors, if the tile holds it, and its sign
-  const int mirror = !WALLS || !inner                 ? 0
-                     : a1 == 2 && tx >= 2             ? -2
-                     : a1 == N1 - 3 && tx + 2 < TILE1 ? 2
-                                                      : 0;
+  const int reflected = !WALLS || !inner ? 0
+                        : a1 >= 2 && a1 <= STENCIL_RADIUS + 1 ? 2 - 2 * a1
+                        : a1 >= N1 - 2 - STENCIL_RADIUS && a1 <= N1 - 3
+                            ? 2 * (N1 - 2 - a1)
+                            : 0;
+  const int mirror =
+      tx + reflected >= 0 && tx + reflected < TILE1 ? reflected : 0;
+  const bool stored = a1 + mirror == 0 || a1 + mirror == N1 - 1;
   const bool flip = dirichlet >> (mirror < 0 ? 2 : 3) & 1;
   const bool low = dirichlet & 1, high = dirichlet & 2;
+  // a ghost column past the stored one loads its mirror's, sign1 the sign
+  int sign1 = 1;
+  const int c1 =
+      WALLS && !col ? mirror_node(a1, N1, dirichlet >> 2, sign1) : a1;
+  // u^0 on row b of the column, past a wall off its mirror
+  const auto fetch = [&](const int b) {
+    if (!WALLS)
+      return u1[b * s0 + a1];
+    if (!reached || b < 1 - STENCIL_RADIUS || b > N0 - 2 + STENCIL_RADIUS)
+      return (real_t)0;
+    if (col && b >= 0 && b <= N0 - 1)
+      return u1[b * s0 + a1];
+    int sign0;
+    const int row = mirror_node(b, N0, dirichlet, sign0);
+    return signed_value(u1[row * s0 + c1], sign0 * sign1);
+  };
 
   // the column's sources and sensors by row, from the march's first: `se` the
   // first a step still adds, `sz` the first past the row loaded
@@ -814,7 +899,7 @@ __global__ void __launch_bounds__(TILE1)
   const int end = last + HALO;
   int z = first - HALO, slot = 0; // this row's u at slot, the one read next
   bool load = col && z >= 0;
-  real_t nu0 = load ? u0[z * s0 + a1] : 0, nu1 = load ? u1[z * s0 + a1] : 0;
+  real_t nu0 = load ? u0[z * s0 + a1] : 0, nu1 = fetch(z);
   real_t ns = load ? stiff[z * s0 + a1] : (real_t)1;
   real_t nm = load && !derive_inertia ? minv[z * s0 + a1] : 0;
   for (; z < end; ++z) {
@@ -825,13 +910,13 @@ __global__ void __launch_bounds__(TILE1)
     load = col && (!WALLS || z + 1 >= 0 && z + 1 <= N0 - 1) && z + 1 < end;
     const int ahead = (z + 1) * s0 + a1;
     nu0 = load ? u0[ahead] : 0;
-    nu1 = load ? u1[ahead] : 0;
+    nu1 = z + 1 < end ? fetch(z + 1) : 0;
     ns = load ? stiff[ahead] : (real_t)1;
     nm = load && !derive_inertia ? minv[ahead] : 0;
     __syncthreads();
 
     // what nothing steps keeps through the launch: a corner
-    if (WALLS && side && (z == 0 || z == N0 - 1) && owned) {
+    if (WALLS && side && col && (z == 0 || z == N0 - 1) && owned) {
       const int kz = owner(z, N0);
       if (kz >= first && kz < last) {
         v0[z * s0 + a1] = STEPS % 2 ? lu1 : lu0;
@@ -884,10 +969,9 @@ __global__ void __launch_bounds__(TILE1)
         const auto along1 = [&](const int j) { return cu[i + j]; };
         const real_t d0 =
             flux_divergence_taps(along0, uc, G[HALO - n], G[HALO - n - 1], 1,
-                                 WALLS ? CLOSURE(q, N0) : STENCIL_RADIUS);
-        const real_t d1 =
-            flux_divergence_taps(along1, uc, M[n][1], M[n][0], 1,
-                                 WALLS ? CLOSURE(a1, N1) : STENCIL_RADIUS);
+                                 STENCIL_RADIUS);
+        const real_t d1 = flux_divergence_taps(along1, uc, M[n][1], M[n][0], 1,
+                                               STENCIL_RADIUS);
         // one axis fused onto the other, as nvcc contracts fd_kernel's sum
 #if STENCIL_RADIUS == 1
         const real_t laplacian = FMA_RN(f0, d0, MUL_RN(f1, d1));
@@ -903,6 +987,9 @@ __global__ void __launch_bounds__(TILE1)
 #else
         u = FMA_RN(MI[n], laplacian, 2.f * uc - u);
 #endif
+        if (WALLS && (held_wall(q, N0, dirichlet) ||
+                      held_wall(a1, N1, dirichlet >> 2)))
+          u = 0; // a Dirichlet wall node holds zero
         if (WALLS && sourced >> (n + 1) & 1) {
           int e = se;
           while (source_entries[e].x != q)
@@ -928,7 +1015,7 @@ __global__ void __launch_bounds__(TILE1)
           const real_t w = Q[STEPS - 1][STENCIL_RADIUS];
           v0[idx] = w;
           v1[idx] = u;
-          if (mirror) {
+          if (mirror && stored) {
             v0[idx + mirror] = flip ? -w : w;
             v1[idx + mirror] = flip ? -u : u;
           }
@@ -945,14 +1032,19 @@ __global__ void __launch_bounds__(TILE1)
 
       // the ghost rows' refill through the queue
       if (k < STEPS) {
-        if (WALLS && inner && q == N0 - 1)
-          u = high ? -Q[k][DEPTH - 2] : Q[k][DEPTH - 2];
+        // a ghost row R deep takes its mirror across the wall node
+#pragma unroll
+        for (int m = 1; m <= STENCIL_RADIUS; ++m)
+          if (WALLS && inner && q == N0 - 2 + m)
+            u = high ? -Q[k][DEPTH - 2 * m] : Q[k][DEPTH - 2 * m];
 #pragma unroll
         for (int m = 0; m < DEPTH - 1; ++m)
           Q[k][m] = Q[k][m + 1];
         Q[k][DEPTH - 1] = u;
-        if (WALLS && inner && q == 2)
-          Q[k][DEPTH - 3] = low ? -u : u;
+#pragma unroll
+        for (int m = 1; m <= STENCIL_RADIUS; ++m)
+          if (WALLS && inner && q == m + 1)
+            Q[k][DEPTH - 1 - 2 * m] = low ? -u : u;
         if (!side || q <= 0 || q >= N0 - 1)
           nxt[k * WIDE + i] = u;
       }
@@ -1181,6 +1273,10 @@ __global__ void __launch_bounds__(TILE1 *TILE2)
 #else
         u = FMA_RN(MI[k - 1], laplacian, 2.f * uc - u);
 #endif
+        if (WALLS && (held_wall(q, N0, dirichlet) ||
+                      held_wall(a1, N1, dirichlet >> 2) ||
+                      held_wall(a2, N2, dirichlet >> 4)))
+          u = 0; // a Dirichlet wall node holds zero
         if (sourced >> k & 1) {
           int e = se;
           while (source_entries[e].x != q)

@@ -57,6 +57,13 @@ kernel conventions). Do not infer the style from a single file instead of readin
   `boundary.py` and `sensitivity.py` reproduce the same ordering by hand.
 - Sources and sensors live on **interior** nodes; `sensitivity` raises if they don't
   (`require_interior`), because a ghost node carries no equation and corrupts the gradient.
+- The pressure walls (`Neumann`, `Dirichlet`) mirror as deep as the stencil reaches, but
+  only one ghost layer is **stored**: the step reads the `R - 1` layers past it off their
+  mirror about the wall node (`mirror_node` in `common.cuh`, odd on `-DDIRICHLET_FACES`),
+  so every node keeps the full radius and the wall keeps the interior order. A Dirichlet
+  wall node is held at zero by the step and the refill, and read as zero by the adjoint,
+  so a source there is refused (`require_off_held_walls`). A path that stages its taps (stream, tiles,
+  marches) loads the layers past the ring from the mirror and refills all `R` per step.
 
 ### Forward solve (`wave.py` framework + one module per equation)
 
@@ -153,7 +160,7 @@ and the cell onto one stays open with the zero at the cell *midpoint* (radius co
 `USE_FLOAT`, `USE_DAMPING` and `USE_MAGNETIC` go in as `-D` flags, while two source blocks
 are *prepended* so CuPy's module cache keys on them without a flag: the stencil table from
 `stencils.preamble(space_order, stencil)` (`Simulation.stencil`, default `"optimized"`, the
-dispersion-fitted full-radius row; `"taylor"` the formal-order one; wall rows stay Taylor), then `kernels/common.cuh`.
+dispersion-fitted full-radius row, second order under refinement; `"taylor"` the formal-order one; the graded rows below it stay Taylor and serve only a `domain`'s cut cells), then `kernels/common.cuh`.
 That prelude holds what every `.cu` repeated (the `real_t` typedef, the `OP_W`/`SG_W`
 accessors, `rad_node`/`rad_half`, `PAIR_ROW`, and the four transfer kernels); the `AXIS_*`
 macro blocks stay per file, since the anisotropic adjoint's signature genuinely differs. Any new flag is added to both the
@@ -249,10 +256,10 @@ is exact only once both runs have decayed: a constant tail is continued in close
 must cover ghost nodes too, since the stiffness gradient reads them at the walls.
 
 `sensitivity` and `reconstruction_sensitivity` are exact at any order. Above order 2 the
-pressure operator is not its own transpose (graded wall rows, wide flux under a varying
-stiffness), so `PressureWave.define_adjoint_step` steps lambda with `adjoint_kernel`,
-`W^-1 A^T W` written as a gather, and the fused and gradient kernels carry the matching
-wall terms. Those three kernels launch on `split_grid_block`: the near-wall columns of the
+pressure operator is not its own transpose (wide flux under a varying stiffness), so
+`PressureWave.define_adjoint_step` steps lambda with `adjoint_kernel`, `W^-1 A^T W` written
+as a gather; near a wall it reads lambda, u and the stiffness through the same mirror as
+the step, which is the whole wall path of the adjoint and gradient kernels. Those three kernels launch on `split_grid_block`: the near-wall columns of the
 fast axis are packed into leading blocks, so only those blocks and the near-wall rows run
 the general wall path (a warp holding one wall node would otherwise run it for all 32
 lanes). Masked runs (`domain`/`dirichlet`) are not covered: material gradients refuse them

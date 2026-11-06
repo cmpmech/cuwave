@@ -20,7 +20,7 @@ import cupy as cp
 import cupy.typing as cpt
 import numpy as np
 
-from .boundary import _canonical_faces, pml_widths
+from .boundary import _canonical_faces, pml_widths, require_off_held_walls
 
 if TYPE_CHECKING:
     from .wave import Simulation
@@ -295,6 +295,8 @@ def decomposable(function: Callable) -> Callable:
     def run(*args, **kwargs):
         bound = signature.bind(*args, **kwargs)
         sim = bound.arguments["sim"]
+        # checked whole, since a subdomain's walls at the cuts are halo rows
+        require_off_held_walls(sim, bound.arguments["source"].position)
         if sim.devices is None:
             return function(*args, **kwargs)
         if bound.arguments.get("record_every") is not None:

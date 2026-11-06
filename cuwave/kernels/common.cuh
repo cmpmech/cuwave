@@ -5,6 +5,7 @@
 //   STENCIL_RADIUS
 //   OP_COEFFS
 //   STAG_COEFFS
+//   DIRICHLET_FACES (default 0)
 
 #ifdef USE_FLOAT
 typedef float real_t;
@@ -12,8 +13,8 @@ typedef float real_t;
 #define FMA_RN __fmaf_rn
 #else
 typedef double real_t;
-#define MUL_RN(a, b) ((a) * (b)) // left to nvcc, as only float32 blocks steps
-#define FMA_RN(a, b, c) ((a) * (b) + (c))
+#define MUL_RN __dmul_rn // pinned too, so code around it rounds nothing anew
+#define FMA_RN __fma_rn
 #endif
 
 // ----------------------------- finite difference helpers
@@ -23,17 +24,48 @@ typedef double real_t;
 
 #if STENCIL_RADIUS == 1
 #define OP_W(r, k) ((real_t)1)
-#define CLOSURE(a, N) 1
 #define SG_W(r, k) ((real_t)1)
 #else
 // cache
 __constant__ real_t OP_C[STENCIL_RADIUS][STENCIL_RADIUS] = OP_COEFFS;
 #define OP_W(r, k) OP_C[(r) - 1][(k) - 1] // 1-indexed adjustment
-// grade radius down towards wall so the stencil never reaches past ghost nodes
-#define CLOSURE(a, N) min(STENCIL_RADIUS, min(a, (N) - 1 - (a)))
 __constant__ real_t SG_C[STENCIL_RADIUS][STENCIL_RADIUS] = STAG_COEFFS;
 #define SG_W(r, k) SG_C[(r) - 1][(k) - 1] // 1-indexed adjustment
 #endif
+
+// ---------------------------------- mirrored taps
+#ifndef DIRICHLET_FACES
+#define DIRICHLET_FACES 0
+#endif
+
+// whether node a is the wall node of a face of `odd` (bit 0 low, bit 1 high)
+__device__ __forceinline__ bool held_wall(const int a, const int N,
+                                          const int odd) {
+  return (odd & 1 && a == 1) || (odd & 2 && a == N - 2);
+}
+
+// node b of an axis of N nodes, past the stored ghost its mirror about the
+// wall node, odd past a face of `odd`
+__device__ __forceinline__ int mirror_node(const int b, const int N,
+                                           const int odd, int &sign) {
+  sign = (b < 0 && odd & 1) || (b > N - 1 && odd & 2) ? -1 : 1;
+  return b < 0 ? 2 - b : b > N - 1 ? 2 * (N - 2) - b : b;
+}
+
+// a value read off a mirror with its sign
+__device__ __forceinline__ real_t signed_value(const real_t v, const int sign) {
+  return sign > 0 ? v : sign < 0 ? -v : (real_t)0;
+}
+
+// u at node a + j of the line through idx, read through mirror_node
+__device__ __forceinline__ real_t mirrored(const real_t *__restrict__ u,
+                                           const int idx, const int s,
+                                           const int a, const int N,
+                                           const int odd, const int j) {
+  int sign;
+  const int b = mirror_node(a + j, N, odd, sign);
+  return signed_value(u[idx + (b - a) * s], sign);
+}
 
 // --------------------------------- staggered lattice
 #define NPAIRS (NDIM * (NDIM - 1) / 2)
@@ -138,6 +170,20 @@ __device__ __forceinline__ int slab_index(const int a, const int off,
   if (row < 0)
     return -1;
   return d < NDIM - 1 ? row * plane + off : off * (lo + hi) + row;
+}
+
+// whether the node at idx is the wall node of a face DIRICHLET_FACES names
+__device__ __forceinline__ bool held_node(const int idx, const int *n,
+                                          const int *s) {
+  bool held = false;
+  int rest = idx;
+#pragma unroll
+  for (int e = 0; e < NDIM; ++e) {
+    const int ae = rest / s[e];
+    rest -= ae * s[e];
+    held |= held_wall(ae, n[e], DIRICHLET_FACES >> 2 * e);
+  }
+  return held;
 }
 
 // ------------------------------- pml memory accessors

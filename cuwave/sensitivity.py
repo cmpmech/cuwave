@@ -24,7 +24,7 @@ import cupyx.scipy.ndimage as ndi
 import numpy as np
 import numpy.typing as npt
 
-from .boundary import define_boundary, pml_nodes
+from .boundary import define_boundary, pml_nodes, require_off_held_walls
 from .decomposition import agree, decomposable, owned, replaying, undivided
 from .wave import (
     BFLOAT16,
@@ -936,6 +936,7 @@ def spectral_sensitivity(
     """
     require_interior(sim, sensors, "sensor")
     require_interior(sim, source.position, "source")
+    require_off_held_walls(sim, source.position)
     require_full_domain(sim)
     frequencies = np.atleast_1d(np.asarray(frequencies, dtype=np.float64))
 

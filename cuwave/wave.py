@@ -680,7 +680,7 @@ def domain_cells(sim: Simulation) -> cpt.NDArray[cp.int32]:
         shape = [1] * sim.ndim
         shape[d] = -1
         a = cp.arange(sim.Nx_padded[d]).reshape(shape)
-        wall = cp.minimum(R, cp.minimum(a, sim.Nx[d] - 1 - a))  # CLOSURE
+        wall = cp.minimum(R, cp.minimum(a, sim.Nx[d] - 1 - a))  # graded at a cut
 
         def run(sign):
             count, on = cp.zeros(sim.Nx_padded, cp.int32), cp.ones_like(inside)

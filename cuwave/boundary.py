@@ -92,6 +92,18 @@ def face_mask(sim: Simulation, condition: BoundaryCondition) -> np.int32:
     return np.int32(sum(1 << f for f in faces_with(sim, condition)))
 
 
+def require_off_held_walls(sim: Simulation, position: cpt.NDArray[cp.int32]) -> None:
+    """Raise if a source at `position` sits on the wall node of a `Dirichlet` face, which the step holds at zero."""
+    rows = position[-sim.ndim :]
+    for face in faces_with(sim, Dirichlet):
+        d, side = divmod(face, 2)
+        wall = sim.Nx[d] - 2 if side else 1
+        if bool(cp.any(rows[d] == wall)):
+            raise ValueError(
+                f"a source on the wall node {wall} of Dirichlet face {face}, held at zero"
+            )
+
+
 def canonical_boundary(
     boundary: BoundaryCondition | Sequence | None,
     ndim: int,

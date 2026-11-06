@@ -163,7 +163,7 @@ equations hold in common is the lattice, and their material models, `build_mater
 `compile_kernels` prepends two source blocks to every `.cu` before handing it to
 `RawModule`: the coefficient tables from [stencils](stencils.md) `preamble`, then
 `kernels/common.cuh`. The prelude carries what every equation repeats, so a `.cu` holds
-only its own operator: the `real_t` typedef with its rounded `MUL_RN` and `FMA_RN` (which nvcc never contracts, so two kernels inlining one formula round alike), the `OP_W` / `CLOSURE` and `SG_W` accessors
+only its own operator: the `real_t` typedef with its rounded `MUL_RN` and `FMA_RN` (which nvcc never contracts, so two kernels inlining one formula round alike), the `OP_W` and `SG_W` accessors and the mirrored taps of the pressure walls
 with their `__constant__ tables`, `NPAIRS` / `PAIR_ROW`, `rad_node` / `rad_half`,
 `clamped_face`, and the byte-identical `excitation_kernel`, `get_signal_kernel` and
 `set_signal_kernel`

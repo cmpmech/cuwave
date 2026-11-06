@@ -23,7 +23,9 @@ A condition is a declarative marker naming a kernel and nothing more, so a setup
 | normalization | `canonical_boundary(boundary, ndim)` | expands the shorthands (`None`, one condition, one per axis) into the `((low, high),) * ndim` form `Simulation` stores |
 | dispatch | `define_boundary(sim, kernels)` | groups the faces by condition and returns `bc_step(u)`, which runs one launch per **distinct** condition |
 
-Both walls are the discrete method of images and act on the ghost ring only, mirroring the second-interior node onto it, evenly for `Neumann` and oddly for `Dirichlet`, so the interior kernel needs no boundary branch at all. [forward CUDA](cuda_scalar.md) carries the two kernels and the thread-to-ghost mapping
+Both walls are the discrete method of images about the wall node, evenly for `Neumann` and oddly for `Dirichlet`, as deep as the stencil reaches: the kernels refill the stored ghost ring from its mirror, and the step reads the $R-1$ layers past it off theirs (`mirror_node`), so every interior node keeps the full radius $R$ and the wall costs no order. A `Dirichlet` wall node is held at zero by the step itself, so a source there is refused. [forward CUDA](cuda_scalar.md) carries the two kernels, the thread-to-ghost mapping and the mirrored taps
+
+The images are exact for a constant material at a flat wall: the wave equation zeroes every odd normal derivative at a reflecting wall and every even one at a held wall, so the mirrored field is smooth and the interior stencil keeps its order up to the wall. A stiffness that varies across the wall breaks that smoothness, but the two-point cell mean is second order there anyway, so the price is not the wall's
 
 Grouping by condition rather than by face is what keeps the common case cheap: a uniform boundary is one launch however many faces it covers, and a mixed one costs one launch per distinct condition rather than $2\,\textrm{ndim}$. The faces travel as a bitmask, so no device array has to be allocated or kept alive for the dispatch
 

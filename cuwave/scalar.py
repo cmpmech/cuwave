@@ -131,7 +131,7 @@ def split_grid_block(sim: Simulation) -> tuple[tuple[int, ...], tuple[int, ...]]
     """`grid_block` with the fast axis split: every row's near-wall columns packed, then the deep ones."""
     grid, block = grid_block(sim)
     radius = sim.space_order // 2
-    reach = 2 * radius if radius > 1 else 3  # WALL_REACH in scalar_sensitivity.cu
+    reach = radius + 2  # WALL_REACH in scalar_sensitivity.cu
     walls = -(-2 * (reach - 1) // block[0])
     deep = -(-max(sim.Nx[-1] - 2 * reach, 0) // block[0])
     return (walls + deep, *grid[1:]), block
@@ -149,6 +149,15 @@ class PressureWave(Simulation):
     derive_inertia = False  # set where m == k (rho scaling): minv derived from stiff
     accepts_domain = True
     accepts_pml = True
+
+    def __post_init__(self) -> None:
+        """Check every axis holds the mirror of a full-radius tap, on top of `Simulation.__post_init__`."""
+        super().__post_init__()
+        if min(self.Nx) < self.space_order // 2 + 3:
+            raise ValueError(
+                f"Nx {self.Nx} cannot mirror the taps of space_order "
+                f"{self.space_order}: at least {self.space_order // 2 + 3} nodes an axis"
+            )
 
     @property
     def streams(self) -> bool:
@@ -169,19 +178,17 @@ class PressureWave(Simulation):
         return (
             not (self.masked or self.streams or self.pml is not None)
             and conditions <= {Neumann, Dirichlet}
-            and min(self.Nx) >= 4  # a mirror two nodes in is interior
             and self.space_order <= 4  # a wider kernel loses more than the launch
             and sms >= FOLD_SMS
         )
 
     @property
     def compile_flags(self) -> tuple[str, ...]:
-        """The base flags, plus the streaming block where the step streams, or the folded refill."""
+        """The base flags and the Dirichlet faces the taps mirror oddly, plus the streaming block where the step streams, or the folded refill."""
         flags = super().compile_flags
+        flags += (f"-DDIRICHLET_FACES={face_mask(self, Dirichlet)}",)
         if self._refills_in_step:
-            neumann, dirichlet = face_mask(self, Neumann), face_mask(self, Dirichlet)
-            flags += ("-DFOLD_REFILL", f"-DNEUMANN_FACES={neumann}")
-            flags += (f"-DDIRICHLET_FACES={dirichlet}",)
+            flags += ("-DFOLD_REFILL", f"-DNEUMANN_FACES={face_mask(self, Neumann)}")
             # a 2D stencil is too cheap to carry the source list's loads
             flags += ("-DFOLD_SOURCES",) if self.ndim == 3 else ()
         if not self.streams:
