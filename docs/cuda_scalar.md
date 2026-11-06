@@ -54,7 +54,7 @@ compute $\nabla\cdot(k\nabla u)$ at $i$  (`idx`)
 **input args**
 `u1`: array of $u$; `stiff`: array of $k$; `idx`: index; `s`: stride along axis; `uc`: `u1[idx]`; `sc`: `sc[idx]`; `a`: the node's index along the axis; `N`: the axis' extent, ghosts included; `odd`: the axis' Dirichlet bits, low side first
 **internal args**
-`sp, sm`: `stiff` at the two neighbours $k_{i\pm1}$; `taps`: $u$ on the $2R+1$ nodes around $i$, read through `mirrored`; `gp, gm`: cell stiffnesses $k_{i\pm\frac{1}{2}}$ as the *halved* harmonic mean of `sc` with `sp`/`sm`; `Dp, Dm`: the two cell fluxes $D_i^+, D_i^-$
+`sp, sm`: `stiff` at the two neighbours $k_{i\pm1}$; `FAST`: whether the axis is the fastest, whose nodes share no warp-uniform wall test; `taps`: $u$ on the $2R+1$ nodes around $i$, read through `mirrored`, or in place along a slow axis off its walls from $R=3$; `gp, gm`: cell stiffnesses $k_{i\pm\frac{1}{2}}$ as the *halved* harmonic mean of `sc` with `sp`/`sm`; `Dp, Dm`: the two cell fluxes $D_i^+, D_i^-$
 **how?**
 - approximation of outer gradient (flux divergence)
 $$\nabla\cdot(k\nabla u)|_i\approx \frac{1}{h} (k_{i+\frac{1}{2}}\nabla u_{i+\frac{1}{2}}-k_{i-\frac{1}{2}}\nabla u_{i-\frac{1}{2}})$$
@@ -62,6 +62,7 @@ $$\nabla\cdot(k\nabla u)|_i\approx \frac{1}{h} (k_{i+\frac{1}{2}}\nabla u_{i+\fr
 - approximation of inner gradients with higher order finite differences
 $$\nabla_{i+\frac{1}{2}}\approx \frac{1}{h}\sum_{k=1}^r w_{r,k}(u_{i+k}-u_{i-(k-1)})$$
 $$\nabla_{i-\frac{1}{2}}\approx \frac{1}{h}\sum_{k=1}^r w_{r,k}(u_{i+(k-1)}-u_{i-k})$$
+ - along the fast axis every node reads through the mirror, a no-op inside, so a warp holding a wall node runs one path rather than two; along a slow axis the wall test is uniform per warp, so a node off the walls reads in place once the radius makes the mirror's index work cost more than the branch
  - the result comes back without the per-axis factor $f_d$, which `fd_kernel` multiplies in with the axes summed in a pinned order; the taps are staged before the arithmetic, so a node rounds as it would with no wall code at all
  - $f_d$ captures the condensed factor $\frac{1}{h^2}$ of the two nested differences, the $\Delta t^2$ of the time step (and $c_0^2$ for `ScalarWave`), plus the **2** that `gp, gm` are missing (they are $k_ik_{i\pm1}/(k_i+k_{i\pm1})$, so the effective cell stiffness is the full harmonic mean $2k_ik_{i\pm1}/(k_i+k_{i\pm1})$)
 ## domain helpers

@@ -40,17 +40,25 @@ __device__ __forceinline__ real_t flux_divergence_means(
 }
 
 // spatial finite difference stencil for Laplacian, node a of N on its axis
+template <bool FAST>
 __device__ __forceinline__ real_t flux_divergence_axis(
     const real_t *__restrict__ u1, const real_t *__restrict__ stiff,
     const int idx, const int s, const real_t uc, const real_t sc, const int a,
     const int N, const int odd) {
   const real_t sp = stiff[idx + s]; // plus of sc
   const real_t sm = stiff[idx - s]; // minus of sc
-  // every tap through the mirror, a no-op inside, so no warp diverges on it
+  // the fast axis always through the mirror, a slow one near a wall from R 3
   real_t taps[2 * STENCIL_RADIUS + 1];
+  if (!FAST && STENCIL_RADIUS > 2 && a >= STENCIL_RADIUS &&
+      a <= N - 1 - STENCIL_RADIUS) {
 #pragma unroll
-  for (int j = -STENCIL_RADIUS; j <= STENCIL_RADIUS; ++j)
-    taps[j + STENCIL_RADIUS] = mirrored(u1, idx, s, a, N, odd, j);
+    for (int j = -STENCIL_RADIUS; j <= STENCIL_RADIUS; ++j)
+      taps[j + STENCIL_RADIUS] = u1[idx + j * s];
+  } else {
+#pragma unroll
+    for (int j = -STENCIL_RADIUS; j <= STENCIL_RADIUS; ++j)
+      taps[j + STENCIL_RADIUS] = mirrored(u1, idx, s, a, N, odd, j);
+  }
   const auto u = [&](const int j) { return taps[j + STENCIL_RADIUS]; };
   return flux_divergence_taps(u, uc, sc * sp / (sc + sp), sc * sm / (sc + sm),
                               1, STENCIL_RADIUS);
@@ -401,25 +409,26 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
   const real_t sc = stiff[idx]; // load once
   // the axes summed as blocked_kernel takes them, rounding pinned
 #if NDIM == 1
-  real_t laplacian = MUL_RN(f0, flux_divergence_axis(u1, stiff, idx, 1, uc, sc,
-                                                     a0, N0, DIRICHLET_FACES));
+  real_t laplacian =
+      MUL_RN(f0, flux_divergence_axis<true>(u1, stiff, idx, 1, uc, sc, a0, N0,
+                                            DIRICHLET_FACES));
 #elif NDIM == 2
-  const real_t d0 = flux_divergence_axis(u1, stiff, idx, s0, uc, sc, a0, N0,
-                                         DIRICHLET_FACES);
-  const real_t d1 = flux_divergence_axis(u1, stiff, idx, 1, uc, sc, a1, N1,
-                                         DIRICHLET_FACES >> 2);
+  const real_t d0 = flux_divergence_axis<false>(u1, stiff, idx, s0, uc, sc,
+                                                a0, N0, DIRICHLET_FACES);
+  const real_t d1 = flux_divergence_axis<true>(u1, stiff, idx, 1, uc, sc, a1,
+                                               N1, DIRICHLET_FACES >> 2);
 #if STENCIL_RADIUS == 1
   real_t laplacian = FMA_RN(f0, d0, MUL_RN(f1, d1));
 #else
   real_t laplacian = FMA_RN(f1, d1, MUL_RN(f0, d0));
 #endif
 #elif NDIM == 3
-  const real_t d0 = flux_divergence_axis(u1, stiff, idx, s0, uc, sc, a0, N0,
-                                         DIRICHLET_FACES);
-  const real_t d1 = flux_divergence_axis(u1, stiff, idx, s1, uc, sc, a1, N1,
-                                         DIRICHLET_FACES >> 2);
-  const real_t d2 = flux_divergence_axis(u1, stiff, idx, 1, uc, sc, a2, N2,
-                                         DIRICHLET_FACES >> 4);
+  const real_t d0 = flux_divergence_axis<false>(u1, stiff, idx, s0, uc, sc,
+                                                a0, N0, DIRICHLET_FACES);
+  const real_t d1 = flux_divergence_axis<false>(u1, stiff, idx, s1, uc, sc,
+                                                a1, N1, DIRICHLET_FACES >> 2);
+  const real_t d2 = flux_divergence_axis<true>(u1, stiff, idx, 1, uc, sc, a2,
+                                               N2, DIRICHLET_FACES >> 4);
   real_t laplacian = FMA_RN(f2, d2, FMA_RN(f0, d0, MUL_RN(f1, d1)));
 #endif
 #ifdef USE_DOMAIN
