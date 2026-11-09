@@ -21,6 +21,7 @@ import cupyx.scipy.ndimage as ndi
 import numpy.typing as npt
 
 KERNEL_PATH = Path(__file__).parent / "kernels" / "brush.cu"
+NUDGES = (0.0, 1e-3, 1e-2, 1e-1)  # brush reward perturbations, tried in turn on a stall
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -269,6 +270,10 @@ class _Touches(NamedTuple):
     may_void: cpt.NDArray[cp.bool_]
 
 
+class _Stalled(Exception):
+    """A brush generator pass left with no touch that strands no node."""
+
+
 class BrushGenerator(Regularization):
     """A 2D design whose solid and void both admit a disk, by Schubert et al.'s generator.
 
@@ -308,6 +313,7 @@ class BrushGenerator(Regularization):
         self.free = region[self.window]
         # breaks the ties of a uniform reward, the same way every call
         self.jitter = 1e-6 * cp.random.RandomState(0).random_sample(self.free.shape)
+        self.noise = cp.random.RandomState(1).standard_normal(self.free.shape)
 
     def _launch(self, name: str, a: cpt.NDArray, taps: cpt.NDArray) -> cpt.NDArray:
         """Kernel `name` over the contiguous 2D `a`, combining each node's `taps`."""
@@ -350,12 +356,25 @@ class BrushGenerator(Regularization):
         """`x` with the nodes of `region` set to a feasible 0/1 design."""
         part = x[self.window]
         fixed = (part > 0.5) & ~self.free, (part <= 0.5) & ~self.free
-        reward = (2.0 * part - 1.0 + self.jitter).astype(cp.float32)
-        solid = cp.zeros(part.shape, dtype=cp.bool_)
+        reward = 2.0 * part - 1.0 + self.jitter
+        # a pass can still paint itself into a corner; a nudged reward takes another path
+        for nudge in NUDGES:
+            try:
+                solid = self._generate((reward + nudge * self.noise).astype(cp.float32), fixed)
+            except _Stalled:
+                continue
+            out = x.copy()
+            out[self.window] = cp.where(self.free, self._dilate(solid), part)
+            return out
+        raise RuntimeError(f"the brush generator stalled for every reward nudge {NUDGES}")
+
+    def _generate(self, reward: cpt.NDArray, fixed: tuple) -> cpt.NDArray[cp.bool_]:
+        """Solid touches of one pass of Algorithm 1 over the window."""
+        solid = cp.zeros(reward.shape, dtype=cp.bool_)
         void = cp.zeros_like(solid)
 
         # touches first that only paint nodes the other phase cannot reach anyway
-        for _ in range(part.size):
+        for _ in range(reward.size):
             t = self._touches(solid, void, *fixed)
             if bool(cp.all(t.is_solid | t.is_void)):
                 break
@@ -374,9 +393,7 @@ class BrushGenerator(Regularization):
             solid, void = self._step(solid, void, fixed, valid_solid, valid_void, *gains)
         else:
             raise RuntimeError("the brush generator did not complete the design")
-        out = x.copy()
-        out[self.window] = cp.where(self.free, self._dilate(solid), part)
-        return out
+        return solid
 
     def _step(self, solid, void, fixed, valid_solid, valid_void, gain_solid, gain_void):
         """Place the best touch of each neighbourhood, dropping any that strands a node."""
@@ -397,7 +414,7 @@ class BrushGenerator(Regularization):
             blamed = self._spread(stranded)
             valid_solid &= ~(blamed & pick_solid)
             valid_void &= ~(blamed & pick_void)
-        raise RuntimeError("every touch left would strand a node")
+        raise _Stalled
 
     def grad(self, x: cpt.NDArray, dy: cpt.NDArray | float = 1.0) -> cpt.NDArray:
         """Straight-through estimate: `dy` passed on unchanged."""

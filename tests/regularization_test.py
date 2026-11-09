@@ -19,12 +19,14 @@ that `set` retunes a live instance the way a `continuation` schedule needs.
 `BrushGenerator` is pinned to what it promises: on smooth random rewards, with and
 without fixed silicon at the edge of its region, both phases admit the brush, which a
 morphological opening checks independently of the generator; a feasible design comes
-back unchanged; and the nodes outside its region are never touched.
+back unchanged; a pass that stalls is retried on a nudged reward; and the nodes outside
+its region are never touched.
 """
 
 import itertools
 import math
 import unittest
+from unittest import mock
 
 try:
     import cupy as cp
@@ -45,6 +47,7 @@ if HAS_CUDA:
         Tikhonov,
         TotalVariation,
         _spatial_grad,
+        _Stalled,
         _spatial_grad_adjoint,
         continuation,
         disk,
@@ -304,6 +307,23 @@ class BrushGeneratorTest(unittest.TestCase):
         # without the lookahead, the generator strands a node on this input
         region = self._region(n=360)
         design = BrushGenerator(10, region)(cp.where(region, _rewards(region.shape, 2), 0.0))
+        self.assertEqual(_violations(design, region, 10), 0)
+
+    def test_a_stalled_pass_is_retried_on_a_nudged_reward(self):
+        region = self._region()
+        generator = BrushGenerator(10, region)
+        x = cp.where(region, _rewards(region.shape, 7), 0.0)
+        passes = [_Stalled(), generator._generate]
+
+        def stall_once(reward, fixed):
+            attempt = passes.pop(0)
+            if isinstance(attempt, Exception):
+                raise attempt
+            return attempt(reward, fixed)
+
+        with mock.patch.object(generator, "_generate", side_effect=stall_once):
+            design = generator(x)
+        self.assertEqual(passes, [])
         self.assertEqual(_violations(design, region, 10), 0)
 
     def test_fixed_silicon_at_the_edge_is_kept_and_respected(self):
