@@ -40,6 +40,9 @@ Under `GRADIENT`, the arguments appended to `stress_kernel` (`g_normal`, `g_shea
 ### RELAXATION_ARGS
 Under `RELAXATION`, `memory` and `coef` appended to `stress_kernel` after the pml arguments, which a relaxation never comes with; empty otherwise
 
+### STRESS_REGISTERS, UPDATE_REGISTERS
+`__maxnreg__` caps on `stress_kernel` and `fd_kernel`: 40 registers both in 2D, 64 on the 3D `stress_kernel` under `GRADIENT`, nothing else. The wall path needs more registers than the deep one, and uncapped it would cost every block of 512 threads its third (2D) or second (3D adjoint) slot on a multiprocessor, the deep warps included; capped, the wall path spills a few bytes instead. Empty before CUDA 12.4, whose NVRTC lacks the qualifier
+
 ## device functions
 
 ### rad_half
@@ -61,23 +64,24 @@ Reads bit $2d+\textrm{side}$ of the `clamped` mask, the faces `Simulation.bounda
 **aim**
 the staggered SBP pair of [stencils](stencils.md) (`staggered_pair`) along a line: the derivative $D_+$ onto node `a` of a half-point field, $D_-$ onto the half point `a` (at $a+\tfrac12$) of a nodal one, and the divergences the update takes, $D_-$ of a nodal stress and $D_+$ of a half-point one
 **input args**
-`u` or `sg`: the field along the line; `a`, `N`: the point's index along the axis and the logical extent; `DEEP`: the template switch
+`u` or `sg`: the field along the line; `a`, `N`: the point's index along the axis and the logical extent; `deep`: whether the point lies past both closures of the axis, a compile-time constant wherever it is set
 **how?**
 - past the closure, the full staggered difference with `SG_W` at radius $R$
 $$D_+u\big|_a=\sum_{k=1}^{R}c_k\left(u^{a+k-1}-u^{a-k}\right)\qquad D_-u\big|_a=\sum_{k=1}^{R}c_k\left(u^{a+k}-u^{a+1-k}\right)$$
 - within `NODE_CLOSURE` nodes or `HALF_CLOSURE` half points of a wall, `node_rows` or `half_rows`
 - the divergences are the other derivative, since the pair sums by parts, $H_+D_++\left(H_-D_-\right)^\top=B$: the update's $-M^{-1}D_+^\top W\sigma$ is $D_-\sigma$ with the norms of $W$ and $M$ cancelling, and $-M^{-1}D_-^\top W\sigma$ is $D_+\sigma$, the stress at the half-grid wall point read as zero. So no kernel reads a norm, and the update reaches no further than the strains
-- `node_divergence` and `half_divergence` keep the interior taps in the order the deep path has always rounded them; with `DEEP` set the closure branches compile away, which is what `deep_node` buys
+- `node_divergence` and `half_divergence` keep the interior taps in the order the deep path has always rounded them; with `deep` set the closure branch compiles away, which is what `warp_deep` buys
 
-### deep_node, clamped_at
+### deep_axes, warp_deep, BY_DEEP, clamped_at
 **aim**
-the wall-free path: a node more than `CLOSURE_BAND` nodes inside every wall, the larger of the two row counts, reads no closure row and no clamped wall
+the wall-free path, axis by axis: a node more than `CLOSURE_BAND` nodes inside both walls of an axis, the larger of the two row counts, reads no closure row and no clamped wall along it
 **input args**
-`A`, `NN`: geometry; `DEEP`: the template switch
+`A`, `NN`: geometry; `DEEP`: the template mask, bit $d$ for axis $d$
 **how?**
-- with `DEEP` set, the derivatives take their interior branch alone and `clamped_at` returns false; unset, every helper checks its own axis' place against either wall
-- every helper below that reads a wall takes `DEEP` as a template argument defaulting to false, and every kernel branches on `deep_node` per thread, so only the warps that hold a node within the band of a wall run both paths
+- `deep_axes` sets bit $d$ where the node lies past both bands of axis $d$; `warp_deep` reduces it over the warp's active lanes to one of three masks, `DEEP_ALL` (every axis), `DEEP_SLOW` (every axis but the fast one) or none, so a warp runs one path and a warp at a wall of the fast axis runs closure code along that axis alone
+- every helper below that reads a wall takes `DEEP` as a template mask defaulting to none, and passes bit $d$ on as the `deep` of its derivatives along axis $d$; `clamped_at` returns false along a deep axis. `BY_DEEP(deep, f, ...)` calls `f` with the mask `warp_deep` returned
 - the deep path is the general one with the wall terms removed, rounded alike, so the two agree bitwise on a node they both reach and a kernel may take either there
+- the vote rather than a per-thread switch, since a warp whose lanes disagree would run both paths, and the general path at an interior node costs about half as much again as the deep one
 
 ### normal_strains
 **aim**
@@ -163,7 +167,15 @@ which is $\sigma_U-\tfrac12\sum_l\left(\zeta_l^{n+\frac12}+\zeta_l^{n-\frac12}\r
 the stress divergence on component `c`'s point, as `fd_kernel` takes it: `node_divergence` of its normal stress along its own axis, then `half_divergence` of each shear stress along the others, summed through `MUL_RN` and `FMA_RN` so the pair, the fused and the blocked step round alike
 
 ### wall_stresses
-`stress_point` of a ring point within a wall's band into the fused kernel's shared memory, out of line, so the registers the general path takes do not cost the ring's deep points their occupancy
+`stress_point` of a ring point whose warp holds one within a wall's band into the fused kernel's shared memory, along the deep axes `deep` (`DEEP_SLOW` or none), out of line, so the registers the general path takes do not cost the ring's deep points their occupancy
+
+### ring_stresses, deep_ring
+**aim**
+the fused kernel's first phase: the stresses of the tile and its ring, whose first node per axis is `B`, into the shared `ss`, those of `stress_kernel`'s nodes and zero off the interior
+**input args**
+`u1`, `gamma`, `cs`, `lam`, `mu`, `clamped`: as `stress_kernel`; `GS`, `GN`, `E`: strides, extents and $1/\Delta x_d$; `DEEP`: whether the whole ring lies past every band, which `deep_ring` tests per axis from the block indices alone
+**how?**
+- a deep tile forms every ring point on the deep path with no test and no call; any other votes per warp with `warp_deep` and hands the warps that hold a band point to `wall_stresses`
 
 ## gradient helpers
 
@@ -173,11 +185,11 @@ Under `GRADIENT` only. `normal_form` is the one of [cuda_elastic_sensitivity](cu
 **aim**
 subtract the stiffness densities of the adjoint against the forward field at the node and its shear points, as `gradient_kernel` does
 **input args**
-`eps`: the adjoint's `NVOIGT` strains, under `RELAXATION` already relaxed by `relax`; `v1`: the forward field they pair with; `idx`, `cs`, `A`, `S`, `NN`: geometry; `F`: $1/\Delta x_d$, the strain factors; `lam`, `mu`, `clamped`: as `stress_kernel`; `DEEP`: as `deep_node`
+`eps`: the adjoint's `NVOIGT` strains, under `RELAXATION` already relaxed by `relax`; `v1`: the forward field they pair with; `idx`, `cs`, `A`, `S`, `NN`: geometry; `F`: $1/\Delta x_d$, the strain factors; `lam`, `mu`, `clamped`: as `stress_kernel`; `DEEP`: as `warp_deep`
 **output args**
 `g_normal`, `g_shear`: the normal and shear accumulators, decremented
 **how?**
-- the strains of `v1` on the path `deep_node` picks, which rounds as the general one, so the densities are bit for bit those of `gradient_kernel`
+- the strains of `v1` on the path `warp_deep` picks, which rounds as the general one, so the densities are bit for bit those of `gradient_kernel`
 $$g_n\mathrel{-}=2\mu\,\boldsymbol{\varepsilon}\left(\lambda\right):\boldsymbol{\varepsilon}\left(u\right)+\lambda_\textrm{eff}\,\textrm{tr}\,\boldsymbol{\varepsilon}\left(\lambda\right)\textrm{tr}\,\boldsymbol{\varepsilon}\left(u\right)\qquad g_{kl}\mathrel{-}=\mu\,2\varepsilon_{kl}\left(\lambda\right)\,2\varepsilon_{kl}\left(u\right)$$
 - under a relaxation the density of the relaxed recursion, whose stiffness acts on the relaxed strain
 
@@ -234,7 +246,7 @@ read off the block `phase` names and written into the other, so no thread overwr
 
 ### stress_kernel
 **parallelization**
-one thread per grid point, writing every stress family whose point it carries
+one thread per grid point, writing every stress family whose point it carries, under `STRESS_REGISTERS`
 **input args**
 `u1`: the field at $t-1$; `gamma`: the nodal design, the normal stress point's own value and `shear_gamma`'s mean on a shear point; `lam`, `mu`: $\lambda$ (plane-reduced on the host) and $\mu$; `clamped`: the face bitmask; `cs`: component stride; `f0..f2`: $1/\Delta x_d$; `N0..N2`, `s0, s1`: geometry; under `GRADIENT`, `v1`: the forward field `u1` pairs with; under `USE_PML`, per axis `m`, `p`, `lo`, `hi`: its memory, profile and slab rows, 0 unlined, then `phase`: 0 forwards, 1 or 2 the adjoint reading its strain memory off row 0 or `2 * NDIM`; under `RELAXATION`, `memory`, `coef`: as `relax`, the memory settled in place
 **output args**
@@ -250,7 +262,7 @@ $$\sigma_{kl}=\gamma_s\,\mu\left(2\,\varepsilon_{kl}\right)$$
 
 ### fd_kernel
 **parallelization**
-one thread per grid point, updating every component whose unknown it carries
+one thread per grid point, updating every component whose unknown it carries, under `UPDATE_REGISTERS`
 **input args**
 `u0`, `u1`: the fields at $t-2$ and $t-1$; `sigma`: the stresses `stress_kernel` just wrote; `gamma`, `rho`: the nodal design and $\rho_0$, from which `point_minv` forms the inverse inertia per component; `damping`: nodal $d$, with `USE_DAMPING` only; `dt`: $\Delta t$, with `USE_DAMPING` only; `clamped`, `cs`: as above; `f0..f2`: $\Delta t^2/\Delta x_d$; under `GRADIENT`, `v1`: the forward field `u1` pairs with, and `mf`: $1/\Delta t^2$; the pml arguments of `stress_kernel`, under `USE_PML`
 **output args**
@@ -275,7 +287,7 @@ one block per tile of `TILE0` $\times$ `TILE1` ($\times$ `TILE2`) nodes, a threa
 `ss`: the `NVOIGT` stresses of the tile and its ring in shared memory, zero where `stress_kernel` writes nothing (off the interior); `local`, `T`: the node's place and strides in it, which `nodal_force` reads through as it would the `sigma` scratch
 **how?**
 - the ring holds every stress the divergence of a tile node reaches, so a block needs nothing another block forms; the ring's stresses are formed twice, once by each block that reads them. A closure row reaches further than the ring, towards its wall, which the flush last tile keeps inside the block that holds the wall, as long as a tile is wider than the rows reach (`closure_reach`, which `define_step` checks)
-- ring points within a band take `wall_stresses`, and the launch bounds the registers to three blocks a multiprocessor to radius 2 and two past it, which the deep path fits without spilling
+- a tile whose ring keeps clear of every band (`deep_ring`) forms its ring and steps its nodes on the deep path alone; elsewhere the ring's band warps take `wall_stresses` and the update votes with `warp_deep`, and the launch bounds the registers to three blocks a multiprocessor to radius 2 and two past it, which the deep path fits without spilling
 - the stresses never travel through memory: a step reads $u^{t-1}$, $u^{t-2}$ and the design and writes $u^t$, against the pair's extra write and read of every stress, which halves the traffic where DRAM bounds the step. While the scratch fits in L2 the pair stays as fast or faster, and where the ring more than doubles the stresses a block forms (3D above order 2) their recomputation costs more than the traffic saved, so `define_step` keeps the pair there
 
 ### blocked_kernel

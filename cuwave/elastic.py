@@ -334,14 +334,14 @@ class ElasticWave(Simulation):
 
     def _point_norms(self, lin_index: cpt.NDArray[cp.int32]) -> cpt.NDArray:
         """The norm W on the component points `lin_index`: the half points' along its own axis."""
-        component, node = lin_index // self.comp_stride, lin_index % self.comp_stride
+        component, node = np.divmod(lin_index.get(), self.comp_stride)
         nodal = self._norm_lines(())
-        weight = cp.ones(lin_index.shape, dtype=self.dtype)
-        for d, line in enumerate(self._norm_lines(tuple(range(self.ndim)))):
+        half = self._norm_lines(tuple(range(self.ndim)))
+        weight = np.ones(len(node))
+        for d in range(self.ndim):
             a = node // self.strides[d] % self.Nx_padded[d]
-            norms = cp.asarray(np.stack([nodal[d], line]), dtype=self.dtype)
-            weight = weight * norms[(component == d).astype(cp.int32), a]
-        return weight
+            weight *= np.where(component == d, half[d][a], nodal[d][a])
+        return cp.asarray(weight, dtype=self.dtype)
 
     def define_step(self, kernels: cp.RawModule, mat: dict) -> Callable:
         """Closure launching the stress kernel and then the update over (u0, u1, u2)."""

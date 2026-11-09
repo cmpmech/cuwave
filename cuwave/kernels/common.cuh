@@ -158,14 +158,34 @@ __device__ const real_t HALF_ROWS[HALF_CLOSURE][HALF_SPAN] = HALF_ROWS_C;
 #define CLOSURE_BAND                                                           \
   (NODE_CLOSURE > HALF_CLOSURE ? NODE_CLOSURE : HALF_CLOSURE)
 
-// a node past every wall's closure band: the interior rows on every axis
-__device__ __forceinline__ bool deep_node(const int *A, const int *NN) {
-  bool deep = true;
+// the axes along which a node lies past both walls' closure bands, a bit each
+__device__ __forceinline__ int deep_axes(const int *A, const int *NN) {
+  int deep = 0;
 #pragma unroll
   for (int d = 0; d < NDIM; ++d)
-    deep &= A[d] > CLOSURE_BAND && A[d] < NN[d] - 2 - CLOSURE_BAND;
+    deep |= (A[d] > CLOSURE_BAND && A[d] < NN[d] - 2 - CLOSURE_BAND) << d;
   return deep;
 }
+
+// every axis deep, or every one but the fast axis
+#define DEEP_ALL ((1 << NDIM) - 1)
+#define DEEP_SLOW (DEEP_ALL >> 1)
+
+// the deep axes the warp's active lanes share, as DEEP_ALL, DEEP_SLOW or none,
+// so the warp runs one path
+__device__ __forceinline__ int warp_deep(const int *A, const int *NN) {
+  const unsigned lanes = __activemask();
+  const int deep = deep_axes(A, NN);
+  if (__all_sync(lanes, deep == DEEP_ALL))
+    return DEEP_ALL;
+  return __all_sync(lanes, (deep & DEEP_SLOW) == DEEP_SLOW) ? DEEP_SLOW : 0;
+}
+
+// f with the template mask of the deep axes a warp_deep result names
+#define BY_DEEP(deep, f, ...)                                                  \
+  ((deep) == DEEP_ALL    ? f<DEEP_ALL>(__VA_ARGS__)                            \
+   : (deep) == DEEP_SLOW ? f<DEEP_SLOW>(__VA_ARGS__)                           \
+                         : f(__VA_ARGS__))
 
 // a line through a field: u(j) the value j points along the axis from idx
 struct Line {
@@ -208,12 +228,14 @@ __device__ __forceinline__ real_t half_rows(const L &u, const int lo,
 }
 
 // d/dx at node a of a half-point field along a line; past a wall it reads the
-// half-grid wall point as zero
-template <bool DEEP = false, class L>
+// half-grid wall point as zero; deep (a constant where it is set) skips the
+// closure rows
+template <class L>
 __device__ __forceinline__ real_t node_derivative(const L &u, const int a,
-                                                  const int N) {
+                                                  const int N,
+                                                  const bool deep = false) {
   const int lo = a - 1, hi = N - 2 - a;
-  if (!DEEP && (lo < NODE_CLOSURE || hi < NODE_CLOSURE))
+  if (!deep && (lo < NODE_CLOSURE || hi < NODE_CLOSURE))
     return node_rows(u, lo, hi);
   real_t acc = (real_t)0;
 #pragma unroll
@@ -223,11 +245,12 @@ __device__ __forceinline__ real_t node_derivative(const L &u, const int a,
 }
 
 // d/dx at the half point a (a + 1/2) of a nodal field along a line
-template <bool DEEP = false, class L>
+template <class L>
 __device__ __forceinline__ real_t half_derivative(const L &u, const int a,
-                                                  const int N) {
+                                                  const int N,
+                                                  const bool deep = false) {
   const int lo = a - 1, hi = N - 3 - a;
-  if (!DEEP && (lo < HALF_CLOSURE || hi < HALF_CLOSURE))
+  if (!deep && (lo < HALF_CLOSURE || hi < HALF_CLOSURE))
     return half_rows(u, lo, hi);
   real_t acc = (real_t)0;
 #pragma unroll
@@ -239,11 +262,12 @@ __device__ __forceinline__ real_t half_derivative(const L &u, const int a,
 // the divergence of a nodal stress at the half point a: half_derivative's rows,
 // which are minus node_derivative's transpose in the norms, so the norms cancel
 // against the inertia's; inside, the taps in the order the deep path rounds
-template <bool DEEP = false, class L>
+template <class L>
 __device__ __forceinline__ real_t node_divergence(const L &sg, const int a,
-                                                  const int N) {
+                                                  const int N,
+                                                  const bool deep = false) {
   const int lo = a - 1, hi = N - 3 - a;
-  if (!DEEP && (lo < HALF_CLOSURE || hi < HALF_CLOSURE))
+  if (!deep && (lo < HALF_CLOSURE || hi < HALF_CLOSURE))
     return half_rows(sg, lo, hi);
   real_t acc = (real_t)0;
 #pragma unroll
@@ -256,11 +280,12 @@ __device__ __forceinline__ real_t node_divergence(const L &sg, const int a,
 
 // the divergence of a half-point stress at node a: node_derivative's rows, the
 // stress at the wall point never read
-template <bool DEEP = false, class L>
+template <class L>
 __device__ __forceinline__ real_t half_divergence(const L &sg, const int a,
-                                                  const int N) {
+                                                  const int N,
+                                                  const bool deep = false) {
   const int lo = a - 1, hi = N - 2 - a;
-  if (!DEEP && (lo < NODE_CLOSURE || hi < NODE_CLOSURE))
+  if (!deep && (lo < NODE_CLOSURE || hi < NODE_CLOSURE))
     return node_rows(sg, lo, hi);
   real_t acc = (real_t)0;
 #pragma unroll

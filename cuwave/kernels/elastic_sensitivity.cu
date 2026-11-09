@@ -42,7 +42,7 @@
 
 // the node's normal strains, one per axis: a traction wall's is a zero row
 // (returned as a set bit), a clamped one's reads its held u = 0 as nothing
-template <bool DEEP = false>
+template <int DEEP = 0>
 __device__ __forceinline__ int
 normal_strains(const real_t *__restrict__ u, const int idx, const int cs,
                const int *A, const int *S, const int *NN, const real_t *F,
@@ -50,13 +50,14 @@ normal_strains(const real_t *__restrict__ u, const int idx, const int cs,
   int zeroed = 0;
 #pragma unroll
   for (int d = 0; d < NDIM; ++d) {
-    if (!DEEP && ((A[d] == 1 && !clamped_face(clamped, d, 0)) ||
+    const bool deep = (DEEP >> d) & 1;
+    if (!deep && ((A[d] == 1 && !clamped_face(clamped, d, 0)) ||
                   (A[d] == NN[d] - 2 && !clamped_face(clamped, d, 1)))) {
       eps[d] = (real_t)0;
       zeroed |= 1 << d;
     } else {
-      eps[d] = F[d] * node_derivative<DEEP>(Line{u + d * cs, idx, S[d]}, A[d],
-                                            NN[d]);
+      eps[d] = F[d] * node_derivative(Line{u + d * cs, idx, S[d]}, A[d], NN[d],
+                                      deep);
     }
   }
   return zeroed;
@@ -78,15 +79,15 @@ __device__ __forceinline__ real_t condensed_lame(const real_t lam,
 #if NDIM >= 2
 // the engineering shear strain of the (k, l) pair at its own staggered point,
 // rounded as the step's
-template <bool DEEP = false>
+template <int DEEP = 0>
 __device__ __forceinline__ real_t
 shear_strain(const real_t *__restrict__ u, const int idx, const int cs,
              const int k, const int l, const int *A, const int *S,
              const int *NN, const real_t *F) {
-  const real_t dk =
-      half_derivative<DEEP>(Line{u + l * cs, idx, S[k]}, A[k], NN[k]);
-  const real_t dl =
-      half_derivative<DEEP>(Line{u + k * cs, idx, S[l]}, A[l], NN[l]);
+  const real_t dk = half_derivative(Line{u + l * cs, idx, S[k]}, A[k], NN[k],
+                                    (DEEP >> k) & 1);
+  const real_t dl = half_derivative(Line{u + k * cs, idx, S[l]}, A[l], NN[l],
+                                    (DEEP >> l) & 1);
   return FMA_RN(F[k], dk, MUL_RN(F[l], dl));
 }
 #endif
@@ -138,15 +139,11 @@ __global__ void gradient_kernel(real_t *__restrict__ g_mass,
 
   // dJ/dgamma on the node: forward against adjoint under the normal coupling,
   // off the walls on the deep path, which rounds as the general one there
-  const bool deep = deep_node(A, NN);
+  const int deep = warp_deep(A, NN);
   real_t eu[NDIM], el[NDIM];
   const int zeroed =
-      deep ? normal_strains<true>(u1, idx, cs, A, S, NN, F, clamped, eu)
-           : normal_strains(u1, idx, cs, A, S, NN, F, clamped, eu);
-  if (deep)
-    normal_strains<true>(l1, idx, cs, A, S, NN, F, clamped, el);
-  else
-    normal_strains(l1, idx, cs, A, S, NN, F, clamped, el);
+      BY_DEEP(deep, normal_strains, u1, idx, cs, A, S, NN, F, clamped, eu);
+  BY_DEEP(deep, normal_strains, l1, idx, cs, A, S, NN, F, clamped, el);
   g_normal[idx] -= normal_form(el, eu, lam, mu, zeroed);
 
 #if NDIM >= 2
@@ -158,11 +155,8 @@ __global__ void gradient_kernel(real_t *__restrict__ g_mass,
         continue;
       const int v = PAIR_ROW(k, l);
       g_shear[(v - NDIM) * cs + idx] -=
-          mu *
-          (deep ? shear_strain<true>(l1, idx, cs, k, l, A, S, NN, F)
-                : shear_strain(l1, idx, cs, k, l, A, S, NN, F)) *
-          (deep ? shear_strain<true>(u1, idx, cs, k, l, A, S, NN, F)
-                : shear_strain(u1, idx, cs, k, l, A, S, NN, F));
+          mu * BY_DEEP(deep, shear_strain, l1, idx, cs, k, l, A, S, NN, F) *
+          BY_DEEP(deep, shear_strain, u1, idx, cs, k, l, A, S, NN, F);
     }
 #endif
 }
@@ -192,11 +186,10 @@ __global__ void frechet_kernel(real_t *__restrict__ acc_mass,
     acc_mass[n] += ft * dudt * dudt;
   }
 
-  const bool deep = deep_node(A, NN);
+  const int deep = warp_deep(A, NN);
   real_t eu[NDIM];
   const int zeroed =
-      deep ? normal_strains<true>(u1, idx, cs, A, S, NN, F, clamped, eu)
-           : normal_strains(u1, idx, cs, A, S, NN, F, clamped, eu);
+      BY_DEEP(deep, normal_strains, u1, idx, cs, A, S, NN, F, clamped, eu);
   acc_normal[idx] += fs * normal_form(eu, eu, lam, mu, zeroed);
 
 #if NDIM >= 2
@@ -208,8 +201,7 @@ __global__ void frechet_kernel(real_t *__restrict__ acc_mass,
         continue;
       const int v = PAIR_ROW(k, l);
       const real_t e =
-          deep ? shear_strain<true>(u1, idx, cs, k, l, A, S, NN, F)
-               : shear_strain(u1, idx, cs, k, l, A, S, NN, F);
+          BY_DEEP(deep, shear_strain, u1, idx, cs, k, l, A, S, NN, F);
       acc_shear[(v - NDIM) * cs + idx] += fs * mu * e * e;
     }
 #endif

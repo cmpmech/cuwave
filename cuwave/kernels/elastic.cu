@@ -118,15 +118,15 @@
 #define RELAXATION_ARGS
 #endif
 
-template <bool DEEP>
+template <int DEEP>
 __device__ __forceinline__ bool clamped_at(const int clamped, const int d,
                                            const int side) {
-  return !DEEP && clamped_face(clamped, d, side);
+  return !((DEEP >> d) & 1) && clamped_face(clamped, d, side);
 }
 
 // the node's normal strains, one per axis: a traction wall's is a zero row
 // (returned as a set bit), a clamped one's reads its held u = 0 as nothing
-template <bool DEEP = false>
+template <int DEEP = 0>
 __device__ __forceinline__ int
 normal_strains(const real_t *__restrict__ u, const int idx, const int cs,
                const int *A, const int *S, const int *NN, const real_t *F,
@@ -134,13 +134,14 @@ normal_strains(const real_t *__restrict__ u, const int idx, const int cs,
   int zeroed = 0;
 #pragma unroll
   for (int d = 0; d < NDIM; ++d) {
-    if (!DEEP && ((A[d] == 1 && !clamped_face(clamped, d, 0)) ||
+    const bool deep = (DEEP >> d) & 1;
+    if (!deep && ((A[d] == 1 && !clamped_face(clamped, d, 0)) ||
                   (A[d] == NN[d] - 2 && !clamped_face(clamped, d, 1)))) {
       eps[d] = (real_t)0;
       zeroed |= 1 << d;
     } else {
-      eps[d] = F[d] * node_derivative<DEEP>(Line{u + d * cs, idx, S[d]}, A[d],
-                                            NN[d]);
+      eps[d] = F[d] * node_derivative(Line{u + d * cs, idx, S[d]}, A[d], NN[d],
+                                      deep);
     }
   }
   return zeroed;
@@ -162,18 +163,26 @@ __device__ __forceinline__ real_t condensed_lame(const real_t lam,
 #if NDIM >= 2
 // the engineering shear strain of the (k, l) pair at its own staggered point,
 // d u_k / d x_l + d u_l / d x_k, rounded alike in every kernel and path
-template <bool DEEP = false>
+template <int DEEP = 0>
 __device__ __forceinline__ real_t
 shear_strain(const real_t *__restrict__ u, const int idx, const int cs,
              const int k, const int l, const int *A, const int *S,
              const int *NN, const real_t *F) {
-  const real_t dk =
-      half_derivative<DEEP>(Line{u + l * cs, idx, S[k]}, A[k], NN[k]);
-  const real_t dl =
-      half_derivative<DEEP>(Line{u + k * cs, idx, S[l]}, A[l], NN[l]);
+  const real_t dk = half_derivative(Line{u + l * cs, idx, S[k]}, A[k], NN[k],
+                                    (DEEP >> k) & 1);
+  const real_t dl = half_derivative(Line{u + k * cs, idx, S[l]}, A[l], NN[l],
+                                    (DEEP >> l) & 1);
   return FMA_RN(F[k], dk, MUL_RN(F[l], dl));
 }
 #endif
+
+// whether the (k, l) shear point exists: off the staggered ghosts of k and l
+template <int DEEP = 0>
+__device__ __forceinline__ bool shear_point(const int k, const int l,
+                                            const int *A, const int *NN) {
+  return (((DEEP >> k) & 1) || A[k] <= NN[k] - 3) &&
+         (((DEEP >> l) & 1) || A[l] <= NN[l] - 3);
+}
 
 // ---------------------------------- material helpers
 #ifdef USE_FLOAT
@@ -196,7 +205,7 @@ __device__ __forceinline__ real_t shear_gamma(const real_t *__restrict__ gamma,
 #endif
 
 // inverse inertia of component c's point, zero where a clamped wall holds it
-template <bool DEEP = false>
+template <int DEEP = 0>
 __device__ __forceinline__ real_t
 point_minv(const real_t *__restrict__ gamma, const int idx, const int c,
            const int *A, const int *S, const int *NN, const real_t rho,
@@ -213,7 +222,7 @@ point_minv(const real_t *__restrict__ gamma, const int idx, const int c,
 // ----------------------------------- step helpers
 // every strain of the node at idx, zero off its point, and the axes a traction
 // wall zeroes
-template <bool DEEP = false>
+template <int DEEP = 0>
 __device__ __forceinline__ int
 strain_point(const real_t *__restrict__ u, const int idx, const int cs,
              const int *A, const int *S, const int *NN, const real_t *F,
@@ -225,16 +234,16 @@ strain_point(const real_t *__restrict__ u, const int idx, const int cs,
   for (int k = 0; k < NDIM - 1; ++k)
 #pragma unroll
     for (int l = k + 1; l < NDIM; ++l)
-      eps[PAIR_ROW(k, l)] =
-          (!DEEP && (A[k] > NN[k] - 3 || A[l] > NN[l] - 3))
-              ? (real_t)0
-              : shear_strain<DEEP>(u, idx, cs, k, l, A, S, NN, F);
+      eps[PAIR_ROW(k, l)] = shear_point<DEEP>(k, l, A, NN)
+                                ? shear_strain<DEEP>(u, idx, cs, k, l, A, S,
+                                                     NN, F)
+                                : (real_t)0;
 #endif
   return zeroed;
 }
 
 // the stresses of the strains eps at the node at idx, zero off their points
-template <bool DEEP = false>
+template <int DEEP = 0>
 __device__ __forceinline__ void
 stress_of(const real_t *eps, const int zeroed,
           const real_t *__restrict__ gamma, const int idx, const int *A,
@@ -257,16 +266,15 @@ stress_of(const real_t *eps, const int zeroed,
 #pragma unroll
     for (int l = k + 1; l < NDIM; ++l) {
       const int v = PAIR_ROW(k, l);
-      sig[v] = (!DEEP && (A[k] > NN[k] - 3 || A[l] > NN[l] - 3))
-                   ? (real_t)0
-                   : shear_gamma(gamma, idx, k, l, S) * mu *
-                         eps[v];
+      sig[v] = shear_point<DEEP>(k, l, A, NN)
+                   ? shear_gamma(gamma, idx, k, l, S) * mu * eps[v]
+                   : (real_t)0;
     }
 #endif
 }
 
 // every stress of the node at idx, zero off its point
-template <bool DEEP = false>
+template <int DEEP = 0>
 __device__ __forceinline__ void
 stress_point(const real_t *__restrict__ u, const real_t *__restrict__ gamma,
              const int idx, const int cs, const int *A, const int *S,
@@ -279,7 +287,7 @@ stress_point(const real_t *__restrict__ u, const real_t *__restrict__ gamma,
 }
 
 // the stress divergence on component c's point, off the accessor (sigma, cs, S)
-template <bool DEEP = false>
+template <int DEEP = 0>
 __device__ __forceinline__ real_t
 nodal_force(const real_t *__restrict__ sigma, const int idx, const int cs,
             const int *S, const int c, const int *A, const int *NN,
@@ -287,8 +295,8 @@ nodal_force(const real_t *__restrict__ sigma, const int idx, const int cs,
   // own normal stress along axis c, then the shear stresses along the others,
   // rounded alike in every kernel
   real_t force =
-      MUL_RN(F[c], node_divergence<DEEP>(Line{sigma + c * cs, idx, S[c]}, A[c],
-                                         NN[c]));
+      MUL_RN(F[c], node_divergence(Line{sigma + c * cs, idx, S[c]}, A[c], NN[c],
+                                   (DEEP >> c) & 1));
 #if NDIM >= 2
 #pragma unroll
   for (int l = 0; l < NDIM; ++l) {
@@ -296,8 +304,8 @@ nodal_force(const real_t *__restrict__ sigma, const int idx, const int cs,
       continue;
     const int v = PAIR_ROW(min(c, l), max(c, l));
     force = FMA_RN(F[l],
-                   half_divergence<DEEP>(Line{sigma + v * cs, idx, S[l]}, A[l],
-                                         NN[l]),
+                   half_divergence(Line{sigma + v * cs, idx, S[l]}, A[l], NN[l],
+                                   (DEEP >> l) & 1),
                    force);
   }
 #endif
@@ -346,7 +354,7 @@ __device__ __forceinline__ real_t normal_form(const real_t *ea,
 
 // dJ/dgamma on the node and its shear points: the adjoint's strains eps, under
 // a relaxation relaxed, against the forward field v1's
-template <bool DEEP = false>
+template <int DEEP = 0>
 __device__ __forceinline__ void
 stiffness_density(const real_t *eps, const real_t *__restrict__ v1,
                   real_t *__restrict__ g_normal,
@@ -366,7 +374,7 @@ stiffness_density(const real_t *eps, const real_t *__restrict__ v1,
   for (int k = 0; k < NDIM - 1; ++k)
 #pragma unroll
     for (int l = k + 1; l < NDIM; ++l) {
-      if (A[k] > NN[k] - 3 || A[l] > NN[l] - 3)
+      if (!shear_point<DEEP>(k, l, A, NN))
         continue;
       const int v = PAIR_ROW(k, l);
       g_shear[(v - NDIM) * cs + idx] -=
@@ -590,11 +598,161 @@ settle_memory(const real_t *__restrict__ sigma, const int idx, const int cs,
   }
 }
 
+// --------------------------------- fused step helpers
+#if NDIM >= 2 && defined(TILE0) && !defined(USE_PML) && !defined(STEPS)
+// a thread a tile node, the stresses on the tile and a ring a radius wide
+#define WIDE (TILE1 + 2 * STENCIL_RADIUS)
+#if NDIM == 2
+#define RING ((TILE0 + 2 * STENCIL_RADIUS) * WIDE)
+#define THREADS (TILE0 * TILE1)
+#define TILE_INTERIOR_OR_RETURN                                                \
+  const int a0 = o0 + threadIdx.y, a1 = o1 + threadIdx.x;                      \
+  if (!(a0 > 0 && a0 < N0 - 1 && a1 > 0 && a1 < N1 - 1 &&                      \
+        a0 < tile_end(blockIdx.y, TILE0, N0) &&                                \
+        a1 < tile_end(blockIdx.x, TILE1, N1)))                                 \
+    return;                                                                    \
+  const int idx = a0 * s0 + a1
+#else
+#define DEEP_ (TILE2 + 2 * STENCIL_RADIUS)
+#define RING ((TILE0 + 2 * STENCIL_RADIUS) * WIDE * DEEP_)
+#define THREADS (TILE0 * TILE1 * TILE2)
+#define TILE_INTERIOR_OR_RETURN                                                \
+  const int a0 = o0 + threadIdx.z, a1 = o1 + threadIdx.y;                      \
+  const int a2 = o2 + threadIdx.x;                                             \
+  if (!(a0 > 0 && a0 < N0 - 1 && a1 > 0 && a1 < N1 - 1 && a2 > 0 &&            \
+        a2 < N2 - 1 && a0 < tile_end(blockIdx.z, TILE0, N0) &&                 \
+        a1 < tile_end(blockIdx.y, TILE1, N1) &&                                \
+        a2 < tile_end(blockIdx.x, TILE2, N2)))                                 \
+    return;                                                                    \
+  const int idx = a0 * s0 + a1 * s1 + a2
+#endif
+
+// a ring point of a band warp: its stresses, deep along the axes deep, into out
+// a shared plane apart; out of line, so the deep ring keeps few registers
+#if NDIM == 2
+__device__ __noinline__ void
+wall_stresses(const real_t *__restrict__ u1, const real_t *__restrict__ gamma,
+              const int cs, const real_t lam, const real_t mu,
+              const int clamped, const int deep, const int g0, const int g1,
+              const int N0, const int N1, const int s0, const real_t e0,
+              const real_t e1, real_t *out) {
+  const int G[2] = {g0, g1}, GS[2] = {s0, 1}, GN[2] = {N0, N1};
+  const real_t E[2] = {e0, e1};
+  const int at = g0 * s0 + g1;
+#else
+__device__ __noinline__ void
+wall_stresses(const real_t *__restrict__ u1, const real_t *__restrict__ gamma,
+              const int cs, const real_t lam, const real_t mu,
+              const int clamped, const int deep, const int g0, const int g1,
+              const int g2, const int N0, const int N1, const int N2,
+              const int s0, const int s1, const real_t e0, const real_t e1,
+              const real_t e2, real_t *out) {
+  const int G[3] = {g0, g1, g2}, GS[3] = {s0, s1, 1}, GN[3] = {N0, N1, N2};
+  const real_t E[3] = {e0, e1, e2};
+  const int at = g0 * s0 + g1 * s1 + g2;
+#endif
+  real_t sig[NVOIGT];
+  if (deep == DEEP_SLOW)
+    stress_point<DEEP_SLOW>(u1, gamma, at, cs, G, GS, GN, E, lam, mu, clamped,
+                            sig);
+  else
+    stress_point(u1, gamma, at, cs, G, GS, GN, E, lam, mu, clamped, sig);
+#pragma unroll
+  for (int v = 0; v < NVOIGT; ++v)
+    out[v * RING] = sig[v];
+}
+
+// the stresses of the tile's ring, whose first node is B, into ss: those of
+// stress_kernel's nodes, zero elsewhere; DEEP where all of them are deep
+template <bool DEEP>
+__device__ __forceinline__ void
+ring_stresses(real_t *ss, const real_t *__restrict__ u1,
+              const real_t *__restrict__ gamma, const int cs, const real_t lam,
+              const real_t mu, const int clamped, const int *B, const int *GS,
+              const int *GN, const real_t *E) {
+#if NDIM == 2
+  for (int t = threadIdx.y * TILE1 + threadIdx.x; t < RING; t += THREADS) {
+    const int G[2] = {B[0] + t / WIDE, B[1] + t % WIDE};
+#else
+  for (int t = (threadIdx.z * TILE1 + threadIdx.y) * TILE2 + threadIdx.x;
+       t < RING; t += THREADS) {
+    const int G[3] = {B[0] + t / (WIDE * DEEP_), B[1] + t / DEEP_ % WIDE,
+                      B[2] + t % DEEP_};
+#endif
+    bool inner = true;
+    int at = 0;
+#pragma unroll
+    for (int d = 0; d < NDIM; ++d) {
+      inner &= G[d] > 0 && G[d] < GN[d] - 1;
+      at += G[d] * GS[d];
+    }
+    const int deep = DEEP || !inner ? DEEP_ALL : warp_deep(G, GN);
+    if (deep != DEEP_ALL) {
+#if NDIM == 2
+      wall_stresses(u1, gamma, cs, lam, mu, clamped, deep, G[0], G[1], GN[0],
+                    GN[1], GS[0], E[0], E[1], ss + t);
+#else
+      wall_stresses(u1, gamma, cs, lam, mu, clamped, deep, G[0], G[1], G[2],
+                    GN[0], GN[1], GN[2], GS[0], GS[1], E[0], E[1], E[2],
+                    ss + t);
+#endif
+      continue;
+    }
+    real_t sig[NVOIGT];
+    if (DEEP || inner) {
+      stress_point<DEEP_ALL>(u1, gamma, at, cs, G, GS, GN, E, lam, mu, clamped,
+                             sig);
+    } else {
+#pragma unroll
+      for (int v = 0; v < NVOIGT; ++v)
+        sig[v] = (real_t)0;
+    }
+#pragma unroll
+    for (int v = 0; v < NVOIGT; ++v)
+      ss[v * RING + t] = sig[v];
+  }
+}
+
+// whether a ring spanning [b, b + T + 2 R) of an axis of N nodes is deep
+__device__ __forceinline__ bool deep_ring(const int b, const int T,
+                                          const int N) {
+  return b > CLOSURE_BAND &&
+         b + T + 2 * STENCIL_RADIUS - 1 < N - 2 - CLOSURE_BAND;
+}
+
+// the first node of tile b of T along an axis of N nodes, -1 past the last: the
+// last ends on the axis' end, so no wall's closure band straddles two tiles
+__device__ __forceinline__ int tile_origin(const int b, const int T,
+                                           const int N) {
+  return b * T < N ? min(b * T, max(N - T, 0)) : -1;
+}
+
+// the end of the nodes tile b steps, the next tile's origin
+__device__ __forceinline__ int tile_end(const int b, const int T, const int N) {
+  const int next = tile_origin(b + 1, T, N);
+  return next < 0 ? N : next;
+}
+#endif
+
+// register caps keeping the deep path's occupancy (__maxnreg__ from CUDA 12.4)
+#define REGISTER_CAPS                                                          \
+  (__CUDACC_VER_MAJOR__ * 100 + __CUDACC_VER_MINOR__ >= 1204)
+#if REGISTER_CAPS && NDIM == 2
+#define STRESS_REGISTERS __maxnreg__(40)
+#define UPDATE_REGISTERS __maxnreg__(40)
+#elif REGISTER_CAPS && NDIM == 3 && defined(GRADIENT)
+#define STRESS_REGISTERS __maxnreg__(64)
+#define UPDATE_REGISTERS
+#else
+#define STRESS_REGISTERS
+#define UPDATE_REGISTERS
+#endif
+
 // -------------------------------------- kernels
 extern "C" {
 
 // ------------------------------------------------------------------------------------
-__global__ void
+__global__ void STRESS_REGISTERS
 stress_kernel(const real_t *__restrict__ u1, real_t *__restrict__ sigma,
               const real_t *__restrict__ gamma, const real_t lam,
               const real_t mu, const int clamped, const int cs,
@@ -603,32 +761,23 @@ stress_kernel(const real_t *__restrict__ u1, real_t *__restrict__ sigma,
   AXIS_GEOM;
   AXIS_FACTORS;
 
-  const bool deep = deep_node(A, NN);
+  const int deep = warp_deep(A, NN);
   real_t sig[NVOIGT];
 #ifdef GRADIENT
   // the adjoint's strains once, for its density and its stresses, a relaxation
   // holding its memory in strains so the density pairs the relaxed ones
   real_t eps[NVOIGT];
   const int zeroed =
-      deep ? strain_point<true>(u1, idx, cs, A, S, NN, F, clamped, eps)
-           : strain_point(u1, idx, cs, A, S, NN, F, clamped, eps);
+      BY_DEEP(deep, strain_point, u1, idx, cs, A, S, NN, F, clamped, eps);
 #ifdef RELAXATION
   relax(memory, coef, idx, cs, eps);
 #endif
-  if (deep) {
-    stiffness_density<true>(eps, v1, g_normal SHEAR_ROWS, idx, cs, A, S, NN, F,
-                            lam, mu, clamped);
-    stress_of<true>(eps, zeroed, gamma, idx, A, S, NN, lam, mu, sig);
-  } else {
-    stiffness_density(eps, v1, g_normal SHEAR_ROWS, idx, cs, A, S, NN, F, lam,
-                      mu, clamped);
-    stress_of(eps, zeroed, gamma, idx, A, S, NN, lam, mu, sig);
-  }
+  BY_DEEP(deep, stiffness_density, eps, v1, g_normal SHEAR_ROWS, idx, cs, A, S,
+          NN, F, lam, mu, clamped);
+  BY_DEEP(deep, stress_of, eps, zeroed, gamma, idx, A, S, NN, lam, mu, sig);
 #else
-  if (deep)
-    stress_point<true>(u1, gamma, idx, cs, A, S, NN, F, lam, mu, clamped, sig);
-  else
-    stress_point(u1, gamma, idx, cs, A, S, NN, F, lam, mu, clamped, sig);
+  BY_DEEP(deep, stress_point, u1, gamma, idx, cs, A, S, NN, F, lam, mu, clamped,
+          sig);
 #ifdef RELAXATION
   relax(memory, coef, idx, cs, sig);
 #endif
@@ -647,7 +796,7 @@ stress_kernel(const real_t *__restrict__ u1, real_t *__restrict__ sigma,
 }
 
 // ------------------------------------------------------------------------------------
-__global__ void
+__global__ void UPDATE_REGISTERS
 fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
           real_t *__restrict__ u2, const real_t *__restrict__ sigma,
           const real_t *__restrict__ gamma, const real_t rho,
@@ -662,18 +811,16 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
   FOLD_GEOM;
 #endif
 
-  const bool deep = deep_node(A, NN);
+  const int deep = warp_deep(A, NN);
 #pragma unroll
   for (int c = 0; c < NDIM; ++c) {
     if (A[c] > NN[c] - 3)
       continue; // no unknown on the staggered ghost of its own axis
     const real_t force =
-        deep ? nodal_force<true>(sigma, idx, cs, S, c, A, NN, F, clamped)
-             : nodal_force(sigma, idx, cs, S, c, A, NN, F, clamped);
+        BY_DEEP(deep, nodal_force, sigma, idx, cs, S, c, A, NN, F, clamped);
     const int n = c * cs + idx;
     const real_t mi =
-        deep ? point_minv<true>(gamma, idx, c, A, S, NN, rho, clamped)
-             : point_minv(gamma, idx, c, A, S, NN, rho, clamped);
+        BY_DEEP(deep, point_minv, gamma, idx, c, A, S, NN, rho, clamped);
 #ifdef USE_DAMPING
     const real_t beta = 0.5f * mi * damping[idx] * dt;
     real_t next =
@@ -707,77 +854,8 @@ fd_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
 
 #if NDIM >= 2 && defined(TILE0) && !defined(USE_PML) && !defined(STEPS)
 // ------------------------------------------------------------------------------------
-// the stresses of the block's tile and a ring a stencil radius wide around it
-#define WIDE (TILE1 + 2 * STENCIL_RADIUS)
-#if NDIM == 2
-#define RING ((TILE0 + 2 * STENCIL_RADIUS) * WIDE)
-#define THREADS (TILE0 * TILE1)
-#define TILE_INTERIOR_OR_RETURN                                                \
-  const int a0 = o0 + threadIdx.y, a1 = o1 + threadIdx.x;                     \
-  if (!(a0 > 0 && a0 < N0 - 1 && a1 > 0 && a1 < N1 - 1 &&                     \
-        a0 < tile_end(blockIdx.y, TILE0, N0) &&                                \
-        a1 < tile_end(blockIdx.x, TILE1, N1)))                                 \
-    return;                                                                    \
-  const int idx = a0 * s0 + a1
-#else
-#define DEEP_ (TILE2 + 2 * STENCIL_RADIUS)
-#define RING ((TILE0 + 2 * STENCIL_RADIUS) * WIDE * DEEP_)
-#define THREADS (TILE0 * TILE1 * TILE2)
-#define TILE_INTERIOR_OR_RETURN                                                \
-  const int a0 = o0 + threadIdx.z, a1 = o1 + threadIdx.y;                     \
-  const int a2 = o2 + threadIdx.x;                                             \
-  if (!(a0 > 0 && a0 < N0 - 1 && a1 > 0 && a1 < N1 - 1 && a2 > 0 &&            \
-        a2 < N2 - 1 && a0 < tile_end(blockIdx.z, TILE0, N0) &&                 \
-        a1 < tile_end(blockIdx.y, TILE1, N1) &&                                \
-        a2 < tile_end(blockIdx.x, TILE2, N2)))                                 \
-    return;                                                                    \
-  const int idx = a0 * s0 + a1 * s1 + a2
-#endif
-
-// a ring point within a wall's closure band: its stresses into out, a shared
-// plane apart, out of line so the deep ring keeps few registers
-#if NDIM == 2
-__device__ __noinline__ void
-wall_stresses(const real_t *__restrict__ u1, const real_t *__restrict__ gamma,
-              const int cs, const real_t lam, const real_t mu,
-              const int clamped, const int g0, const int g1, const int N0,
-              const int N1, const int s0, const real_t e0, const real_t e1,
-              real_t *out) {
-  const int G[2] = {g0, g1}, GS[2] = {s0, 1}, GN[2] = {N0, N1};
-  const real_t E[2] = {e0, e1};
-  const int at = g0 * s0 + g1;
-#else
-__device__ __noinline__ void
-wall_stresses(const real_t *__restrict__ u1, const real_t *__restrict__ gamma,
-              const int cs, const real_t lam, const real_t mu,
-              const int clamped, const int g0, const int g1, const int g2,
-              const int N0, const int N1, const int N2, const int s0,
-              const int s1, const real_t e0, const real_t e1, const real_t e2,
-              real_t *out) {
-  const int G[3] = {g0, g1, g2}, GS[3] = {s0, s1, 1}, GN[3] = {N0, N1, N2};
-  const real_t E[3] = {e0, e1, e2};
-  const int at = g0 * s0 + g1 * s1 + g2;
-#endif
-  real_t sig[NVOIGT];
-  stress_point(u1, gamma, at, cs, G, GS, GN, E, lam, mu, clamped, sig);
-#pragma unroll
-  for (int v = 0; v < NVOIGT; ++v)
-    out[v * RING] = sig[v];
-}
-
-// the first node of tile b of T along an axis of N nodes, -1 past the last: the
-// last ends on the axis' end, so no wall's closure band straddles two tiles
-__device__ __forceinline__ int tile_origin(const int b, const int T,
-                                           const int N) {
-  return b * T < N ? min(b * T, max(N - T, 0)) : -1;
-}
-
-// the end of the nodes tile b steps, the next tile's origin
-__device__ __forceinline__ int tile_end(const int b, const int T, const int N) {
-  const int next = tile_origin(b + 1, T, N);
-  return next < 0 ? N : next;
-}
-// at most 42 registers to radius 2, 64 past it
+// the stresses of the block's tile and a ring a stencil radius wide around it,
+// then the update; at most 42 registers to radius 2, 64 past it
 __global__ void
 __launch_bounds__(THREADS, (STENCIL_RADIUS > 2 ? 1024 : 1536) / THREADS)
     fused_kernel(const real_t *__restrict__ u0, const real_t *__restrict__ u1,
@@ -805,55 +883,29 @@ __launch_bounds__(THREADS, (STENCIL_RADIUS > 2 ? 1024 : 1536) / THREADS)
   const int o1 = tile_origin(blockIdx.x, TILE1, N1);
   if (o0 < 0 || o1 < 0)
     return;
-  const int b0 = o0 - STENCIL_RADIUS, b1 = o1 - STENCIL_RADIUS;
+  const int B[2] = {o0 - STENCIL_RADIUS, o1 - STENCIL_RADIUS};
+  const int GS[2] = {s0, 1}, GN[2] = {N0, N1};
   const real_t E[2] = {e0, e1};
-  for (int t = threadIdx.y * TILE1 + threadIdx.x; t < RING; t += THREADS) {
-    const int g0 = b0 + t / WIDE, g1 = b1 + t % WIDE;
-    const bool inner = g0 > 0 && g0 < N0 - 1 && g1 > 0 && g1 < N1 - 1;
-    const int G[2] = {g0, g1}, GS[2] = {s0, 1}, GN[2] = {N0, N1};
-    const int at = g0 * s0 + g1;
+  const bool deep_tile =
+      deep_ring(B[0], TILE0, N0) && deep_ring(B[1], TILE1, N1);
 #else
   const int o0 = tile_origin(blockIdx.z, TILE0, N0);
   const int o1 = tile_origin(blockIdx.y, TILE1, N1);
   const int o2 = tile_origin(blockIdx.x, TILE2, N2);
   if (o0 < 0 || o1 < 0 || o2 < 0)
     return;
-  const int b0 = o0 - STENCIL_RADIUS, b1 = o1 - STENCIL_RADIUS;
-  const int b2 = o2 - STENCIL_RADIUS;
+  const int B[3] = {o0 - STENCIL_RADIUS, o1 - STENCIL_RADIUS,
+                    o2 - STENCIL_RADIUS};
+  const int GS[3] = {s0, s1, 1}, GN[3] = {N0, N1, N2};
   const real_t E[3] = {e0, e1, e2};
-  for (int t = (threadIdx.z * TILE1 + threadIdx.y) * TILE2 + threadIdx.x;
-       t < RING; t += THREADS) {
-    const int g0 = b0 + t / (WIDE * DEEP_), g1 = b1 + t / DEEP_ % WIDE;
-    const int g2 = b2 + t % DEEP_;
-    const bool inner = g0 > 0 && g0 < N0 - 1 && g1 > 0 && g1 < N1 - 1 &&
-                       g2 > 0 && g2 < N2 - 1;
-    const int G[3] = {g0, g1, g2}, GS[3] = {s0, s1, 1}, GN[3] = {N0, N1, N2};
-    const int at = g0 * s0 + g1 * s1 + g2;
+  const bool deep_tile = deep_ring(B[0], TILE0, N0) &&
+                         deep_ring(B[1], TILE1, N1) &&
+                         deep_ring(B[2], TILE2, N2);
 #endif
-    // stress_kernel's nodes; the scratch it writes is zero elsewhere
-    if (inner && !deep_node(G, GN)) {
-#if NDIM == 2
-      wall_stresses(u1, gamma, cs, lam, mu, clamped, g0, g1, N0, N1, s0, e0,
-                    e1, ss + t);
-#else
-      wall_stresses(u1, gamma, cs, lam, mu, clamped, g0, g1, g2, N0, N1, N2,
-                    s0, s1, e0, e1, e2, ss + t);
-#endif
-      continue;
-    }
-    real_t sig[NVOIGT];
-    if (inner) {
-      stress_point<true>(u1, gamma, at, cs, G, GS, GN, E, lam, mu, clamped,
-                         sig);
-    } else {
-#pragma unroll
-      for (int v = 0; v < NVOIGT; ++v)
-        sig[v] = (real_t)0;
-    }
-#pragma unroll
-    for (int v = 0; v < NVOIGT; ++v)
-      ss[v * RING + t] = sig[v];
-  }
+  if (deep_tile)
+    ring_stresses<true>(ss, u1, gamma, cs, lam, mu, clamped, B, GS, GN, E);
+  else
+    ring_stresses<false>(ss, u1, gamma, cs, lam, mu, clamped, B, GS, GN, E);
   __syncthreads();
 
   // fd_kernel's update, the divergence read off the tile
@@ -871,30 +923,22 @@ __launch_bounds__(THREADS, (STENCIL_RADIUS > 2 ? 1024 : 1536) / THREADS)
       threadIdx.x + STENCIL_RADIUS;
   const int T[3] = {WIDE * DEEP_, DEEP_, 1};
 #endif
-  const bool deep = deep_node(A, NN);
+  const int deep = deep_tile ? DEEP_ALL : warp_deep(A, NN);
 #ifdef GRADIENT
   real_t eps[NVOIGT];
-  if (deep) {
-    strain_point<true>(u1, idx, cs, A, S, NN, E, clamped, eps);
-    stiffness_density<true>(eps, v1, g_normal, g_shear, idx, cs, A, S, NN, E,
-                            lam, mu, clamped);
-  } else {
-    strain_point(u1, idx, cs, A, S, NN, E, clamped, eps);
-    stiffness_density(eps, v1, g_normal, g_shear, idx, cs, A, S, NN, E, lam, mu,
-                      clamped);
-  }
+  BY_DEEP(deep, strain_point, u1, idx, cs, A, S, NN, E, clamped, eps);
+  BY_DEEP(deep, stiffness_density, eps, v1, g_normal, g_shear, idx, cs, A, S,
+          NN, E, lam, mu, clamped);
 #endif
 #pragma unroll
   for (int c = 0; c < NDIM; ++c) {
     if (A[c] > NN[c] - 3)
       continue; // no unknown on the staggered ghost of its own axis
     const real_t force =
-        deep ? nodal_force<true>(ss, local, RING, T, c, A, NN, F, clamped)
-             : nodal_force(ss, local, RING, T, c, A, NN, F, clamped);
+        BY_DEEP(deep, nodal_force, ss, local, RING, T, c, A, NN, F, clamped);
     const int n = c * cs + idx;
     const real_t mi =
-        deep ? point_minv<true>(gamma, idx, c, A, S, NN, rho, clamped)
-             : point_minv(gamma, idx, c, A, S, NN, rho, clamped);
+        BY_DEEP(deep, point_minv, gamma, idx, c, A, S, NN, rho, clamped);
 #ifdef USE_DAMPING
     const real_t beta = 0.5f * mi * damping[idx] * dt;
     const real_t next =
@@ -982,7 +1026,7 @@ __global__ void __launch_bounds__(TILE1 *ROWS)
                           reads_held(a0, lo0 - HALO, TILE0, N0) &&
                           reads_held(a1, lo1 - HALO, TILE1, N1);
     const int A[2] = {a0, a1};
-    const bool deep = deep_node(A, NN);
+    const int deep = warp_deep(A, NN);
     sg[AT(x, ty)] = inside ? gamma[idx] : (real_t)1;
     inner |= (unsigned)interior << k;
 #pragma unroll
@@ -992,10 +1036,9 @@ __global__ void __launch_bounds__(TILE1 *ROWS)
       su[c * AREA + AT(x, ty)] = uc[k][c];
       const bool steps = interior && A[c] <= NN[c] - 3;
       moving |= (unsigned)steps << (2 * k + c);
-      mi[k][c] = !steps ? (real_t)0
-                 : deep
-                     ? point_minv<true>(gamma, idx, c, A, GS, NN, rho, clamped)
-                     : point_minv(gamma, idx, c, A, GS, NN, rho, clamped);
+      mi[k][c] = steps ? BY_DEEP(deep, point_minv, gamma, idx, c, A, GS, NN,
+                                 rho, clamped)
+                       : (real_t)0;
 #ifdef USE_DAMPING
       beta[k][c] = steps ? 0.5f * mi[k][c] * damping[idx] : 0; // over dt
 #endif
@@ -1037,12 +1080,8 @@ __global__ void __launch_bounds__(TILE1 *ROWS)
       const int A[2] = {a0, a1};
       real_t sig[NVOIGT];
       if ((inner >> k) & 1) {
-        if (deep_node(A, NN))
-          stress_point<true>(su, sg, AT(x, ty), AREA, A, T, NN, E, lam, mu,
-                             clamped, sig);
-        else
-          stress_point(su, sg, AT(x, ty), AREA, A, T, NN, E, lam, mu, clamped,
-                       sig);
+        BY_DEEP(warp_deep(A, NN), stress_point, su, sg, AT(x, ty), AREA, A, T,
+                NN, E, lam, mu, clamped, sig);
       } else {
 #pragma unroll
         for (int v = 0; v < NVOIGT; ++v)
@@ -1060,15 +1099,13 @@ __global__ void __launch_bounds__(TILE1 *ROWS)
     for (int k = 0; k < NODES; ++k) {
       const int x = x0 + k, a0 = lo0 - HALO + x;
       const int A[2] = {a0, a1};
-      const bool deep = deep_node(A, NN);
+      const int deep = warp_deep(A, NN);
 #pragma unroll
       for (int c = 0; c < 2; ++c) {
         real_t next = up[k][c];
         if ((moving >> (2 * k + c)) & 1) {
-          const real_t force =
-              deep ? nodal_force<true>(ss, AT(x, ty), AREA, T, c, A, NN, F,
-                                       clamped)
-                   : nodal_force(ss, AT(x, ty), AREA, T, c, A, NN, F, clamped);
+          const real_t force = BY_DEEP(deep, nodal_force, ss, AT(x, ty), AREA,
+                                       T, c, A, NN, F, clamped);
 #ifdef USE_DAMPING
           // rounded as nvcc compiles fd_kernel's, dt beta fused into 1 -+ beta
           next = FMA_RN(mi[k][c], force,

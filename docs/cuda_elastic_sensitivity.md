@@ -16,7 +16,7 @@ $$\frac{\partial\gamma_s}{\partial\gamma_i}=\frac{1}{4}\left(\frac{\gamma_s}{\ga
 
 ## device functions
 
-`node_derivative`, `half_derivative`, `deep_node`, `clamped_face`, `normal_strains`, `condensed_lame` and `shear_strain` as in [cuda_elastic](cuda_elastic.md), taken on the path `deep_node` picks, which rounds as the general one, so the densities are bit for bit those of the step's, evaluated here on the forward and the adjoint field alike, plus
+`node_derivative`, `half_derivative`, `warp_deep`, `clamped_face`, `normal_strains`, `condensed_lame` and `shear_strain` as in [cuda_elastic](cuda_elastic.md), taken on the path `warp_deep` picks, which rounds as the general one, so the densities are bit for bit those of the step's, evaluated here on the forward and the adjoint field alike, plus
 
 ### normal_form
 **aim**

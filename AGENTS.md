@@ -99,11 +99,13 @@ old graded rows stalled. Summation by parts turns the update's `-M^-1 D+^T W` in
 (and back), so the update takes the other derivative's rows and no kernel reads a norm;
 the norms live in Python (`point_weights` for the gradient chain, `point_inverse_inertia`
 for a point load). The pml memory terms use the same rows, so their adjoint transposes
-still pair. `deep_node` sends threads past the band (`CLOSURE_BAND`: 2r rows Taylor, 3r-1
-optimized, whose `D-` follows from `Q- = B - Q+^T`) down a template path with no wall
-terms; an axis needs `2 closure_band + 3` nodes. A band reads further than a radius, so
-the fused step puts each axis' last tile flush with its end (`tile_origin`) and the
-blocked step shifts its cores (`origin`) until no tile edge cuts a band.
+still pair. Each warp votes (`warp_deep`) on the axes it lies past the band of
+(`CLOSURE_BAND`: 2r rows Taylor, 3r-1 optimized, whose `D-` follows from `Q- = B - Q+^T`)
+and takes a template path without their wall terms, so a warp at a fast-axis wall runs the
+closure along that axis alone; an axis needs `2 closure_band + 3` nodes. A band reads
+further than a radius, so the fused step puts each axis' last tile flush with its end
+(`tile_origin`) and the blocked step shifts its cores (`origin`) until no tile edge cuts a
+band.
 `ElasticWave.relaxation` (an `elastic.Relaxation`) is the material's own attenuation: a
 generalized Zener body, `-DRELAXATION` memory variables per stress settled in the stress
 pass, fitted by `zener` to a constant Q over a band. The relaxed step is its own transpose,

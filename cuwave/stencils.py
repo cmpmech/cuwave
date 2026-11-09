@@ -183,6 +183,7 @@ def _closure_tables(space_order: int, stencil: str) -> tuple[dict, tuple[int, ..
     return tables, (node_rows, half_rows, node_span, half_span)
 
 
+@lru_cache
 def preamble(space_order: int, stencil: str = "taylor") -> str:
     """CUDA preamble: `STENCIL_RADIUS`, the coefficient tables one row per radius, and the staggered closure."""
     R = space_order // 2
