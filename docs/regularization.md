@@ -88,6 +88,22 @@ with the penalization exponent `p` and the lower bound `x_min`, mapping $[0,1]$ 
 
 The material coefficients are interpolated linearly in $\gamma$, so `p=1` recovers the plain interpolation and only `p>1` penalizes; unlike in compliance minimization, `x_min` is not needed to keep the system regular here, since both materials have finite properties
 
+### BrushGenerator
+`BrushGenerator` maps a 2D design onto one whose solid and void both admit a circular brush, so that every feature and every gap is at least the brush wide: a strict minimum length scale, which filtering and projection only approach. It is the conditional generator of [Schubert et al. 2022](https://doi.org/10.1021/acsphotonics.2c00313). Touches of the brush are placed until every node of the region is painted, each chosen by its reward
+$$r_\textrm{solid}(t)=\sum_{i\in b_t,\ i\textrm{ unset}}w\left(2x_i-1\right),\qquad w=\begin{cases}1&2x_i-1>0\\\left|b\right|&\textrm{otherwise}\end{cases}$$
+with the design `x` $x$, the nodes $b_t$ the touch at $t$ paints, the brush size $\left|b\right|$ in nodes, and the void reward the same with the sign flipped. Weighting a node of the wrong sign as heavily as the whole brush makes a touch that stays inside its phase win, so a design that is already feasible comes back unchanged
+
+| member | signature | description |
+|---|---|---|
+| constructor | `BrushGenerator(diameter, region)` | the brush `disk(diameter)` and the nodal mask `region` it decides; the nodes outside are read off the input as fixed, solid above 0.5 |
+| generator | `__call__(x)` | returns `x` with `region` set to a feasible $0/1$ design |
+| derivative | `grad(x, dy=1.0)` | returns `dy` unchanged, the straight-through estimate |
+| brush | `disk(diameter)` | the circular brush centred on a node, `diameter + 1` nodes across |
+
+The generator follows Algorithm 1 of the paper: touches that only paint nodes the other phase cannot reach anyway are placed first, all at once; then a touch resolving a required node, one that only this phase can still reach; then any valid touch. Two changes make it fit a GPU and make it complete. (1) A touch constrains nodes up to 1.5 brushes away, so a step places the best touch of every neighbourhood three brushes across at once instead of one touch per step. (2) A touch can leave a node that neither phase reaches any more, which the sequential algorithm does not rule out either; such a touch is dropped from its step, so the design is always completed. The fixed nodes next to the region count as painted, so a guide that enters the region constrains the touches there like any other feature
+
+The map is not differentiable, so the gradient passes straight through, as in the paper. Put a `DensityFilter` and a `Projection` in front of it: their smooth, length-scaled output is the reward, and their own `grad` stands in for the generator's. The dilations, maxima and sums the steps need run in `kernels/brush.cu`; a call on a region of a few hundred nodes across takes about a second on a desktop GPU
+
 ## Penalty (cost function modification)
 ### Tikhonov
 `Tikhonov` adds an $L_2$ penalty on the design, or on its gradient, to stabilize an ill-posed inversion, going back to Tikhonov & Arsenin 1977 (see [Hansen 1992](https://doi.org/10.1137/1034115) on the analysis and on choosing `alpha`)

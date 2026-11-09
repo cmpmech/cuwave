@@ -15,8 +15,14 @@ identities the module is built on:
 The remaining classes pin the properties a driver relies on but no adjoint test would
 catch: that the filter preserves a constant, that the projection stays in [0, 1], and
 that `set` retunes a live instance the way a `continuation` schedule needs.
+
+`BrushGenerator` is pinned to what it promises: on smooth random rewards, with and
+without fixed silicon at the edge of its region, both phases admit the brush, which a
+morphological opening checks independently of the generator; a feasible design comes
+back unchanged; and the nodes outside its region are never touched.
 """
 
+import itertools
 import math
 import unittest
 
@@ -28,8 +34,11 @@ except Exception:
     HAS_CUDA = False
 
 if HAS_CUDA:
+    import cupyx.scipy.ndimage as ndi
+
     from cuwave.regularization import (
         SIMP,
+        BrushGenerator,
         DensityFilter,
         Projection,
         SmoothedProjection,
@@ -38,6 +47,7 @@ if HAS_CUDA:
         _spatial_grad,
         _spatial_grad_adjoint,
         continuation,
+        disk,
     )
 
 STEP = 1e-6
@@ -260,6 +270,68 @@ class SimpTest(unittest.TestCase):
     def test_penalization_pushes_intermediate_densities_down(self):
         x = _design()
         self.assertTrue(bool(cp.all(SIMP(p=3.0, x_min=0.0)(x) < x)))
+
+
+# ---------------------------------- brush generator ----------------------------------
+def _rewards(shape, seed):
+    """Smooth random design values about 0.5, as a filtered latent field gives them."""
+    x = ndi.gaussian_filter(cp.random.RandomState(seed).random_sample(shape), 4.0)
+    return 0.5 + 0.3 * (x - x.mean()) / x.std()
+
+
+def _violations(design, where, diameter):
+    """Nodes on `where` that an opening by the brush changes, in either phase."""
+    brush, solid = disk(diameter), design > 0.5
+    opened = ndi.binary_opening(solid, brush), ndi.binary_opening(~solid, brush)
+    return int((((opened[0] != solid) | (opened[1] != ~solid)) & where).sum())
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class BrushGeneratorTest(unittest.TestCase):
+    def _region(self, n=160, margin=20):
+        region = cp.zeros((n, n), dtype=bool)
+        region[margin:-margin, margin:-margin] = True
+        return region
+
+    def test_both_phases_admit_the_brush(self):
+        region = self._region()
+        for seed, diameter in itertools.product(range(3), (6, 10)):
+            x = cp.where(region, _rewards(region.shape, seed), 0.0)
+            design = BrushGenerator(diameter, region)(x)
+            self.assertEqual(_violations(design, region, diameter), 0, f"{seed}")
+
+    def test_a_touch_that_would_strand_a_node_is_dropped(self):
+        # without the lookahead, the generator strands a node on this input
+        region = self._region(n=360)
+        design = BrushGenerator(10, region)(cp.where(region, _rewards(region.shape, 2), 0.0))
+        self.assertEqual(_violations(design, region, 10), 0)
+
+    def test_fixed_silicon_at_the_edge_is_kept_and_respected(self):
+        region = self._region()
+        guide = cp.zeros_like(region)
+        guide[:, 70:90] = True
+        x = cp.where(region, _rewards(region.shape, 4), guide.astype(float))
+        design = BrushGenerator(10, region)(x)
+        self.assertTrue(bool(cp.array_equal(design[~region], x[~region])))
+        self.assertEqual(_violations(design, region, 10), 0)
+
+    def test_a_feasible_design_comes_back_unchanged(self):
+        region = self._region()
+        generator = BrushGenerator(10, region)
+        design = generator(cp.where(region, _rewards(region.shape, 5), 0.0))
+        self.assertTrue(bool(cp.array_equal(generator(design), design)))
+
+    def test_the_gradient_passes_straight_through(self):
+        region = self._region()
+        dy = cp.random.RandomState(6).random_sample(region.shape)
+        x = _rewards(region.shape, 6)
+        self.assertTrue(bool(cp.array_equal(BrushGenerator(10, region).grad(x, dy), dy)))
+
+    def test_it_rejects_a_brush_that_is_not_a_positive_integer(self):
+        with self.assertRaises(ValueError):
+            BrushGenerator(0, self._region())
+        with self.assertRaises(ValueError):
+            BrushGenerator(2.5, self._region())
 
 
 # ------------------------------- continuation schedules ------------------------------

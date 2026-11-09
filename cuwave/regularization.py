@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import abc
 import math
+from pathlib import Path
 from collections.abc import Sequence
+from typing import NamedTuple
 
 import cupy as cp
 import cupy.typing as cpt
 import cupyx.scipy.ndimage as ndi
 import numpy.typing as npt
+
+KERNEL_PATH = Path(__file__).parent / "kernels" / "brush.cu"
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -246,6 +250,158 @@ class SIMP(Regularization):
     def grad(self, x: cpt.NDArray, dy: cpt.NDArray | float = 1.0) -> cpt.NDArray:
         """Adjoint of the penalization: `dy` scaled by the power-law derivative."""
         return dy * (1.0 - self.x_min) * self.p * x ** (self.p - 1.0)
+
+
+def disk(diameter: int) -> cpt.NDArray[cp.bool_]:
+    """Circular brush centered on a node, `diameter + 1` nodes across along the axes."""
+    offsets = cp.arange(-(diameter // 2), diameter // 2 + 1)
+    return cp.hypot(*cp.meshgrid(offsets, offsets, indexing="ij")) <= 0.5 * diameter
+
+
+class _Touches(NamedTuple):
+    """Node and touch states of the brush generator, each a mask over its window."""
+
+    is_solid: cpt.NDArray[cp.bool_]  # painted solid, or fixed solid
+    is_void: cpt.NDArray[cp.bool_]
+    valid_solid: cpt.NDArray[cp.bool_]  # touches painting no void node
+    valid_void: cpt.NDArray[cp.bool_]
+    may_solid: cpt.NDArray[cp.bool_]  # nodes some placed or valid touch paints
+    may_void: cpt.NDArray[cp.bool_]
+
+
+class BrushGenerator(Regularization):
+    """A 2D design whose solid and void both admit a disk, by Schubert et al.'s generator.
+
+    Algorithm 1 of https://doi.org/10.1021/acsphotonics.2c00313, each step placing the
+    best touch of every neighbourhood three brushes across and dropping any touch that
+    would leave a node neither phase can reach. The map is not differentiable, so
+    `grad` passes `dy` straight through; docs/regularization.md gives the reward.
+
+    Args:
+        diameter: brush diameter in nodes, the least width of either phase.
+        region: (nx, ny) mask of the nodes it decides; the rest of `x` is fixed,
+            solid above 0.5, and constrains the touches next to it.
+    """
+
+    def __init__(self, diameter: int, region: cpt.NDArray[cp.bool_]) -> None:
+        if not (isinstance(diameter, int) and diameter >= 1):
+            raise ValueError(f"diameter must be a positive integer: {diameter}")
+        if region.ndim != 2 or not bool(region.any()):
+            raise ValueError(f"region must be a 2D mask with a node: {region.shape}")
+        self.brush = disk(diameter)
+        self.disk_taps = (cp.argwhere(self.brush) - diameter // 2).astype(cp.int32)
+        # a neighbourhood three brushes across, as a row pass then a column pass
+        line = cp.arange(-3 * diameter, 3 * diameter + 1, dtype=cp.int32)
+        self.row_taps = cp.stack([cp.zeros_like(line), line], axis=1)
+        self.column_taps = cp.stack([line, cp.zeros_like(line)], axis=1)
+        module = cp.RawModule(code=KERNEL_PATH.read_text())
+        self.kernels = {
+            name: module.get_function(f"{name}_kernel")
+            for name in ("dilate", "maximum", "sum")
+        }
+        pad = 2 * diameter
+        nodes = cp.nonzero(region)
+        self.window = tuple(
+            slice(max(int(i.min()) - pad, 0), min(int(i.max()) + pad + 1, n))
+            for i, n in zip(nodes, region.shape)
+        )
+        self.free = region[self.window]
+        # breaks the ties of a uniform reward, the same way every call
+        self.jitter = 1e-6 * cp.random.RandomState(0).random_sample(self.free.shape)
+
+    def _launch(self, name: str, a: cpt.NDArray, taps: cpt.NDArray) -> cpt.NDArray:
+        """Kernel `name` over the contiguous 2D `a`, combining each node's `taps`."""
+        out = cp.empty_like(a)
+        n0, n1 = a.shape
+        grid = ((n1 + 31) // 32, (n0 + 7) // 8)
+        args = (a, out, taps, cp.int32(len(taps)), cp.int32(n0), cp.int32(n1))
+        self.kernels[name](grid, (32, 8), args)
+        return out
+
+    def _dilate(self, a: cpt.NDArray[cp.bool_]) -> cpt.NDArray[cp.bool_]:
+        return self._launch("dilate", a.view(cp.uint8), self.disk_taps).view(cp.bool_)
+
+    def _spread(self, a: cpt.NDArray[cp.bool_]) -> cpt.NDArray[cp.bool_]:
+        """`a` dilated by the square neighbourhood a step places one touch in."""
+        rows = self._launch("dilate", a.view(cp.uint8), self.row_taps)
+        return self._launch("dilate", rows, self.column_taps).view(cp.bool_)
+
+    def _gain(self, reward: cpt.NDArray, painted: cpt.NDArray[cp.bool_]) -> cpt.NDArray:
+        """Reward of a touch at each node, summed over the nodes it would newly set.
+
+        A node of the wrong sign weighs as much as the whole brush, so a touch that
+        stays inside its phase always wins, and a feasible design comes back as is.
+        """
+        weighted = cp.where(reward > 0.0, reward, len(self.disk_taps) * reward)
+        unset = cp.where(painted, cp.float32(0.0), weighted).astype(cp.float32)
+        return self._launch("sum", unset, self.disk_taps)
+
+    def _touches(self, solid, void, fixed_solid, fixed_void) -> _Touches:
+        """States of Algorithm 1 for the placed touches, fixed nodes counted as painted."""
+        is_solid = self._dilate(solid) | fixed_solid
+        is_void = self._dilate(void) | fixed_void
+        valid_solid = ~self._dilate(is_void) & ~solid
+        valid_void = ~self._dilate(is_solid) & ~void
+        may_solid = self._dilate(solid | valid_solid) | fixed_solid
+        may_void = self._dilate(void | valid_void) | fixed_void
+        return _Touches(is_solid, is_void, valid_solid, valid_void, may_solid, may_void)
+
+    def __call__(self, x: cpt.NDArray) -> cpt.NDArray:
+        """`x` with the nodes of `region` set to a feasible 0/1 design."""
+        part = x[self.window]
+        fixed = (part > 0.5) & ~self.free, (part <= 0.5) & ~self.free
+        reward = (2.0 * part - 1.0 + self.jitter).astype(cp.float32)
+        solid = cp.zeros(part.shape, dtype=cp.bool_)
+        void = cp.zeros_like(solid)
+
+        # touches first that only paint nodes the other phase cannot reach anyway
+        for _ in range(part.size):
+            t = self._touches(solid, void, *fixed)
+            if bool(cp.all(t.is_solid | t.is_void)):
+                break
+            free_solid = ~self._dilate(t.may_void | t.is_void) & t.valid_solid
+            free_void = ~self._dilate(t.may_solid | t.is_solid) & t.valid_void
+            if bool(cp.any(free_solid | free_void)):
+                solid, void = solid | free_solid, void | free_void
+                continue
+
+            # near a required node only a touch resolving it, elsewhere any valid one
+            need_solid, need_void = ~t.is_solid & ~t.may_void, ~t.is_void & ~t.may_solid
+            near = self._spread(need_solid | need_void)
+            valid_solid = t.valid_solid & (~near | self._dilate(need_solid))
+            valid_void = t.valid_void & (~near | self._dilate(need_void))
+            gains = self._gain(reward, t.is_solid), self._gain(-reward, t.is_void)
+            solid, void = self._step(solid, void, fixed, valid_solid, valid_void, *gains)
+        else:
+            raise RuntimeError("the brush generator did not complete the design")
+        out = x.copy()
+        out[self.window] = cp.where(self.free, self._dilate(solid), part)
+        return out
+
+    def _step(self, solid, void, fixed, valid_solid, valid_void, gain_solid, gain_void):
+        """Place the best touch of each neighbourhood, dropping any that strands a node."""
+        while bool(cp.any(valid_solid | valid_void)):
+            pick_solid = valid_solid & ((gain_solid >= gain_void) | ~valid_void)
+            pick_void = valid_void & ~pick_solid
+            score = cp.where(pick_solid, gain_solid, cp.where(pick_void, gain_void, -cp.inf))
+            score = score.astype(cp.float32, copy=False)
+            rows = self._launch("maximum", score, self.row_taps)
+            peak = score == self._launch("maximum", rows, self.column_taps)
+            pick_solid, pick_void = peak & pick_solid, peak & pick_void
+
+            # a stranded node is reachable by neither phase; its touch is dropped
+            t = self._touches(solid | pick_solid, void | pick_void, *fixed)
+            stranded = ~(t.is_solid | t.is_void | t.may_solid | t.may_void)
+            if not bool(cp.any(stranded)):
+                return solid | pick_solid, void | pick_void
+            blamed = self._spread(stranded)
+            valid_solid &= ~(blamed & pick_solid)
+            valid_void &= ~(blamed & pick_void)
+        raise RuntimeError("every touch left would strand a node")
+
+    def grad(self, x: cpt.NDArray, dy: cpt.NDArray | float = 1.0) -> cpt.NDArray:
+        """Straight-through estimate: `dy` passed on unchanged."""
+        return dy * cp.ones_like(x)
 
 
 # ----------------------------- penalization in objective -----------------------------
