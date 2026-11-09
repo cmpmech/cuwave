@@ -7,6 +7,10 @@ conjugation away from an expression that agrees on real data and disagrees on
 everything else. So the transform is pinned against `numpy.fft` and its derivative
 against central differences.
 
+`mode_overlap` is `intensity` on a linear projection of the record, so identity modes
+must reproduce `intensity` exactly, and a mode row with a subtracted reference is pinned
+against the projected `numpy` transform, its derivative against central differences.
+
 `tdt` / `itdt` are only right with the time origin of each record right, a source row
 `t` sitting at `t dt` and a sensor row at `(t + 1) dt`, which no round trip can see. So
 they are pinned on a real leapfrog run against the exact 1D solution.
@@ -39,6 +43,7 @@ if HAS_CUDA:
         measure,
         misfit,
         misfit_gradient,
+        mode_overlap,
         point_source,
         shots,
         tdt,
@@ -134,6 +139,56 @@ class IntensityTest(unittest.TestCase):
         cost, _ = intensity(sim, self.frequencies, weights)(record)
         reference = abs(_transform(sim, self.frequencies, record)[2, 1]) ** 2
         self.assertAlmostEqual(cost / reference, 1.0, places=10)
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class ModeOverlapTest(unittest.TestCase):
+    frequencies = (0.7, 2.3, 5.0)
+
+    def _modes(self, seed=3):
+        return np.random.default_rng(seed).standard_normal((2, 4))
+
+    def test_identity_modes_are_the_intensity(self):
+        sim = _sim()
+        record = _record(sim)
+        cost, derivative = mode_overlap(sim, self.frequencies, np.eye(4))(record)
+        reference, expected = intensity(sim, self.frequencies)(record)
+        self.assertAlmostEqual(cost / reference, 1.0, places=12)
+        self.assertTrue(cp.allclose(derivative, expected, rtol=1e-12, atol=0.0))
+
+    def test_a_mode_row_is_the_projected_transform(self):
+        sim = _sim()
+        record, incident = _record(sim), _record(sim, seed=1)
+        modes = self._modes()
+        objective = mode_overlap(sim, self.frequencies, modes, reference=incident)
+        cost, _ = objective(record)
+        spectrum = _transform(sim, self.frequencies, record - incident)
+        reference = np.sum(np.abs(spectrum @ modes.T) ** 2)
+        self.assertAlmostEqual(cost / reference, 1.0, places=10)
+
+    def test_the_derivative_matches_finite_differences(self):
+        sim = _sim()
+        record = _record(sim)
+        objective = mode_overlap(
+            sim, self.frequencies, self._modes(), reference=_record(sim, seed=1)
+        )
+        _, derivative = objective(record)
+        rng = np.random.default_rng(2)
+        h = 1e-6
+        for _ in range(8):
+            node = (int(rng.integers(0, sim.N)), int(rng.integers(0, 4)))
+            plus, minus = record.copy(), record.copy()
+            plus[node] += h
+            minus[node] -= h
+            reference = (objective(plus)[0] - objective(minus)[0]) / (2.0 * h)
+            self.assertAlmostEqual(
+                float(derivative[node]) / reference, 1.0, places=6, msg=f"{node}"
+            )
+
+    def test_it_rejects_a_reference_of_the_wrong_shape(self):
+        sim = _sim()
+        with self.assertRaises(ValueError):
+            mode_overlap(sim, 1.0, self._modes(), reference=_record(sim, columns=3))
 
 
 # ---------------------------------- time dispersion ----------------------------------

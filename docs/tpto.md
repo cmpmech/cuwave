@@ -6,7 +6,7 @@ An optimization is set up as follows:
 1. define the forward problem with [maxwell](maxwell.md), `ElectricWave` or `MagneticWave` depending on the polarization, its indicator $\gamma$ interpolating between air and silicon
 2. open the domain with `pad_for_sponge` and a `Pml` ([boundary](boundary.md)), or a `sponge`, which for Maxwell is a real conductivity rather than an absorbing fiction
 3. mark the design region with `box` and the ports with `nodes` ([geometry](geometry.md))
-4. build the objective with `intensity` ([utils](utils.md)), one broadband `ricker` run scoring every design wavelength at once
+4. build the objective with `intensity` ([utils](utils.md)) at points, or with `mode_overlap` on a line of sensors across each port guide, whose mode a line source of its `slab_modes` profile launches ([maxwell](maxwell.md)); one broadband run scores every design wavelength at once
 5. map the design variables through a `DensityFilter` and a `Projection` ([regularization](regularization.md))
 6. iterate `response_gradient` with `spectral_sensitivity` on the design region and one `Adam` step, sharpening the projection on a continuation schedule
 7. snap the final design to 0/1 with `threshold` and re-simulate it to report what it achieves

@@ -66,6 +66,21 @@ Order 2 costs nothing in accuracy here. A binary design is a material jump defin
 
 Dispersion and loss are not modelled. A Lorentz or Drude pole needs an auxiliary equation per node, which is a new material model rather than a new parametrization, so a single real index has to serve every wavelength a broadband run scores. For silicon over a telecom band that is a fair approximation and over the visible it is not
 
+## waveguide modes
+
+**`slab_modes`** finds the guided modes of a line of nodes across a waveguide, which a port needs twice: to launch a mode and to read one. Along the line, the time-harmonic `ElectricWave` field $E_z=m(y)\,e^{i\left(\beta x-\omega t\right)}$ satisfies
+$$m''+\omega^2\mu\varepsilon\,m=\beta^2m$$
+with the frequency `frequency` $\omega/2\pi$, the line's permittivity `permittivity` $\varepsilon$, the permeability `permeability` $\mu$ and the propagation constant `beta` $\beta$. The second difference on the line's spacing is the one the scheme takes at `space_order` 2 and the field is held at zero past both ends, so the eigenproblem is a dense symmetric one of the line's size. A mode is guided where $\beta^2$ exceeds $\omega^2\mu\varepsilon$ at both end nodes, and `slab_modes` raises rather than return a box mode of the truncated line
+
+| member | signature | description |
+|---|---|---|
+| record | `SlabModes(beta, profiles)` | the propagation constants and the unit-norm profiles, largest `beta` first |
+| mode solver | `slab_modes(sim, permittivity, frequency, axis, count=1)` | the `count` guided modes of the line along `axis`, each profile's leading lobe positive |
+
+The operator is symmetric with unit weight, so the profiles are orthonormal in the plain sum over the line's nodes, and a profile serves as the line source and as the overlap row unchanged: `point_source` with the signal `np.outer(pulse, profile)` launches the mode in both directions, and `mode_overlap` ([utils](utils.md)) reads each mode's amplitude off a line of sensors. A mode of amplitude $a$ leaving through a port carries the power $\tfrac{\beta}{2\omega\mu}\lvert a\rvert^2\Delta y$, so modes of different order compare through their `beta`, and a transmission is normalized by a run of the straight guide with the same source
+
+Only `ElectricWave` has modes here: an $H_z$ line weighs its eigenproblem by $1/\varepsilon$, which the Ceviche setup this serves does not need. A profile belongs to one frequency, so a broadband objective reads its other frequencies through a slightly mismatched row
+
 ## MaxwellWave
 
 **MaxwellWave** solves the vector curl-curl equation on the Yee lattice, which is what 3D needs and 2D does not

@@ -14,6 +14,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import cupy as cp
 import cupy.typing as cpt
@@ -120,8 +121,8 @@ class ElectricWave(PolarizedWave):
     """Out-of-plane electric field, the permittivity its inertia and `1 / mu` its stiffness.
 
     The polarization Christiansen & Sigmund 2021 (https://doi.org/10.1364/JOSAB.406048)
-    label TE, and the one a waveguide device is designed in, since a guided mode's
-    electric field is the one held continuous across the sidewalls.
+    label TE and a waveguide community TM, the one the Ceviche challenges (Schubert et
+    al. 2022, https://doi.org/10.1021/acsphotonics.2c00313) are posed in.
     """
 
     def parametrization(
@@ -156,6 +157,63 @@ class MagneticWave(PolarizedWave):
         """The inertia is constant; `1 / eps` is not affine in gamma, so its derivative is nodal."""
         contrast = self.permittivity2 - self.permittivity1
         return 0.0, -contrast / self.permittivity(indicator) ** 2
+
+
+# ---------------------------------- waveguide modes ----------------------------------
+class SlabModes(NamedTuple):
+    """Guided modes of a line of nodes across a waveguide, the largest `beta` first."""
+
+    beta: npt.NDArray[np.float64]  # (count,) propagation constants
+    profiles: npt.NDArray[np.float64]  # (count, nodes) unit-norm field along the line
+
+
+def slab_modes(
+    sim: ElectricWave,
+    permittivity: cpt.NDArray | npt.NDArray,
+    frequency: float,
+    *,
+    axis: int,
+    count: int = 1,
+) -> SlabModes:
+    """Guided E_z modes of the line `permittivity` samples, exact for `space_order` 2.
+
+    Args:
+        sim: the simulation whose spacing and permeability the line shares.
+        permittivity: (nodes,) permittivity at consecutive nodes along `axis`, the field
+            held at zero past either end.
+        frequency: the frequency the modes propagate at.
+        axis: the grid axis the line runs along.
+        count: how many guided modes to return.
+
+    Returns:
+        the `count` modes of largest `beta`, each profile of unit Euclidean norm with
+        its leading lobe positive, so that it serves as the line source and as the
+        overlap row unchanged.
+    """
+    eps = cp.asnumpy(permittivity).astype(np.float64)
+    if eps.ndim != 1 or eps.size < 3 or not np.all(eps > 0.0):
+        raise ValueError(f"permittivity must be a positive line of 3+ nodes: {eps}")
+    if not (frequency > 0.0):
+        raise ValueError(f"frequency must be positive: {frequency}")
+    if axis not in range(sim.ndim):
+        raise ValueError(f"axis must be one of the {sim.ndim} grid axes: {axis}")
+    if count not in range(1, eps.size + 1):
+        raise ValueError(f"count must lie in 1 .. {eps.size}: {count}")
+
+    # beta**2 m = m'' + omega**2 mu eps m, the second difference of the scheme
+    k2 = (2.0 * np.pi * frequency) ** 2 * sim.permeability * eps
+    off = np.full(eps.size - 1, 1.0 / sim.dx[axis] ** 2)
+    operator = np.diag(k2 - 2.0 / sim.dx[axis] ** 2) + np.diag(off, 1) + np.diag(off, -1)
+    values, vectors = np.linalg.eigh(operator)
+    values, vectors = values[::-1][:count], vectors[:, ::-1][:, :count].T
+
+    # a mode decaying into both claddings has beta above either cladding's wavenumber
+    if values[-1] <= max(k2[0], k2[-1]):
+        raise ValueError(f"the line guides fewer than {count} modes at {frequency}")
+    # the first node past half the peak, not the peak: an odd mode has two of those
+    lobes = np.abs(vectors) > 0.5 * np.abs(vectors).max(axis=1, keepdims=True)
+    signs = np.sign(vectors[np.arange(count), lobes.argmax(axis=1)])
+    return SlabModes(np.sqrt(values), vectors * signs[:, None])
 
 
 # ---------------------------------- the vector case ----------------------------------

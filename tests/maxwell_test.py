@@ -16,6 +16,10 @@ a cavity mode stays an eigenvector of the discrete operator. One step on it conv
 the exact curl curl at the stencil's own order; a wall graded down near the boundary
 does not converge there at all.
 
+A guided mode is pinned twice: `slab_modes` against the transcendental dispersion
+relation and field of the symmetric slab, and in a run, where the line source it builds
+must launch the mode alone and carry it down a straight guide without loss.
+
 Independently of all of that, fdtdx (Mahlau et al. 2026, an E/H Yee leapfrog) is rerun
 here from its stored probe traces: eliminating H from Yee's scheme gives exactly this
 curl-curl recursion, so wherever both codes place the permittivity alike the traces
@@ -65,6 +69,7 @@ if HAS_CUDA:
         Neumann,
         Pml,
         Traction,
+        pad_for_sponge,
         sponge,
     )
     from cuwave.geometry import box
@@ -73,6 +78,7 @@ if HAS_CUDA:
         ElectricWave,
         MagneticWave,
         interpolate,
+        slab_modes,
     )
     from cuwave.scalar import AcousticWave
     from cuwave.sensitivity import (
@@ -81,9 +87,15 @@ if HAS_CUDA:
         spectral_sensitivity,
         superposition_sensitivity,
     )
-    from cuwave.signals import ricker
+    from cuwave.signals import gabor, ricker
     from cuwave.stencils import staggered_weights
-    from cuwave.utils import Sensors, intensity, point_source, response_gradient
+    from cuwave.utils import (
+        Sensors,
+        intensity,
+        mode_overlap,
+        point_source,
+        response_gradient,
+    )
     from cuwave.wave import (
         Source,
         compile_kernels,
@@ -297,16 +309,139 @@ class TransmissionTest(unittest.TestCase):
         self.assertLess(worst(fine), 0.25 * worst(coarse))
 
 
+# ---------------------------------- waveguide modes ----------------------------------
+SLAB = 0.3  # core width in wavelengths, which guides one even and one odd mode
+
+
+def _slab(spacing, core=EPS2, cladding=2.25, frequency=1.0):
+    """Nodal permittivity across a symmetric slab, both interfaces midway between nodes."""
+    y = (np.arange(int(3.0 / spacing)) - (int(3.0 / spacing) - 1) / 2) * spacing
+    return y, np.where(np.abs(y) < 0.5 * SLAB, core, cladding)
+
+
+def _analytic_mode(y, order, core=EPS2, cladding=2.25, frequency=1.0):
+    """Propagation constant and unit-norm field of slab mode `order` (0 even, 1 odd)."""
+    k0 = 2.0 * np.pi * frequency
+    v = k0 * math.sqrt(core - cladding)
+    trig = (np.cos, np.sin)[order]
+
+    def residual(kappa):
+        if order == 0:
+            return kappa * math.tan(0.5 * kappa * SLAB) - math.sqrt(v**2 - kappa**2)
+        return -kappa / math.tan(0.5 * kappa * SLAB) - math.sqrt(v**2 - kappa**2)
+
+    low, high = order * math.pi / SLAB + 1e-12, min((order + 1) * math.pi / SLAB, v)
+    for _ in range(200):
+        mid = 0.5 * (low + high)
+        low, high = (mid, high) if residual(mid) < 0.0 else (low, mid)
+    kappa = 0.5 * (low + high)
+    gamma = math.sqrt(v**2 - kappa**2)
+    edge = trig(0.5 * kappa * SLAB)
+    outside = np.sign(y) ** order * edge * np.exp(-gamma * (np.abs(y) - 0.5 * SLAB))
+    field = np.where(np.abs(y) < 0.5 * SLAB, trig(kappa * y), outside)
+    return math.sqrt(k0**2 * core - kappa**2), field / np.linalg.norm(field)
+
+
+def _line_sim(spacing):
+    return ElectricWave(
+        (8, 8),
+        (spacing, spacing),
+        1,
+        0.1 * spacing,
+        THREADS[2],
+        precision="float64",
+        permittivity1=2.25,
+        permittivity2=EPS2,
+    )
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class SlabModeTest(unittest.TestCase):
+    def test_both_modes_match_the_slab_dispersion_relation(self):
+        spacing = SLAB / 60
+        y, eps = _slab(spacing)
+        modes = slab_modes(_line_sim(spacing), eps, 1.0, axis=1, count=2)
+        for order in (0, 1):
+            beta, field = _analytic_mode(y, order)
+            self.assertAlmostEqual(modes.beta[order] / beta, 1.0, delta=5e-4)
+            self.assertGreater(abs(modes.profiles[order] @ field), 1.0 - 1e-6)
+
+    def test_the_error_falls_at_second_order(self):
+        def error(spacing):
+            y, eps = _slab(spacing)
+            beta = slab_modes(_line_sim(spacing), eps, 1.0, axis=1, count=2).beta
+            return [abs(beta[k] / _analytic_mode(y, k)[0] - 1.0) for k in (0, 1)]
+
+        for coarse, fine in zip(error(SLAB / 30), error(SLAB / 60)):
+            self.assertGreater(coarse / fine, 3.5)
+
+    def test_the_leading_lobe_is_positive(self):
+        spacing = SLAB / 20
+        _, eps = _slab(spacing)
+        profiles = slab_modes(_line_sim(spacing), eps, 1.0, axis=0, count=2).profiles
+        for profile in profiles:
+            lobe = np.abs(profile) > 0.5 * np.abs(profile).max()
+            self.assertGreater(profile[lobe.argmax()], 0.0)
+
+    def test_it_refuses_a_mode_the_slab_does_not_guide(self):
+        spacing = SLAB / 20
+        _, eps = _slab(spacing)
+        with self.assertRaises(ValueError):
+            slab_modes(_line_sim(spacing), eps, 1.0, axis=1, count=3)
+
+
+@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+class GuideTest(unittest.TestCase):
+    def test_a_line_source_launches_the_mode_down_a_straight_guide(self):
+        dx = (1.0 / (INDEX * 20),) * 2
+        resolution = (int(6.0 / dx[0]) + 3, int(3.0 / dx[1]) + 3)
+        Nx, pad, origin, _ = pad_for_sponge(resolution, dx, 0.5)
+        dt = 0.95 * stable_dt(dx, 1.0 / 1.5)
+        sim = ElectricWave(
+            Nx,
+            dx,
+            math.ceil(40.0 / dt),
+            dt,
+            THREADS[2],
+            precision="float32",
+            permittivity1=2.25,
+            permittivity2=EPS2,
+            pml=Pml(pad, 1.0 / 1.5),
+        )
+        coords = grid_coords(Nx, dx, dtype=sim.dtype)
+        center = origin[1] + 1.5
+        guide = (cp.abs(coords[1] - center) < 0.5 * SLAB).astype(sim.dtype)
+        node = lambda x: round((origin[0] + x) / dx[0]) + 1
+        rows = 1 + np.arange(round((center - 1.0) / dx[1]), round((center + 1.0) / dx[1]))
+        eps = sim.permittivity(guide)[node(1.0), rows]
+        profile = slab_modes(sim, eps, 1.0, axis=1).profiles[0]
+
+        t = np.arange(sim.N) * dt
+        signal = np.outer(gabor(t, 1.0, 1.0, 4.0), profile)
+        y = (rows - 1) * dx[1]
+        source = point_source(sim, [((node(1.0) - 1) * dx[0], yk) for yk in y], signal)
+        columns = np.repeat([node(3.0), node(5.0)], rows.size)
+        sensors = cp.asarray([columns, np.tile(rows, 2)], dtype=cp.int32)
+        record = simulate(sim, source, guide, sensors=sensors)[1].get()
+        spectrum = (np.exp(-2j * np.pi * t) @ record).reshape(2, rows.size)
+
+        modal = np.abs(spectrum @ profile) ** 2
+        total = np.sum(np.abs(spectrum) ** 2, axis=1)
+        for x, purity in zip((3.0, 5.0), modal / total):
+            self.assertGreater(purity, 0.99, msg=f"at x = {x}")
+        self.assertAlmostEqual(modal[1] / modal[0], 1.0, delta=0.01)
+
+
 # ------------------------------------- gradients -------------------------------------
 @unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class GradientTest(unittest.TestCase):
     frequencies = (6.0, 10.0)
 
-    def _check(self, cls, space_order, adjoint=None, tolerance=1e-4):
+    def _check(self, cls, space_order, adjoint=None, tolerance=1e-4, factory=None):
         adjoint = sensitivity if adjoint is None else adjoint
         sim = _sim(cls, (48, 48), space_order=space_order)
         source, sensors, indicator = _problem(sim)
-        objective = intensity(sim, self.frequencies)
+        objective = (factory or intensity)(sim, self.frequencies)
         rng = np.random.default_rng(5)
         nodes = [
             (int(rng.integers(12, 34)), int(rng.integers(12, 34))) for _ in range(4)
@@ -341,6 +476,16 @@ class GradientTest(unittest.TestCase):
     def test_the_reverse_march_reproduces_the_stored_gradient(self):
         self._check(ElectricWave, 2, adjoint=reconstruction_sensitivity)
         self._check(MagneticWave, 2, adjoint=reconstruction_sensitivity)
+
+    def test_a_mode_overlap_matches_finite_differences(self):
+        rng = np.random.default_rng(7)
+        modes = rng.standard_normal((2, 3))
+
+        def factory(sim, frequencies):
+            reference = 0.1 * rng.standard_normal((sim.N, 3))
+            return mode_overlap(sim, frequencies, modes, reference=reference)
+
+        self._check(ElectricWave, 2, factory=factory)
 
 
 # ---------------------------------- the vector case ----------------------------------

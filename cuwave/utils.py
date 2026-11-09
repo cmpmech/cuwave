@@ -551,6 +551,50 @@ def intensity(
     return objective
 
 
+def mode_overlap(
+    sim: Simulation,
+    frequencies: npt.ArrayLike,
+    modes: cpt.NDArray | npt.ArrayLike,
+    weights: cpt.NDArray | npt.ArrayLike | None = None,
+    *,
+    reference: cpt.NDArray | None = None,
+) -> Callable:
+    """Objective factory: `intensity` of the modal amplitudes `modes @ (u - reference)`.
+
+    Args:
+        sim: the simulation the record comes from.
+        frequencies: one frequency, or several scored by the same run.
+        modes: (num_modes, num_sensors) rows, each a `slab_modes` profile on the
+            sensors of its port and zero elsewhere.
+        weights: (num_frequencies, num_modes), or anything broadcasting to it, so each
+            mode is scored at its own frequencies. Defaults to 1.
+        reference: (N, num_sensors) record subtracted first: the incident field of a
+            run without the device, where a port scores what the device reflects.
+
+    Returns:
+        the objective `sensitivity` takes. The projection is linear, so its adjoint
+        is `modes` applied from the other side.
+    """
+    project = cp.asarray(modes, dtype=sim.dtype)
+    if project.ndim != 2:
+        raise ValueError(f"modes must be (num_modes, num_sensors): {project.shape}")
+    offset = 0.0
+    if reference is not None:
+        offset = cp.asarray(reference, dtype=sim.dtype)
+        if offset.shape != (sim.N, project.shape[1]):
+            raise ValueError(
+                f"reference must be (N, num_sensors) = {(sim.N, project.shape[1])}: "
+                f"{offset.shape}"
+            )
+    amplitudes = intensity(sim, frequencies, weights)
+
+    def objective(traces):
+        cost, derivative = amplitudes((traces - offset) @ project.T)
+        return cost, derivative @ project
+
+    return objective
+
+
 # ---------------------------------- time dispersion ----------------------------------
 def _warn_low_order(sim: Simulation) -> None:
     """Warn where removing the time error costs accuracy: order 2 cancels it in space."""
