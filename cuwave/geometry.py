@@ -7,10 +7,10 @@ accumulate into: it is created when omitted
 import math
 from collections.abc import Sequence
 
-import cupy as cp
-import cupy.typing as cpt
 import numpy as np
 import numpy.typing as npt
+
+from .backend import cp, cpt
 
 
 # -------------------------------------- helpers --------------------------------------

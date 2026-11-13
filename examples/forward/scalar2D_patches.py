@@ -1,10 +1,10 @@
 import math
 import time
 
-import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
+from cuwave.backend import cp
 from cuwave.geometry import circle
 from cuwave.scalar import ScalarWave
 from cuwave.signals import sineburst
@@ -83,10 +83,10 @@ print(f"elapsed time {toc - tic:.2f} s  ({(toc - tic) / N * 1e3:.4f} ms/step)")
 
 # ----------------------------------- postprocessing ----------------------------------
 interior = (slice(1, Nx[0] - 1), slice(1, Nx[1] - 1))
-u_np = u.get()[interior]  # the ghost rows carry the box wall's mirror copy
+u_np = cp.asnumpy(u)[interior]  # the ghost rows carry the box wall's mirror copy
 scale = float(np.max(np.abs(u_np)))
 
-tiles = domain_tiles(sim, domain_cells(sim)).get()
+tiles = cp.asnumpy(domain_tiles(sim, domain_cells(sim)))
 grid = [-(-n // t) for n, t in zip(sim.Nx_padded, THREADS)]
 launched = np.zeros(grid)
 launched[(tiles >> 10) & 1023, tiles & 1023] = 1

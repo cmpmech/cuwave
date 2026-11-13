@@ -18,12 +18,10 @@ import warnings
 from collections.abc import Callable
 from dataclasses import replace
 
-import cupy as cp
-import cupy.typing as cpt
-import cupyx.scipy.ndimage as ndi
 import numpy as np
 import numpy.typing as npt
 
+from .backend import ON_GPU, cp, cpt, ndi
 from .boundary import define_boundary, pml_nodes, require_off_held_walls
 from .decomposition import agree, decomposable, owned, replaying, undivided
 from .wave import (
@@ -674,7 +672,7 @@ def reconstruction_sensitivity(
     joined = cp.cuda.Event(disable_timing=True)
     # past L2 the two would evict each other's fields
     carried = U.nbytes + P.nbytes + sum(field.nbytes for field in grads.values())
-    overlap = carried <= cp.cuda.Device().attributes["L2CacheSize"]
+    overlap = ON_GPU and carried <= cp.cuda.Device().attributes["L2CacheSize"]
 
     # reverse step m on the side stream, beside adjoint step m + 1
     def backward(m, row, signal, source_rows, strip_rows=None):

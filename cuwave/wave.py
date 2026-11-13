@@ -15,11 +15,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import NamedTuple
 
-import cupy as cp
-import cupy.typing as cpt
 import numpy as np
 import numpy.typing as npt
 
+from .backend import ON_GPU, cp, cpt
 from .boundary import (
     Pml,
     canonical_boundary,
@@ -572,6 +571,10 @@ class Simulation:
         self.field_shape = (
             self.Nx_padded if self.ncomp == 1 else (self.ncomp, *self.Nx_padded)
         )
+        if self.devices is not None and not ON_GPU:
+            raise ValueError(
+                f"devices {self.devices} name GPUs, but cuwave runs on the CPU"
+            )
         # flatten_indices accumulates in int32, so the whole field has to address in it
         if self.devices is None and self.ncomp * self.comp_stride >= 2**31:
             raise ValueError(
@@ -913,7 +916,8 @@ def march(
 
     shapes = [(chunk + w.halo, *w.record.shape[1:]) for w in windows]
     nbytes = sum(int(np.prod(s)) * w.dtype.itemsize for s, w in zip(shapes, windows))
-    graphed = N >= 2 * size and nbytes <= cp.cuda.Device().attributes["L2CacheSize"]
+    graphed = ON_GPU and N >= 2 * size
+    graphed = graphed and nbytes <= cp.cuda.Device().attributes["L2CacheSize"]
     if not graphed and not any(w.converts for w in windows):
         for t in range(N):
             step(t, *(w.record for w in windows))
@@ -1149,7 +1153,7 @@ def simulate(
         for t in range(sim.N):
             step(t, *(w.record for w in windows))
             if t % record_every == 0:
-                snapshots.append(U[t % 2][interior].get())
+                snapshots.append(cp.asnumpy(U[t % 2][interior]))
 
     out = (U[(sim.N - 1) % 2][interior],)
     if sensors is not None:

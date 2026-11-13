@@ -41,28 +41,21 @@ from dataclasses import replace
 
 import numpy as np
 
-try:
-    import cupy as cp
-
-    HAS_CUDA = cp.cuda.runtime.getDeviceCount() > 0
-except Exception:  # cupy missing or no GPU
-    HAS_CUDA = False
-
-if HAS_CUDA:
-    from cuwave.boundary import (
-        Dirichlet,
-        Neumann,
-        Pml,
-        canonical_boundary,
-        define_boundary,
-        pad_for_sponge,
-        pml_nodes,
-        pml_profiles,
-        sponge,
-    )
-    from cuwave.scalar import ScalarWave
-    from cuwave.signals import ricker
-    from cuwave.wave import Source, compile_kernels, simulate, stable_dt
+from cuwave.backend import cp
+from cuwave.boundary import (
+    Dirichlet,
+    Neumann,
+    Pml,
+    canonical_boundary,
+    define_boundary,
+    pad_for_sponge,
+    pml_nodes,
+    pml_profiles,
+    sponge,
+)
+from cuwave.scalar import ScalarWave
+from cuwave.signals import ricker
+from cuwave.wave import Source, compile_kernels, simulate, stable_dt
 
 WAVESPEED = 1.0
 DENSITY = 1.0
@@ -105,7 +98,7 @@ def _run(sim, source_node, sensor_nodes, indicator=None, frequency=FREQUENCY):
     _, um = simulate(
         sim, _pulse(sim, source_node, frequency), indicator, sensors=sensors
     )
-    return um.get()
+    return cp.asnumpy(um)
 
 
 def _wall_slices(sim):
@@ -117,7 +110,6 @@ def _wall_slices(sim):
             yield tuple(sel)
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class MirrorOrderTest(unittest.TestCase):
     def _error(self, n, order, condition):
         # one step on a box mode, which the mirrored taps keep an eigenvector
@@ -154,7 +146,6 @@ class MirrorOrderTest(unittest.TestCase):
                 self.assertGreater(rate, order - 0.3, (order, condition))
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class ReflectionTest(unittest.TestCase):
     # 1D. The low wall is the only boundary either run can hear within NSTEPS
     NX, SOURCE, SENSOR, NSTEPS = 200, 40, 20, 250
@@ -185,7 +176,6 @@ class ReflectionTest(unittest.TestCase):
         self.assertLess(residual, 1e-9)
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class WallLayerTest(unittest.TestCase):
     NSTEPS = 400
 
@@ -222,7 +212,6 @@ class WallLayerTest(unittest.TestCase):
         self.assertGreater(ratio, 1e-3)
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class DispatchTest(unittest.TestCase):
     def test_canonical_boundary_expands_the_shorthands(self):
         self.assertEqual(canonical_boundary(None, 2), ((Neumann, Neumann),) * 2)
@@ -277,7 +266,6 @@ class DispatchTest(unittest.TestCase):
         self.assertLess(np.max(np.abs(mixed[:, 1] - neumann[:, 1])) / scale, 1e-12)
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class PadTest(unittest.TestCase):
     NX, DX, THICKNESS = (100, 80), (0.01, 0.01), 0.1
 
@@ -352,7 +340,6 @@ class _Echo:
         )[:, 0]
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class SpongeTest(_Echo, unittest.TestCase):
     def _field(self, width, beta=None, **kwargs):
         sim = _sim((40, 40), None, 1)
@@ -405,7 +392,6 @@ class SpongeTest(_Echo, unittest.TestCase):
 
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class PmlTest(_Echo, unittest.TestCase):
     def _layer(self, pad, layer):
         sim = _sim((self.NX + 2 * pad,) * 2, None, self.NSTEPS, precision="float32")
@@ -435,11 +421,11 @@ class PmlTest(_Echo, unittest.TestCase):
         interior[tuple(slice(1, n - 1) for n in sim.Nx)] = True
         outside = interior.copy()
         outside[region] = False
-        np.testing.assert_array_equal(pml_nodes(sim).get(), outside.get())
+        np.testing.assert_array_equal(cp.asnumpy(pml_nodes(sim)), cp.asnumpy(outside))
 
     def test_the_profiles_vanish_at_the_front_and_mirror_across_the_wall(self):
         sim = replace(_sim((40, 40), None, 1), pml=Pml(6, WAVESPEED))
-        an, bn, ah, bh = pml_profiles(sim)[0].get()
+        an, bn, ah, bh = cp.asnumpy(pml_profiles(sim)[0])
         # the front node 6 and every node past it are undamped
         self.assertTrue(np.all(an[6:34] == 0.0) and np.all(bn[6:34] == 1.0))
         self.assertTrue(np.all(an[1:6] < 0.0))

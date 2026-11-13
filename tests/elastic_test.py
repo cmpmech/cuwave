@@ -51,40 +51,33 @@ from unittest import mock
 
 import numpy as np
 
-try:
-    import cupy as cp
-
-    HAS_CUDA = cp.cuda.runtime.getDeviceCount() > 0
-except Exception:
-    HAS_CUDA = False
-
-if HAS_CUDA:
-    from cuwave import elastic
-    from cuwave.boundary import Clamped, Pml, Traction, pad_for_sponge, sponge
-    from cuwave.elastic import ElasticWave, Relaxation, zener
-    from cuwave.scalar import ScalarWave
-    from cuwave.sensitivity import (
-        l2_misfit,
-        reconstruction_nodes,
-        reconstruction_sensitivity,
-        sensitivity,
-        source_sensitivity,
-        superposition_sensitivity,
-    )
-    from cuwave.signals import ricker
-    from cuwave.stencils import closure_reach, staggered_weights
-    from cuwave.utils import Sensors, point_source
-    from cuwave.wave import (
-        Source,
-        compile_kernels,
-        simulate,
-        stable_dt,
-        stable_timestep,
-    )
+from cuwave import elastic
+from cuwave.backend import ON_GPU, cp
+from cuwave.boundary import Clamped, Pml, Traction, pad_for_sponge, sponge
+from cuwave.elastic import ElasticWave, Relaxation, zener
+from cuwave.scalar import ScalarWave
+from cuwave.sensitivity import (
+    l2_misfit,
+    reconstruction_nodes,
+    reconstruction_sensitivity,
+    sensitivity,
+    source_sensitivity,
+    superposition_sensitivity,
+)
+from cuwave.signals import ricker
+from cuwave.stencils import closure_reach, staggered_weights
+from cuwave.utils import Sensors, point_source
+from cuwave.wave import (
+    Source,
+    compile_kernels,
+    simulate,
+    stable_dt,
+    stable_timestep,
+)
 
 CP, CS, RHO = 2.0, 1.0, 1.3
 THREADS = {1: (128,), 2: (8, 8), 3: (4, 4, 8)}
-RELAXATION = Relaxation(20.0, (2.0, 20.0), 6.0) if HAS_CUDA else None
+RELAXATION = Relaxation(20.0, (2.0, 20.0), 6.0)
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -130,13 +123,17 @@ def _operator(sim, indicator):
     """The mass weighted spatial operator on the free unknowns, an exact transpose."""
     mat = sim.build_materials(indicator)
     step = sim.define_step(compile_kernels(sim), mat)
-    every = cp.arange(sim.ncomp * sim.comp_stride, dtype=cp.int32)
-    minv = sim.point_inverse_inertia(mat["gamma"], every).reshape(sim.field_shape)
-    mass = cp.where(minv > 0, 1.0 / cp.maximum(minv, 1e-300), 0.0)
     slices = [
         (c, *(slice(1, n - 1 - (d == c)) for d, n in enumerate(sim.Nx)))
         for c in range(sim.ncomp)
     ]
+    # the free points only: a point on the last plane has its partner past the array
+    every = cp.arange(sim.ncomp * sim.comp_stride, dtype=cp.int32)
+    free = cp.concatenate([every.reshape(sim.field_shape)[sl].ravel() for sl in slices])
+    minv = cp.zeros(every.size, dtype=sim.dtype)
+    minv[free] = sim.point_inverse_inertia(mat["gamma"], free)
+    minv = minv.reshape(sim.field_shape)
+    mass = cp.where(minv > 0, 1.0 / cp.maximum(minv, 1e-300), 0.0)
 
     def mask(x):
         out = cp.zeros_like(x)
@@ -301,7 +298,6 @@ def _mode_error(order, n, wall):
 
 
 # -------------------------------- stencil and operator -------------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class StencilTest(unittest.TestCase):
     def test_the_weights_are_the_staggered_taylor_ones(self):
         np.testing.assert_allclose(staggered_weights(1), [1.0])
@@ -320,7 +316,6 @@ class StencilTest(unittest.TestCase):
             self.assertGreater(np.log2(errors[0] / errors[1]), 2 * r - 0.5)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class OperatorTest(unittest.TestCase):
     def test_the_stencil_converges_at_its_order(self):
         for order in (2, 4, 6):
@@ -391,6 +386,7 @@ class OperatorTest(unittest.TestCase):
             float(cp.linalg.norm(apply(masked))), 1e-3 * float(cp.linalg.norm(masked))
         )
 
+    @unittest.skipUnless(ON_GPU, "times the GPU")
     def test_the_cost_stays_flat_in_the_order(self):
         import time
 
@@ -413,7 +409,6 @@ class OperatorTest(unittest.TestCase):
 
 
 # ---------------------------------- against the scalar -------------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class OneDimensionTest(unittest.TestCase):
     """On a uniform medium the 1D staggered scheme is the scalar stencil on the offset
     grid, so the two must agree to round-off while no reflection is in flight."""
@@ -455,7 +450,6 @@ class OneDimensionTest(unittest.TestCase):
 
 
 # ------------------------------------- sensitivity -----------------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class GradientTest(unittest.TestCase):
     def _check(self, sim, nodes, tol=1e-4):
         source, sensors, indicator, objective = _problem(sim)
@@ -533,7 +527,6 @@ class GradientTest(unittest.TestCase):
             self.assertLess(abs(got - want), 1e-4 * abs(want))
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class VariantTest(unittest.TestCase):
     def _reference(self, sim):
         """The solver arguments in call order, plus the exact cost and gradient."""
@@ -601,7 +594,7 @@ class VariantTest(unittest.TestCase):
 
 
 # ------------------------------- transducers and validation --------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+@unittest.skipUnless(ON_GPU, "needs a CUDA device")
 class FusedTest(unittest.TestCase):
     def test_the_fused_step_is_the_pair_bit_for_bit(self):
         rng = np.random.default_rng(5)
@@ -667,7 +660,6 @@ def _assert_fused_adjoint(test, sim, gamma, rng, fused):
     test.assertLess(error, 1e-13)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class AdjointGradientTest(unittest.TestCase):
     def test_the_fused_adjoint_step_is_the_step_and_the_gradient_kernel(self):
         rng = np.random.default_rng(6)
@@ -681,7 +673,7 @@ class AdjointGradientTest(unittest.TestCase):
             ((13, 21, 40), 2, Clamped, None, True),
         )
         for Nx, order, boundary, extra, tiers in cases:
-            for fused in (False, True) if tiers else (False,):
+            for fused in (False, True) if tiers and ON_GPU else (False,):
                 with self.subTest(Nx=Nx, order=order, extra=extra, fused=fused):
                     sim = _sim(Nx, 1, "float64", order, boundary=boundary)
                     gamma = cp.asarray(0.4 + rng.random(sim.Nx_padded), dtype=sim.dtype)
@@ -713,7 +705,7 @@ def _blocked_runs(sim, seed, blocks=None, waves=(99, 99)):
     return blocked, plain
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+@unittest.skipUnless(ON_GPU, "needs a CUDA device")
 class BlockedTest(unittest.TestCase):
     def _assert_bitwise(self, blocked, plain):
         self.assertGreater(float(cp.abs(plain[0]).max()), 0.0)
@@ -768,7 +760,6 @@ class BlockedTest(unittest.TestCase):
         self._assert_bitwise(*_blocked_runs(sim, 2, ((((32, 32), 32, 4),),) * 2))
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class PmlTest(unittest.TestCase):
     def test_a_long_run_decays_with_a_free_surface_crossing_the_layer(self):
         dx = (1.0 / 100,) * 2
@@ -807,7 +798,6 @@ class PmlTest(unittest.TestCase):
         _sim((40, 40), boundary=free_top, pml=layer)
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class TransducerTest(unittest.TestCase):
     def test_a_directed_receiver_scatters_as_it_gathers(self):
         sim = _sim((26, 26), N=20)
@@ -869,7 +859,6 @@ class TransducerTest(unittest.TestCase):
                 self.assertLess(abs(found / undamped - expected), 1e-9 * expected)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class TimestepTest(unittest.TestCase):
     def test_the_measured_timestep_agrees_with_the_cheap_bound_when_uniform(self):
         for order in (2, 4):
@@ -900,7 +889,6 @@ class TimestepTest(unittest.TestCase):
         self.assertGreater(ratios[4], 0.3)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class ValidationTest(unittest.TestCase):
     def test_it_rejects_a_missing_material(self):
         with self.assertRaises(ValueError):
@@ -952,14 +940,13 @@ def _line(quality, frequency):
     source = point_source(sim, [[0.6]], ricker(t, 1.0, frequency))
     sensors = cp.asarray([[round(1.6 / dx) + 1, round(2.6 / dx) + 1]], dtype=cp.int32)
     gamma = cp.ones(sim.Nx_padded, dtype=sim.dtype)
-    traces = simulate(sim, source, gamma, sensors=sensors)[1].get()
+    traces = cp.asnumpy(simulate(sim, source, gamma, sensors=sensors)[1])
     # flat over the pulse, zero before the wall echoes arrive 1.2 behind it
     arrival = np.array([1.0, 2.0]) + 1.0 / frequency
     ramp = np.clip((0.35 - np.abs(t[:, None] - arrival)) / 0.1, 0.0, 1.0)
     return traces * (0.5 - 0.5 * np.cos(np.pi * ramp)), sim
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class RelaxationTest(unittest.TestCase):
     def test_a_relaxed_line_holds_its_quality_and_its_reference_speed(self):
         traces, sim = _line(20.0, 12.0)

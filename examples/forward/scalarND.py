@@ -1,10 +1,10 @@
 import math
 import time
 
-import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
+from cuwave.backend import cp
 from cuwave.scalar import ScalarWave
 from cuwave.signals import sineburst
 from cuwave.wave import Source, simulate, stable_dt
@@ -70,7 +70,7 @@ toc = time.time()
 print(f"elapsed time {toc - tic:.2f} s  ({(toc - tic) / N * 1e3:.4f} ms/step)")
 
 # ----------------------------------- postprocessing ----------------------------------
-u_np = u.get()
+u_np = cp.asnumpy(u)
 if DIM == 3:
     u_np = u_np[Nx[0] // 2]  # source plane cuts sphere at its equator
 scale = float(np.max(np.abs(u_np)))

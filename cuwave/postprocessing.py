@@ -8,13 +8,14 @@ sized in nodes, so the same call gives the same figure at any resolution and any
 
 import io
 
-import cupy.typing as cpt
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from PIL import Image
+
+from .backend import cpt
 
 
 # -------------------------------------- helpers --------------------------------------

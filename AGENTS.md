@@ -5,7 +5,8 @@ This file provides guidance to coding agents (Claude Code, Codex, etc.) when wor
 ## What this is
 
 CuWave is a differentiable finite-difference wave solver on one GPU or several. The forward solve is
-CuPy + hand-written CUDA (`cp.RawModule`); the adjoint is hand-derived, not autodiff. Torch
+CuPy + hand-written CUDA (`cp.RawModule`); the adjoint is hand-derived, not autodiff. Without
+a GPU the same kernels run on the CPU (`cpu.py`, see *The CPU fallback* below). Torch
 appears only in `cuwave/nn.py`, matplotlib only in `cuwave/postprocessing.py` and the
 drivers. Applications: full waveform inversion and transient acoustic topology
 optimization.
@@ -22,9 +23,11 @@ python -m pytest \
 python examples/fwi/scalar2D_fwi_adam.py  # drivers are run directly
 ```
 
-- Tests are `unittest` classes run under pytest. Everything CUDA is behind a
-  `HAS_CUDA` guard and everything torch behind `@unittest.skipUnless`, so a run on a
-  machine without a GPU silently skips rather than fails — check the pass/skip counts.
+- Tests are `unittest` classes run under pytest. They take `cp` from `cuwave.backend`, so
+  on a machine without a GPU (or under `CUWAVE_DEVICE=cpu`) the suite runs on the CPU;
+  the GPU-only classes (blocked, fused, streamed, marched, folded steps, several devices)
+  carry `skipUnless(ON_GPU)` and torch `skipUnless(HAS_TORCH)`, so check the pass/skip
+  counts. A CPU run needs a C++ compiler with OpenMP and scipy, and takes far longer.
 - `ruff` is not a project dependency; run `ruff check` from wherever it is installed
   (88 columns). Do not run `ruff format`: the house-style banners sit at column 0 even
   inside a block, which the formatter would indent. `.cu` files are clang-format LLVM
@@ -233,6 +236,16 @@ including on the Ilmenau A100 nodes (4 per node, 8 on makalu88). Per-GPU input a
 pieces, and a multi-node exchange, are not implemented yet; both are needed before a run
 spanning nodes (e.g. 12 H200s, where one 4500³ field is about 365 GB).
 
+**The CPU fallback.** `backend.py` picks the array module once, at import: cupy where it
+finds a device, else `cpu.py` (numpy, plus `asnumpy`, no-op streams and events, and a
+`RawModule`); `CUWAVE_DEVICE=cpu|gpu` overrides. Every module imports `cp`, `cpt`, `ndi`
+and `ON_GPU` from `backend`, never cupy. `cpu.RawModule` prepends `kernels/cpu.hpp` (the CUDA
+builtins as C++: thread-local `threadIdx`, blocks across OpenMP threads, a block's threads
+in turn, a warp of one thread, `atomicAdd` an omp atomic) and compiles the unchanged `.cu`
+with `CXX` and `CUWAVE_CXXFLAGS`, cached in `~/.cache/cuwave`. Shared memory and block
+barriers do not compile there, so every fast path (blocked, fused, streamed, marched,
+folded refill, graphs, the side stream) declines on `not ON_GPU` and `devices` raises.
+
 ### Adjoint sensitivities (`sensitivity.py` + `kernels/<equation>_sensitivity.cu`)
 
 Four variants, identical signature and return (the spectral one adds `frequencies` and an
@@ -341,6 +354,10 @@ the `docs/cuda_*.md` pages are the only ones that document arguments.
   (a traction wall behind the layer grows a surface wave), and `AnisotropicElasticWave`
   refuses a `C` with a backward wave along a lined axis (`backward_axes`, Becache 2003).
 
+- **A GPU-only path gates on `ON_GPU`.** Anything reading `cp.cuda.Device().attributes`,
+  launching with `shared_mem`, capturing a graph or using `__shared__`/`__syncthreads` has
+  no CPU counterpart: `cpu.py` defines no `Device`, so a missed gate fails loudly there.
+  `cp.asnumpy(x)`, not `x.get()`, which numpy arrays lack.
 - **dtype is unchecked all the way to the kernel.** `cp.RawModule` takes raw pointers, so a
   float64 `Source.signal` in a float32 sim is read as garbage and only NaNs a few hundred
   steps later. Pin `dtype=sim.dtype` on every array handed to a kernel; note

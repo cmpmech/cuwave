@@ -1,11 +1,10 @@
 import math
 import time
 
-import cupy as cp
-import cupy.typing as cpt
 import matplotlib.pyplot as plt
 import numpy as np
 
+from cuwave.backend import cp, cpt
 from cuwave.evals import l2_error
 from cuwave.geometry import circle
 from cuwave.scalar import ScalarWave

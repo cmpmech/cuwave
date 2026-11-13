@@ -53,57 +53,50 @@ from unittest import mock
 
 import numpy as np
 
-try:
-    import cupy as cp
-
-    HAS_CUDA = cp.cuda.runtime.getDeviceCount() > 0
-except Exception:
-    HAS_CUDA = False
-
-if HAS_CUDA:
-    from cuwave import maxwell
-    from cuwave.boundary import (
-        Conductor,
-        Dirichlet,
-        Magnetic,
-        Neumann,
-        Pml,
-        Traction,
-        pad_for_sponge,
-        sponge,
-    )
-    from cuwave.geometry import box
-    from cuwave.maxwell import (
-        DielectricWave,
-        ElectricWave,
-        MagneticWave,
-        interpolate,
-        slab_modes,
-    )
-    from cuwave.scalar import AcousticWave
-    from cuwave.sensitivity import (
-        reconstruction_sensitivity,
-        sensitivity,
-        spectral_sensitivity,
-        superposition_sensitivity,
-    )
-    from cuwave.signals import gabor, ricker
-    from cuwave.stencils import staggered_weights
-    from cuwave.utils import (
-        Sensors,
-        intensity,
-        mode_overlap,
-        point_source,
-        response_gradient,
-    )
-    from cuwave.wave import (
-        Source,
-        compile_kernels,
-        flatten_indices,
-        grid_coords,
-        simulate,
-        stable_dt,
-    )
+from cuwave import maxwell
+from cuwave.backend import ON_GPU, cp
+from cuwave.boundary import (
+    Conductor,
+    Dirichlet,
+    Magnetic,
+    Neumann,
+    Pml,
+    Traction,
+    pad_for_sponge,
+    sponge,
+)
+from cuwave.geometry import box
+from cuwave.maxwell import (
+    DielectricWave,
+    ElectricWave,
+    MagneticWave,
+    interpolate,
+    slab_modes,
+)
+from cuwave.scalar import AcousticWave
+from cuwave.sensitivity import (
+    reconstruction_sensitivity,
+    sensitivity,
+    spectral_sensitivity,
+    superposition_sensitivity,
+)
+from cuwave.signals import gabor, ricker
+from cuwave.stencils import staggered_weights
+from cuwave.utils import (
+    Sensors,
+    intensity,
+    mode_overlap,
+    point_source,
+    response_gradient,
+)
+from cuwave.wave import (
+    Source,
+    compile_kernels,
+    flatten_indices,
+    grid_coords,
+    simulate,
+    stable_dt,
+)
 
 REFERENCE = Path(__file__).parent / "reference"
 INDEX = 3.48
@@ -112,26 +105,25 @@ THREADS = {1: (128,), 2: (8, 8)}
 VECTOR_THREADS = {2: (8, 8), 3: (4, 4, 8)}
 
 
-if HAS_CUDA:
 
-    class MagnetodielectricWave(DielectricWave):
-        """Designs the permeability alongside the permittivity, to reach `USE_MAGNETIC`."""
+class MagnetodielectricWave(DielectricWave):
+    """Designs the permeability alongside the permittivity, to reach `USE_MAGNETIC`."""
 
-        magnetic = True
-        permeability2: float = 2.0
+    magnetic = True
+    permeability2: float = 2.0
 
-        def parametrization(self, indicator):
-            """Both materials interpolate, so both densities carry a design dependence."""
-            return (
-                interpolate(indicator, self.permittivity1, self.permittivity2),
-                1.0 / interpolate(indicator, self.permeability, self.permeability2),
-            )
+    def parametrization(self, indicator):
+        """Both materials interpolate, so both densities carry a design dependence."""
+        return (
+            interpolate(indicator, self.permittivity1, self.permittivity2),
+            1.0 / interpolate(indicator, self.permeability, self.permeability2),
+        )
 
-        def parametrization_jacobian(self, indicator):
-            """The permittivity is affine in gamma; the inverse permeability is not."""
-            contrast = self.permeability2 - self.permeability
-            mu = interpolate(indicator, self.permeability, self.permeability2)
-            return self.permittivity2 - self.permittivity1, -contrast / mu**2
+    def parametrization_jacobian(self, indicator):
+        """The permittivity is affine in gamma; the inverse permeability is not."""
+        contrast = self.permeability2 - self.permeability
+        mu = interpolate(indicator, self.permeability, self.permeability2)
+        return self.permittivity2 - self.permittivity1, -contrast / mu**2
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -202,8 +194,8 @@ def _slab_transmission(space_order, points_per_wavelength, frequencies):
     t = np.arange(N) * dt
     source = point_source(sim, [(x_src,)], ricker(t, 1.0, 1.2))
     probe = cp.asarray([[round(x_probe / dx[0]) + 1]], dtype=cp.int32)
-    reference = simulate(sim, source, vacuum, sensors=probe)[1].get()[:, 0]
-    through = simulate(sim, source, slab, sensors=probe)[1].get()[:, 0]
+    reference = cp.asnumpy(simulate(sim, source, vacuum, sensors=probe)[1])[:, 0]
+    through = cp.asnumpy(simulate(sim, source, slab, sensors=probe)[1])[:, 0]
 
     basis = np.exp(-2j * np.pi * np.outer(frequencies, t))
     measured = np.abs((basis @ through) / (basis @ reference)) ** 2
@@ -213,7 +205,6 @@ def _slab_transmission(space_order, points_per_wavelength, frequencies):
 
 
 # --------------------------------- the two reductions --------------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class ReductionTest(unittest.TestCase):
     def test_it_is_the_acoustic_solver_under_the_change_of_variables(self):
         em = _sim(ElectricWave, (64, 64))
@@ -261,9 +252,8 @@ class ReductionTest(unittest.TestCase):
                 [[round(0.5 / dx[0]) + 1, round(0.7 / dx[0]) + 1]], dtype=cp.int32
             )
             field = cp.zeros(sim.Nx_padded, dtype=sim.dtype)
-            peaks = cp.argmax(
-                cp.abs(simulate(sim, source, field, sensors=probes)[1]), axis=0
-            ).get()
+            record = simulate(sim, source, field, sensors=probes)[1]
+            peaks = cp.asnumpy(cp.argmax(cp.abs(record), axis=0))
             speed = 0.2 / ((peaks[1] - peaks[0]) * dt)
             self.assertAlmostEqual(speed * index, 1.0, delta=0.01)
 
@@ -289,7 +279,6 @@ class ReductionTest(unittest.TestCase):
 
 
 # ------------------------------------ transmission -----------------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class TransmissionTest(unittest.TestCase):
     frequencies = (0.5, 1.0, 1.5, 2.0)
 
@@ -355,7 +344,6 @@ def _line_sim(spacing):
     )
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class SlabModeTest(unittest.TestCase):
     def test_both_modes_match_the_slab_dispersion_relation(self):
         spacing = SLAB / 60
@@ -390,7 +378,6 @@ class SlabModeTest(unittest.TestCase):
             slab_modes(_line_sim(spacing), eps, 1.0, axis=1, count=3)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class GuideTest(unittest.TestCase):
     def test_a_line_source_launches_the_mode_down_a_straight_guide(self):
         dx = (1.0 / (INDEX * 20),) * 2
@@ -422,7 +409,7 @@ class GuideTest(unittest.TestCase):
         source = point_source(sim, [((node(1.0) - 1) * dx[0], yk) for yk in y], signal)
         columns = np.repeat([node(3.0), node(5.0)], rows.size)
         sensors = cp.asarray([columns, np.tile(rows, 2)], dtype=cp.int32)
-        record = simulate(sim, source, guide, sensors=sensors)[1].get()
+        record = cp.asnumpy(simulate(sim, source, guide, sensors=sensors)[1])
         spectrum = (np.exp(-2j * np.pi * t) @ record).reshape(2, rows.size)
 
         modal = np.abs(spectrum @ profile) ** 2
@@ -433,7 +420,6 @@ class GuideTest(unittest.TestCase):
 
 
 # ------------------------------------- gradients -------------------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class GradientTest(unittest.TestCase):
     frequencies = (6.0, 10.0)
 
@@ -561,7 +547,6 @@ def _staggered_gradient(sim, phi):
     return out
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class VectorMaxwellTest(unittest.TestCase):
     grids = ((22, 26), (14, 16, 18))
     orders = (2, 4, 6)
@@ -768,7 +753,7 @@ def _blocked_runs(
     return blocked, plain
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+@unittest.skipUnless(ON_GPU, "needs a CUDA device")
 class BlockedTest(unittest.TestCase):
     def _assert_bitwise(self, blocked, plain):
         self.assertGreater(float(cp.abs(plain[0]).max()), 0.0)
@@ -842,7 +827,7 @@ class BlockedTest(unittest.TestCase):
             self.assertIsNone(wide.define_blocked_step(mat, once, None))
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+@unittest.skipUnless(ON_GPU, "needs a CUDA device")
 class FusedTest(unittest.TestCase):
     def test_the_fused_step_is_the_pair_bit_for_bit(self):
         rng = np.random.default_rng(5)
@@ -919,7 +904,6 @@ def _assert_fused_adjoint(test, sim, gamma, rng, fused):
     test.assertLess(error, 1e-13)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class AdjointGradientTest(unittest.TestCase):
     def test_the_fused_adjoint_step_is_the_step_and_the_gradient_kernel(self):
         rng = np.random.default_rng(6)
@@ -932,7 +916,7 @@ class AdjointGradientTest(unittest.TestCase):
             ((13, 21, 40), 2, Conductor, False, MagnetodielectricWave),
         )
         for (Nx, order, boundary, damped, cls), fused in itertools.product(
-            cases, (False, True)
+            cases, (False, True) if ON_GPU else (False,)
         ):
             with self.subTest(Nx=Nx, order=order, cls=cls.__name__, fused=fused):
                 dx = tuple(1.0 / (n - 3) for n in Nx)
@@ -955,7 +939,6 @@ class AdjointGradientTest(unittest.TestCase):
             lined.define_adjoint_gradient(None, mat, lined.gradient_fields(mat))
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class VectorGradientTest(unittest.TestCase):
     frequencies = (6.0, 10.0)
 
@@ -1026,7 +1009,6 @@ class VectorGradientTest(unittest.TestCase):
         self.assertGreater(cosine, 0.98)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class SpectralTest(unittest.TestCase):
     frequencies = (6.0, 10.0)
 
@@ -1119,7 +1101,7 @@ def _gap(name):
 
 
 @unittest.skipUnless(
-    HAS_CUDA and REFERENCE.is_dir(), "needs a CUDA device and tests/reference"
+    REFERENCE.is_dir(), "needs tests/reference"
 )
 class FdtdxReferenceTest(unittest.TestCase):
     def test_a_shared_placement_reproduces_fdtdx_at_round_off(self):

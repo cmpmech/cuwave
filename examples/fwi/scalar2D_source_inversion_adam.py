@@ -1,10 +1,10 @@
 import math
 import time
 
-import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
+from cuwave.backend import cp
 from cuwave.evals import l2_error
 from cuwave.optimization import Adam
 from cuwave.scalar import ScalarWave
@@ -127,8 +127,8 @@ print(f"\nrelative L2 error of the recovered signal: {l2_error(signal, truth):.4
 fig, axes = plt.subplots(1, 2, figsize=(6, 3))
 axes[0].semilogy(np.array(history) / history[0], "k")
 axes[0].set_title("normalized misfit")
-axes[1].plot(t, truth.get(), "k", label="truth")
-axes[1].plot(t, signal.get(), "r--", label="recovered")
+axes[1].plot(t, cp.asnumpy(truth), "k", label="truth")
+axes[1].plot(t, cp.asnumpy(signal), "r--", label="recovered")
 axes[1].set_xlim(0.0, SIGNAL_WINDOW)  # the window the design lives in
 axes[1].set_title("source signal")
 axes[1].legend()

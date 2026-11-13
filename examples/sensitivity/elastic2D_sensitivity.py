@@ -1,10 +1,10 @@
 import math
 import time
 
-import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
+from cuwave.backend import cp
 from cuwave.elastic import ElasticWave
 from cuwave.sensitivity import (
     l2_misfit,
@@ -112,7 +112,7 @@ print(f"{METHOD}: cost {cost:.4e}\t {N:d} steps: {elapsed:.2f}s{note}")
 
 # chain rule
 d_mass, d_stiff = sim.parametrization_jacobian(indicator)
-gradient = (d_mass * grads["mass"] + d_stiff * grads["stiff"]).get()
+gradient = cp.asnumpy((d_mass * grads["mass"] + d_stiff * grads["stiff"]))
 
 # ----------------------------------- postprocessing ----------------------------------
 interior = tuple(slice(1, n - 1) for n in Nx)
@@ -122,7 +122,7 @@ margin = round(MARGIN / dx[0])
 scale = 0.3 * np.max(np.abs(gradient[margin:-margin, margin:-margin])) + 1e-30
 
 fig, axes = plt.subplots(1, 2, figsize=(6, 3))
-axes[0].imshow(true_indicator[interior].get().T, origin="lower", cmap="binary_r")
+axes[0].imshow(cp.asnumpy(true_indicator[interior]).T, origin="lower", cmap="binary_r")
 axes[0].set_title("true density")
 axes[1].imshow(gradient.T, origin="lower", cmap="Spectral_r", vmin=-scale, vmax=scale)
 axes[1].set_title("sensitivity")

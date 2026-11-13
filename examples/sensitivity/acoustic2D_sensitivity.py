@@ -2,11 +2,11 @@ import math
 import time
 from collections.abc import Callable
 
-import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
 
+from cuwave.backend import cp
 from cuwave.scalar import AcousticWave
 from cuwave.sensitivity import sensitivity, superposition_sensitivity
 from cuwave.signals import sineburst
@@ -121,7 +121,7 @@ print(
 
 # chain rule
 d_mass, d_stiff = sim.parametrization_jacobian(indicator)
-gradient = (d_mass * grads["mass"] + d_stiff * grads["stiff"]).get()
+gradient = cp.asnumpy((d_mass * grads["mass"] + d_stiff * grads["stiff"]))
 
 # ----------------------------------- postprocessing ----------------------------------
 interior = tuple(slice(1, n - 1) for n in Nx)

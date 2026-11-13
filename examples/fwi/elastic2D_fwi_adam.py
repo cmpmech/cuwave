@@ -1,10 +1,10 @@
 import math
 import time
 
-import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
+from cuwave.backend import cp
 from cuwave.elastic import ElasticWave
 from cuwave.evals import f1_score, l2_error, pr_auc
 from cuwave.geometry import stacked_circles
@@ -170,7 +170,7 @@ print(
 
 # ----------------------------------- postprocessing ----------------------------------
 show_field = lambda ax, field: ax.imshow(
-    field[interior].get().T,
+    cp.asnumpy(field[interior]).T,
     origin="lower",
     extent=[0.0, Lx, 0.0, Ly],
     cmap="hot",

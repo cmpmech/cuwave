@@ -1,10 +1,10 @@
 import math
 import time
 
-import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
+from cuwave.backend import cp
 from cuwave.evals import f1_score, l2_error, pr_auc
 from cuwave.geometry import circle
 from cuwave.optimization import Adam

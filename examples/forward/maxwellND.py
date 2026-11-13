@@ -1,10 +1,10 @@
 import math
 import time
 
-import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
+from cuwave.backend import cp
 from cuwave.geometry import circles
 from cuwave.maxwell import DielectricWave
 from cuwave.signals import ricker
@@ -89,7 +89,7 @@ toc = time.time()
 print(f"elapsed time {toc - tic:.2f} s  ({(toc - tic) / N * 1e3:.4f} ms/step)")
 
 # ----------------------------------- postprocessing ----------------------------------
-u_np = u[POLARIZATION].get()  # component the current drives
+u_np = cp.asnumpy(u[POLARIZATION])  # component the current drives
 if DIM == 3:
     u_np = u_np[:, :, Nx[2] // 2]  # source plane, where the line looks like a sheet
 scale = 0.2 * float(np.max(np.abs(u_np)))

@@ -14,28 +14,21 @@ from dataclasses import replace
 
 import numpy as np
 
-try:
-    import cupy as cp
-
-    HAS_CUDA = cp.cuda.runtime.getDeviceCount() > 0
-except Exception:
-    HAS_CUDA = False
-
-if HAS_CUDA:
-    from cuwave.boundary import Clamped, Pml
-    from cuwave.elastic import ElasticWave, Relaxation
-    from cuwave.maxwell import DielectricWave
-    from cuwave.scalar import AcousticWave, ScalarWave
-    from cuwave.sensitivity import (
-        l2_misfit,
-        reconstruction_sensitivity,
-        sensitivity,
-        spectral_sensitivity,
-        superposition_sensitivity,
-    )
-    from cuwave.signals import ricker
-    from cuwave.utils import Sensors, measure, misfit_gradient, point_source
-    from cuwave.wave import simulate, stable_dt
+from cuwave.backend import ON_GPU, cp
+from cuwave.boundary import Clamped, Pml
+from cuwave.elastic import ElasticWave, Relaxation
+from cuwave.maxwell import DielectricWave
+from cuwave.scalar import AcousticWave, ScalarWave
+from cuwave.sensitivity import (
+    l2_misfit,
+    reconstruction_sensitivity,
+    sensitivity,
+    spectral_sensitivity,
+    superposition_sensitivity,
+)
+from cuwave.signals import ricker
+from cuwave.utils import Sensors, measure, misfit_gradient, point_source
+from cuwave.wave import simulate, stable_dt
 
 DEVICES = (0, 0, 0)
 
@@ -100,7 +93,7 @@ def _experiment(sim, direction):
     return source, sensors, gamma
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+@unittest.skipUnless(ON_GPU, "needs a CUDA device")
 class ForwardTest(unittest.TestCase):
     def _check(self, sim, direction):
         source, sensors, gamma = _experiment(sim, direction)
@@ -109,8 +102,8 @@ class ForwardTest(unittest.TestCase):
         split_field, split_record = simulate(
             split, source, gamma, sensors=sensors.nodes
         )
-        np.testing.assert_array_equal(split_field.get(), field.get())
-        np.testing.assert_array_equal(split_record.get(), record.get())
+        np.testing.assert_array_equal(cp.asnumpy(split_field), cp.asnumpy(field))
+        np.testing.assert_array_equal(cp.asnumpy(split_record), cp.asnumpy(record))
 
     def test_the_split_scalar_field_is_the_whole_one(self):
         for order in (2, 4, 8):
@@ -130,7 +123,7 @@ class ForwardTest(unittest.TestCase):
                 self._check(replace(sim, N=100), direction)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+@unittest.skipUnless(ON_GPU, "needs a CUDA device")
 class GradientTest(unittest.TestCase):
     def _check(self, sim, direction, adjoint, rtol=0.0):
         source, sensors, gamma = _experiment(sim, direction)
@@ -142,7 +135,7 @@ class GradientTest(unittest.TestCase):
         self.assertEqual(split_cost, cost)
         scale = float(cp.abs(gradient).max())
         np.testing.assert_allclose(
-            split_gradient.get(), gradient.get(), rtol=0.0, atol=rtol * scale
+            cp.asnumpy(split_gradient), cp.asnumpy(gradient), rtol=0.0, atol=rtol * scale
         )
 
     def test_the_split_gradients_are_the_whole_ones(self):

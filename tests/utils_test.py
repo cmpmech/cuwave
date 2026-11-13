@@ -24,31 +24,24 @@ from dataclasses import replace
 
 import numpy as np
 
-try:
-    import cupy as cp
-
-    HAS_CUDA = cp.cuda.runtime.getDeviceCount() > 0
-except Exception:
-    HAS_CUDA = False
-
-if HAS_CUDA:
-    from cuwave.scalar import ScalarWave
-    from cuwave.signals import ricker
-    from cuwave.sensitivity import reconstruction_sensitivity, sensitivity
-    from cuwave.utils import (
-        Sensors,
-        intensity,
-        itdt,
-        leapfrog_frequency,
-        measure,
-        misfit,
-        misfit_gradient,
-        mode_overlap,
-        point_source,
-        shots,
-        tdt,
-    )
-    from cuwave.wave import simulate, stable_dt
+from cuwave.backend import ON_GPU, cp
+from cuwave.scalar import ScalarWave
+from cuwave.signals import ricker
+from cuwave.sensitivity import reconstruction_sensitivity, sensitivity
+from cuwave.utils import (
+    Sensors,
+    intensity,
+    itdt,
+    leapfrog_frequency,
+    measure,
+    misfit,
+    misfit_gradient,
+    mode_overlap,
+    point_source,
+    shots,
+    tdt,
+)
+from cuwave.wave import simulate, stable_dt
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -92,11 +85,10 @@ def _record(sim, columns=4, seed=0):
 def _transform(sim, frequencies, record):
     """The transform `intensity` is built on, evaluated on the host."""
     t = np.arange(sim.N) * sim.dt
-    return sim.dt * np.exp(-2j * np.pi * np.outer(frequencies, t)) @ record.get()
+    return sim.dt * np.exp(-2j * np.pi * np.outer(frequencies, t)) @ cp.asnumpy(record)
 
 
 # ----------------------------------- the objective -----------------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class IntensityTest(unittest.TestCase):
     frequencies = (0.7, 2.3, 5.0)
 
@@ -141,7 +133,6 @@ class IntensityTest(unittest.TestCase):
         self.assertAlmostEqual(cost / reference, 1.0, places=10)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class ModeOverlapTest(unittest.TestCase):
     frequencies = (0.7, 2.3, 5.0)
 
@@ -192,7 +183,6 @@ class ModeOverlapTest(unittest.TestCase):
 
 
 # ---------------------------------- time dispersion ----------------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class TimeDispersionTest(unittest.TestCase):
     frequency = 1.0
 
@@ -213,7 +203,7 @@ class TimeDispersionTest(unittest.TestCase):
         lag = np.arange(1, sim.N + 1) * sim.dt - ((node - 1) * sim.dx[0] - x_source)
         lag = np.maximum(lag, 0.0) - delay
         exact = 0.5 * (lag * np.exp(-a * lag**2) + delay * np.exp(-a * delay**2))
-        return um.get()[:, 0], exact
+        return cp.asnumpy(um)[:, 0], exact
 
     def test_the_transforms_remove_the_leapfrog_time_error(self):
         sim = _line()
@@ -258,7 +248,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+@unittest.skipUnless(ON_GPU, "needs a CUDA device")
 class DevicesTest(unittest.TestCase):
     def setUp(self):
         sim = _sim(N=80)
@@ -280,7 +270,7 @@ class DevicesTest(unittest.TestCase):
         serial = measure(self.sim, self.sources, self.gamma, self.sensors)
         spread = measure(self.sim, self.sources, self.gamma, self.sensors, [0, 0])
         for a, b in zip(serial, spread):
-            np.testing.assert_array_equal(a.get(), b.get())
+            np.testing.assert_array_equal(cp.asnumpy(a), cp.asnumpy(b))
 
     def test_the_spread_cost_and_gradient_match_the_serial_ones(self):
         args = (self.sim, self.sources, self.gamma, self.sensors, self.observed)
@@ -291,6 +281,6 @@ class DevicesTest(unittest.TestCase):
             )
             self.assertAlmostEqual(spread_cost / cost, 1.0, places=12)
             np.testing.assert_allclose(
-                spread.get(), gradient.get(), rtol=1e-10, atol=1e-14
+                cp.asnumpy(spread), cp.asnumpy(gradient), rtol=1e-10, atol=1e-14
             )
             self.assertAlmostEqual(misfit(*args, devices=[0, 0]) / cost, 1.0, places=12)

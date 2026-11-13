@@ -2,10 +2,10 @@ import math
 import time
 from dataclasses import replace
 
-import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
+from cuwave.backend import cp
 from cuwave.boundary import pad_for_sponge, sponge
 from cuwave.scalar import ScalarWave
 from cuwave.signals import sineburst
@@ -78,8 +78,8 @@ toc = time.time()
 print(f"elapsed time {toc - tic:.2f} s  ({(toc - tic) / N * 1e3:.4f} ms/step)")
 
 # ----------------------------------- postprocessing ----------------------------------
-full_np = u[interior_slice(sim)].get()
-u_np = u[domain].get()
+full_np = cp.asnumpy(u[interior_slice(sim)])
+u_np = cp.asnumpy(u[domain])
 scale = float(np.max(np.abs(full_np)))
 
 offset = tuple(s.start - 1 for s in domain)

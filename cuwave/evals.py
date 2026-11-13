@@ -1,5 +1,4 @@
-import cupy as cp
-import cupy.typing as cpt
+from .backend import cp, cpt
 
 NAN = float("nan")
 

@@ -16,11 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-import cupy as cp
-import cupy.typing as cpt
 import numpy as np
 import numpy.typing as npt
 
+from .backend import ON_GPU, cp, cpt
 from .boundary import Conductor, Magnetic, face_mask, faces_with
 from .scalar import PressureWave
 from .wave import (
@@ -400,6 +399,8 @@ class MaxwellWave(Simulation):
 
     def _fuses_pair(self) -> bool:
         """Whether one launch steps the pair: DRAM bounds it and the ring at most doubles the curl."""
+        if not ON_GPU:
+            return False  # the fused tile shares memory
         device = cp.cuda.Device().attributes
         nodes = math.prod(map(int, self.Nx))
         fields = (4 * self.ndim + self.npairs) * nodes * self.dtype().itemsize
@@ -519,7 +520,8 @@ class MaxwellWave(Simulation):
         """
         radius = self.radius
         if (
-            self.ndim != 2
+            not ON_GPU
+            or self.ndim != 2
             or self.precision != "float32"
             or radius > len(BLOCKED)
             or self.pml is not None
@@ -560,7 +562,7 @@ class MaxwellWave(Simulation):
         upper = np.asarray(self.Nx)[:, None] - 2
         points, layers = [], []
         for index in (sources, targets):
-            flat = index.get()
+            flat = cp.asnumpy(index)
             layer, node = np.divmod(flat, self.comp_stride)
             point = np.stack(np.divmod(node, self.Nx_padded[1]))
             # in the interior, each point once, the index fitting an entry's half

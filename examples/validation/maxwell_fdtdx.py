@@ -1,9 +1,9 @@
 from pathlib import Path
 
-import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
+from cuwave.backend import cp
 from cuwave.boundary import Conductor, Dirichlet, Neumann
 from cuwave.maxwell import DielectricWave, ElectricWave, MagneticWave
 from cuwave.wave import Source, flatten_indices, simulate

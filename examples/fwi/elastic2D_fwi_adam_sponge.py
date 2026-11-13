@@ -2,10 +2,10 @@ import math
 import time
 from dataclasses import replace
 
-import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
+from cuwave.backend import cp
 from cuwave.boundary import pad_for_sponge, sponge
 from cuwave.elastic import ElasticWave
 from cuwave.evals import f1_score, l2_error, pr_auc
@@ -193,7 +193,7 @@ print(
 
 # ----------------------------------- postprocessing ----------------------------------
 show_field = lambda ax, field: ax.imshow(
-    field[region].get().T,
+    cp.asnumpy(field[region]).T,
     origin="lower",
     extent=[x0, x0 + Lx, y0, y0 + Ly],
     cmap="hot",

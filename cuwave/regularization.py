@@ -15,10 +15,9 @@ from pathlib import Path
 from collections.abc import Sequence
 from typing import NamedTuple
 
-import cupy as cp
-import cupy.typing as cpt
-import cupyx.scipy.ndimage as ndi
 import numpy.typing as npt
+
+from .backend import cp, cpt, ndi
 
 KERNEL_PATH = Path(__file__).parent / "kernels" / "brush.cu"
 NUDGES = (0.0, 1e-3, 1e-2, 1e-1)  # brush reward perturbations, tried in turn on a stall
@@ -294,7 +293,8 @@ class BrushGenerator(Regularization):
         if region.ndim != 2 or not bool(region.any()):
             raise ValueError(f"region must be a 2D mask with a node: {region.shape}")
         self.brush = disk(diameter)
-        self.disk_taps = (cp.argwhere(self.brush) - diameter // 2).astype(cp.int32)
+        taps = cp.argwhere(self.brush) - diameter // 2  # numpy's is column-major
+        self.disk_taps = cp.ascontiguousarray(taps, dtype=cp.int32)
         # a neighbourhood three brushes across, as a row pass then a column pass
         line = cp.arange(-3 * diameter, 3 * diameter + 1, dtype=cp.int32)
         self.row_taps = cp.stack([cp.zeros_like(line), line], axis=1)

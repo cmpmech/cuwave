@@ -1,10 +1,10 @@
 import math
 import time
 
-import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
+from cuwave.backend import cp
 from cuwave.evals import f1_score, l2_error, pr_auc
 from cuwave.geometry import circles, stacked_circles
 from cuwave.optimization import Adam
@@ -168,7 +168,7 @@ print(
 
 # ----------------------------------- postprocessing ----------------------------------
 show_field = lambda ax, field: ax.imshow(
-    field[interior].get().T,
+    cp.asnumpy(field[interior]).T,
     origin="lower",
     extent=[0.0, Lx, 0.0, Ly],
     cmap="hot",
@@ -176,7 +176,7 @@ show_field = lambda ax, field: ax.imshow(
     vmax=1.0,
 )
 
-held = frozen[interior].get().T
+held = cp.asnumpy(frozen[interior]).T
 shade = np.ma.masked_array(np.full(held.shape, 0.8), ~held)
 
 fig, axes = plt.subplots(1, 4, figsize=(9, 3))
