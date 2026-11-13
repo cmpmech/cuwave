@@ -30,30 +30,23 @@ from unittest import mock
 
 import numpy as np
 
-try:
-    import cupy as cp
-
-    HAS_CUDA = cp.cuda.runtime.getDeviceCount() > 0
-except Exception:  # cupy missing or no GPU
-    HAS_CUDA = False
-
-if HAS_CUDA:
-    from cuwave import wave
-    from cuwave.anisotropic import AnisotropicElasticWave
-    from cuwave.boundary import Clamped, Pml, sponge
-    from cuwave.elastic import ElasticWave
-    from cuwave.maxwell import DielectricWave
-    from cuwave.scalar import ScalarWave
-    from cuwave.sensitivity import (
-        l2_misfit,
-        reconstruction_sensitivity,
-        sensitivity,
-        source_sensitivity,
-    )
-    from cuwave.wave import CHUNK, Source, grid_coords, simulate, stable_dt
+from cuwave import wave
+from cuwave.anisotropic import AnisotropicElasticWave
+from cuwave.backend import cp
+from cuwave.boundary import Clamped, Pml, sponge
+from cuwave.elastic import ElasticWave
+from cuwave.maxwell import DielectricWave
+from cuwave.scalar import ScalarWave
+from cuwave.sensitivity import (
+    l2_misfit,
+    reconstruction_sensitivity,
+    sensitivity,
+    source_sensitivity,
+)
+from cuwave.wave import CHUNK, Source, grid_coords, simulate, stable_dt
 
 NX = (40, 48)
-ORIGINAL_TILES = wave.domain_tiles if HAS_CUDA else None
+ORIGINAL_TILES = wave.domain_tiles
 
 
 def _setup(damped=False, precision="float32", order=4):
@@ -107,14 +100,13 @@ def _plain(run):
         return run()
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class MarchTest(unittest.TestCase):
     def test_simulate_replays_the_plain_loop(self):
         sim, source, indicator, sensors = _setup()
         replayed = simulate(sim, source, indicator, sensors)
         plain = _plain(lambda: simulate(sim, source, indicator, sensors))
         for a, b in zip(replayed, plain):
-            np.testing.assert_array_equal(a.get(), b.get())
+            np.testing.assert_array_equal(cp.asnumpy(a), cp.asnumpy(b))
 
     def test_a_staged_history_replays_the_plain_loop(self):
         sim, source, indicator, sensors = _setup()
@@ -122,7 +114,7 @@ class MarchTest(unittest.TestCase):
         replayed = sensitivity(sim, source, indicator, sensors, objective)
         plain = _plain(lambda: sensitivity(sim, source, indicator, sensors, objective))
         for name in replayed[1]:
-            np.testing.assert_array_equal(replayed[1][name].get(), plain[1][name].get())
+            np.testing.assert_array_equal(cp.asnumpy(replayed[1][name]), cp.asnumpy(plain[1][name]))
 
     def test_a_replayed_strip_matches_the_plain_loop(self):
         sim, source, indicator, sensors = _setup(damped=True)
@@ -136,7 +128,7 @@ class MarchTest(unittest.TestCase):
         replayed, plain = run(), _plain(run)
         self.assertGreater(replayed[3]["strip"], 0)
         for name in replayed[1]:
-            np.testing.assert_array_equal(replayed[1][name].get(), plain[1][name].get())
+            np.testing.assert_array_equal(cp.asnumpy(replayed[1][name]), cp.asnumpy(plain[1][name]))
 
     def test_a_narrowed_strip_replays_the_plain_loop(self):
         # the plain loop stages a converting window too, so both round the same way
@@ -150,7 +142,7 @@ class MarchTest(unittest.TestCase):
 
         replayed, plain = run(), _plain(run)
         for name in replayed[1]:
-            np.testing.assert_array_equal(replayed[1][name].get(), plain[1][name].get())
+            np.testing.assert_array_equal(cp.asnumpy(replayed[1][name]), cp.asnumpy(plain[1][name]))
 
     def test_a_pml_replays_the_plain_loop(self):
         sim, source, indicator, sensors = _setup()
@@ -163,7 +155,7 @@ class MarchTest(unittest.TestCase):
                     args += (objective,)
                 replayed, plain = run(*args), _plain(lambda: run(*args))
                 for a, b in zip(_arrays(replayed), _arrays(plain)):
-                    np.testing.assert_array_equal(a.get(), b.get())
+                    np.testing.assert_array_equal(cp.asnumpy(a), cp.asnumpy(b))
 
     def test_a_vector_pml_replays_the_plain_loop(self):
         dx = tuple(1.0 / (n - 3) for n in NX)
@@ -192,7 +184,7 @@ class MarchTest(unittest.TestCase):
                     full = args if run is simulate else (*args, objective)
                     replayed, plain = run(*full), _plain(lambda: run(*full))
                     for a, b in zip(_arrays(replayed), _arrays(plain)):
-                        np.testing.assert_array_equal(a.get(), b.get())
+                        np.testing.assert_array_equal(cp.asnumpy(a), cp.asnumpy(b))
 
     def test_bfloat16_keeps_eight_bits_of_mantissa(self):
         x = cp.asarray(np.random.default_rng(0).normal(size=4096), dtype=cp.float32)
@@ -201,7 +193,6 @@ class MarchTest(unittest.TestCase):
         self.assertLessEqual(rel, 2.0**-8)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class DomainTest(unittest.TestCase):
     def test_skipping_tiles_changes_nothing(self):
         sim, source, indicator, sensors = _disk_setup()
@@ -209,7 +200,7 @@ class DomainTest(unittest.TestCase):
         with mock.patch("cuwave.wave.domain_tiles", _every_tile):
             every = simulate(sim, source, indicator, sensors)
         for a, b in zip(skipped, every):
-            np.testing.assert_array_equal(a.get(), b.get())
+            np.testing.assert_array_equal(cp.asnumpy(a), cp.asnumpy(b))
 
     def test_skipping_tiles_changes_nothing_around_a_held_obstacle(self):
         sim, source, indicator, sensors = _disk_setup()
@@ -219,7 +210,7 @@ class DomainTest(unittest.TestCase):
         with mock.patch("cuwave.wave.domain_tiles", _every_tile):
             every = simulate(sim, source, indicator, sensors)
         for a, b in zip(skipped, every):
-            np.testing.assert_array_equal(a.get(), b.get())
+            np.testing.assert_array_equal(cp.asnumpy(a), cp.asnumpy(b))
 
     def test_a_held_row_is_the_method_of_images(self):
         # the box mirrors about row 19.5, the midpoint the held row 20 puts its zero at
@@ -248,7 +239,7 @@ class DomainTest(unittest.TestCase):
         below = (slice(1, 20), slice(1, 35))
         scale = float(cp.abs(imaged[below]).max())
         np.testing.assert_allclose(
-            held[below].get(), imaged[below].get(), atol=1e-12 * scale
+            cp.asnumpy(held[below]), cp.asnumpy(imaged[below]), atol=1e-12 * scale
         )
 
     def test_the_material_outside_is_never_read(self):
@@ -258,7 +249,7 @@ class DomainTest(unittest.TestCase):
         a = simulate(sim, source, voided, sensors)
         b = simulate(sim, source, filled, sensors)
         for x, y in zip(a, b):
-            np.testing.assert_array_equal(x.get(), y.get())
+            np.testing.assert_array_equal(cp.asnumpy(x), cp.asnumpy(y))
 
     def test_a_domain_covering_everything_is_the_plain_scheme(self):
         sim, source, indicator, sensors = _setup()
@@ -267,7 +258,7 @@ class DomainTest(unittest.TestCase):
         covered = simulate(sim, source, indicator, sensors)[1]
         # to round-off only: the domain build contracts its fmas differently
         scale = float(cp.abs(plain).max())
-        np.testing.assert_allclose(covered.get(), plain.get(), atol=1e-5 * scale)
+        np.testing.assert_allclose(cp.asnumpy(covered), cp.asnumpy(plain), atol=1e-5 * scale)
 
     def test_the_graded_operator_is_its_own_adjoint(self):
         sim, source, indicator, sensors = _disk_setup("float64", order=2)

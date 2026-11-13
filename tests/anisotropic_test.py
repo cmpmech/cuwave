@@ -24,34 +24,27 @@ from unittest import mock
 
 import numpy as np
 
-try:
-    import cupy as cp
-
-    HAS_CUDA = cp.cuda.runtime.getDeviceCount() > 0
-except Exception:
-    HAS_CUDA = False
-
-if HAS_CUDA:
-    from cuwave import anisotropic
-    from cuwave.anisotropic import AnisotropicElasticWave, cell_stencil, corner_bits
-    from cuwave.boundary import Clamped, Pml, Traction, sponge
-    from cuwave.elastic import voigt
-    from cuwave.scalar import ScalarWave
-    from cuwave.sensitivity import (
-        l2_misfit,
-        reconstruction_sensitivity,
-        sensitivity,
-        superposition_sensitivity,
-    )
-    from cuwave.signals import ricker
-    from cuwave.utils import Sensors, point_source
-    from cuwave.wave import (
-        Source,
-        compile_kernels,
-        simulate,
-        stable_dt,
-        stable_timestep,
-    )
+from cuwave import anisotropic
+from cuwave.anisotropic import AnisotropicElasticWave, cell_stencil, corner_bits
+from cuwave.backend import ON_GPU, cp
+from cuwave.boundary import Clamped, Pml, Traction, sponge
+from cuwave.elastic import voigt
+from cuwave.scalar import ScalarWave
+from cuwave.sensitivity import (
+    l2_misfit,
+    reconstruction_sensitivity,
+    sensitivity,
+    superposition_sensitivity,
+)
+from cuwave.signals import ricker
+from cuwave.utils import Sensors, point_source
+from cuwave.wave import (
+    Source,
+    compile_kernels,
+    simulate,
+    stable_dt,
+    stable_timestep,
+)
 
 CP, CS, RHO = 2.0, 1.0, 1.3
 # orthotropic, five to one, yet every wave runs along its phase on both axes
@@ -129,7 +122,6 @@ def _finite_difference(cost_of, indicator, nodes, h=1e-6):
 
 
 # -------------------------------- element and operator -------------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class StencilTest(unittest.TestCase):
     def test_the_stencil_has_only_the_rigid_body_null_space(self):
         for ndim, dx in ((1, (0.7,)), (2, (0.7, 1.3)), (3, (0.7, 1.3, 0.9))):
@@ -151,7 +143,6 @@ class StencilTest(unittest.TestCase):
         self.assertEqual(corner_bits(2), [(0, 0), (1, 0), (0, 1), (1, 1)])
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class OperatorTest(unittest.TestCase):
     def test_the_kernel_reproduces_the_continuum_divergence(self):
         """Independent of every convention in the module: a smooth field against analytic
@@ -300,7 +291,6 @@ class OperatorTest(unittest.TestCase):
 
 
 # ---------------------------------- against the scalar -------------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class OneDimensionTest(unittest.TestCase):
     """1D elasticity is the scalar equation, so the two solvers must agree exactly."""
 
@@ -350,7 +340,6 @@ class OneDimensionTest(unittest.TestCase):
 
 
 # ------------------------------------- sensitivity -----------------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class GradientTest(unittest.TestCase):
     def _check(self, sim, nodes, tol=1e-5):
         source, sensors, indicator, objective = _problem(sim)
@@ -382,7 +371,6 @@ class GradientTest(unittest.TestCase):
             self.assertEqual(float(gradient[ghost]), 0.0)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class VariantTest(unittest.TestCase):
     def _reference(self, sim):
         """The solver arguments in call order, plus the exact cost and gradient."""
@@ -421,7 +409,6 @@ class VariantTest(unittest.TestCase):
 
 
 # ------------------------------- transducers and validation --------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class TransducerTest(unittest.TestCase):
     def test_a_directed_receiver_scatters_as_it_gathers(self):
         sim = _sim((26, 26), N=20)
@@ -448,7 +435,6 @@ class TransducerTest(unittest.TestCase):
             self.assertEqual(float(cp.abs(field[:, wall, :]).max()), 0.0)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class ValidationTest(unittest.TestCase):
     def test_it_rejects_a_missing_material(self):
         with self.assertRaises(ValueError):
@@ -476,7 +462,6 @@ class ValidationTest(unittest.TestCase):
         self.assertGreater(stable_timestep(sim, uniform) / sim.dt, 1.0)
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class PmlTest(unittest.TestCase):
     def test_a_long_run_decays_through_an_orthotropic_layer_and_a_free_surface(self):
         dx = (1.0 / 100,) * 2
@@ -553,7 +538,7 @@ def _blocked_runs(Nx, N, boundary, blocks, damped=False, C=None):
     return blocked, plain
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+@unittest.skipUnless(ON_GPU, "needs a CUDA device")
 class BlockedTest(unittest.TestCase):
     def _assert_bitwise(self, blocked, plain):
         self.assertGreater(float(cp.abs(plain[0]).max()), 0.0)

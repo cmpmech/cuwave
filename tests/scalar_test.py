@@ -32,20 +32,13 @@ from unittest import mock
 
 import numpy as np
 
-try:
-    import cupy as cp
-
-    HAS_CUDA = cp.cuda.runtime.getDeviceCount() > 0
-except Exception:  # cupy missing or no GPU
-    HAS_CUDA = False
-
-if HAS_CUDA:
-    from cuwave import scalar
-    from cuwave.boundary import Dirichlet, Neumann, Pml, faces_with, sponge
-    from cuwave.scalar import AcousticWave, ScalarWave
-    from cuwave.signals import ricker
-    from cuwave.utils import point_source
-    from cuwave.wave import Source, compile_kernels, simulate, stable_dt
+from cuwave import scalar
+from cuwave.backend import ON_GPU, cp
+from cuwave.boundary import Dirichlet, Neumann, Pml, faces_with, sponge
+from cuwave.scalar import AcousticWave, ScalarWave
+from cuwave.signals import ricker
+from cuwave.utils import point_source
+from cuwave.wave import Source, compile_kernels, simulate, stable_dt
 
 NX = (150, 77)  # three chunks of axis 0, and a width no tile divides
 
@@ -92,7 +85,7 @@ def _random(sim, seed):
 
 
 # ---------------------------------- the two kernels ----------------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+@unittest.skipUnless(ON_GPU, "needs a CUDA device")
 class StreamingTest(unittest.TestCase):
     def _assert_same(self, sim, a, b):
         scale = float(cp.abs(b).max())
@@ -216,7 +209,7 @@ def _runs(sim, seed, sensed=True, **blocks):
     return (blocked, plain) if sensed else ((blocked,), (plain,))
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+@unittest.skipUnless(ON_GPU, "needs a CUDA device")
 class BlockedTest(unittest.TestCase):
     def _assert_bitwise(self, blocked, plain):
         self.assertGreater(float(cp.abs(plain[0]).max()), 0.0)
@@ -342,7 +335,7 @@ def _marched_runs(sim, seed, rows):
     return marched, plain
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+@unittest.skipUnless(ON_GPU, "needs a CUDA device")
 class MarchedRowsTest(unittest.TestCase):
     ROWS = ((64, 4, 16), (64, 3, 16))  # runs and chunks a test grid holds many of
 
@@ -449,7 +442,7 @@ def _runs3d(sim, seed):
     return blocked, plain
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+@unittest.skipUnless(ON_GPU, "needs a CUDA device")
 class MarchedTest(unittest.TestCase):
     def _assert_bitwise(self, blocked, plain):
         self.assertGreater(float(cp.abs(plain[0]).max()), 0.0)
@@ -547,7 +540,7 @@ def _folded_runs(sim, seed):
     return runs
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
+@unittest.skipUnless(ON_GPU, "needs a CUDA device")
 class FoldedStepTest(unittest.TestCase):
     def test_a_folded_run_is_the_launched_run_bit_for_bit(self):
         mixed = (Neumann, Dirichlet), (Dirichlet, Neumann), (Dirichlet, Dirichlet)

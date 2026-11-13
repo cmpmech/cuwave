@@ -15,8 +15,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import cupy as cp
 import numpy as np
+
+from .backend import cp
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence

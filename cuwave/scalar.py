@@ -14,11 +14,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-import cupy as cp
-import cupy.typing as cpt
 import numpy as np
 import numpy.typing as npt
 
+from .backend import ON_GPU, cp, cpt
 from .boundary import Dirichlet, Neumann, face_mask
 from .wave import (
     PML_THREADS,
@@ -162,6 +161,8 @@ class PressureWave(Simulation):
     @property
     def streams(self) -> bool:
         """Whether the step streams along axis 0: a wide unmasked 2D stencil on a full grid."""
+        if not ON_GPU:
+            return False  # the stream shares memory
         # in 3D, or below STREAM_ORDER, L1 serves the plain step as well
         if self.ndim != 2 or self.masked or self.space_order < STREAM_ORDER:
             return False
@@ -173,6 +174,8 @@ class PressureWave(Simulation):
     @property
     def _refills_in_step(self) -> bool:
         """Whether the plain step writes the face ghosts: no mask, stream or pml, order 4 at most, Neumann and Dirichlet faces, `FOLD_SMS`."""
+        if not ON_GPU:
+            return False  # the host steps the plain kernels
         conditions = {c for pair in self.boundary for c in pair}
         sms = cp.cuda.Device().attributes["MultiProcessorCount"]
         return (
@@ -209,7 +212,7 @@ class PressureWave(Simulation):
         """
         if not self._refills_in_step:
             return None
-        points = source.position.get()
+        points = cp.asnumpy(source.position)
         upper = np.asarray(self.Nx)[:, None] - 2
         if ((points < 1) | (points > upper)).any():
             return None
@@ -249,7 +252,7 @@ class PressureWave(Simulation):
         num = 1
         if position is not None:
             # the sources sorted by the thread block holding them, CSR by block
-            points = position.get()
+            points = cp.asnumpy(position)
             sizes = [-(-n // t) for n, t in zip(self.Nx_padded, self.threads)]
             blocks = points // np.asarray(self.threads)[:, None]
             owner = np.ravel_multi_index(tuple(blocks), sizes)
@@ -477,7 +480,8 @@ class PressureWave(Simulation):
         conditions = {c for pair in self.boundary for c in pair}
         radius = self.space_order // 2
         return not (
-            self.ndim == 1
+            not ON_GPU
+            or self.ndim == 1
             or self.precision != "float32"
             or radius > len(SMALL_BLOCKS)
             or self.pml is not None
@@ -531,7 +535,7 @@ class PressureWave(Simulation):
         # sources in the interior, no node holding two sources or two sensors
         sources = flatten_indices(self, source.position)
         targets = flatten_indices(self, sensors) if sensors is not None else sources[:0]
-        flat = [index.get() for index in (sources, targets)]
+        flat = [cp.asnumpy(index) for index in (sources, targets)]
         points = [np.stack(np.divmod(index, self.Nx_padded[1])) for index in flat]
         upper = np.asarray(self.Nx)[:, None] - 2
         if not ((points[0] >= 1) & (points[0] <= upper)).all():
@@ -595,7 +599,7 @@ class PressureWave(Simulation):
         # sources and sensors in the interior, no node holding two of either
         sources = flatten_indices(self, source.position)
         targets = flatten_indices(self, sensors) if sensors is not None else sources[:0]
-        flat = [index.get() for index in (sources, targets)]
+        flat = [cp.asnumpy(index) for index in (sources, targets)]
         points = [np.stack(np.unravel_index(f, self.Nx_padded)) for f in flat]
         upper = np.asarray(self.Nx)[:, None] - 2
         for point, index in zip(points, flat):
@@ -679,7 +683,7 @@ class PressureWave(Simulation):
         # sources and sensors in the interior, no node holding two of either
         sources = flatten_indices(self, source.position)
         targets = flatten_indices(self, sensors) if sensors is not None else sources[:0]
-        flat = [index.get() for index in (sources, targets)]
+        flat = [cp.asnumpy(index) for index in (sources, targets)]
         points = [np.stack(np.divmod(f, self.Nx_padded[1])) for f in flat]
         upper = np.asarray(self.Nx)[:, None] - 2
         for point, index in zip(points, flat):

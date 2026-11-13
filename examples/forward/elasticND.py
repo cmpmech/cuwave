@@ -1,10 +1,10 @@
 import math
 import time
 
-import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 
+from cuwave.backend import cp
 from cuwave.elastic import ElasticWave
 from cuwave.signals import sineburst
 from cuwave.utils import point_source
@@ -74,7 +74,7 @@ toc = time.time()
 print(f"elapsed time {toc - tic:.2f} s  ({(toc - tic) / N * 1e3:.4f} ms/step)")
 
 # ----------------------------------- postprocessing ----------------------------------
-u_np = u[-1].get()  # component the force acts along
+u_np = cp.asnumpy(u[-1])  # component the force acts along
 if DIM == 3:
     u_np = u_np[Nx[0] // 2]  # source plane cuts the sphere at its equator
 scale = float(np.max(np.abs(u_np)))

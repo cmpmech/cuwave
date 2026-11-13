@@ -1,7 +1,7 @@
 from collections import deque
 from collections.abc import Callable
 
-import cupy.typing as cpt
+from .backend import cpt
 
 
 class Adam:

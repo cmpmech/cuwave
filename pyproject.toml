@@ -21,10 +21,12 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Physics",
 ]
 # CuPy is intentionally omitted: install the wheel matching your CUDA toolkit,
-# e.g. `pip install cupy-cuda12x`.
+# e.g. `pip install cupy-cuda12x`. Without it cuwave runs on the CPU (`cpu` extra).
 dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
+# The CPU fallback compiles the kernels with the system C++ compiler and OpenMP.
+cpu = ["scipy>=1.10"]
 # Only the drivers and `cuwave.postprocessing` plot; the solver never imports matplotlib.
 examples = ["matplotlib>=3.7", "pillow>=9.1"]
 # Only `cuwave.nn` needs torch; the solver and its adjoints are cupy throughout.
@@ -39,4 +41,4 @@ Changelog = "https://github.com/cmpmech/cuwave/releases"
 packages = ["cuwave", "cuwave.kernels"]
 
 [tool.setuptools.package-data]
-cuwave = ["kernels/*.cu", "kernels/*.cuh"]
+cuwave = ["kernels/*.cu", "kernels/*.cuh", "kernels/*.hpp"]

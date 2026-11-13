@@ -16,10 +16,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
-import cupy as cp
-import cupy.typing as cpt
 import numpy as np
 
+from .backend import cp, cpt
 from .boundary import _canonical_faces, pml_widths, require_off_held_walls
 
 if TYPE_CHECKING:

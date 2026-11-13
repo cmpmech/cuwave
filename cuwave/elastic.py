@@ -18,11 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-import cupy as cp
-import cupy.typing as cpt
 import numpy as np
 import numpy.typing as npt
 
+from .backend import ON_GPU, cp, cpt
 from .boundary import Clamped, Traction, face_mask, faces_with
 from .stencils import CLOSURES, closure_band, closure_norms, closure_reach
 from .wave import (
@@ -334,7 +333,7 @@ class ElasticWave(Simulation):
 
     def _point_norms(self, lin_index: cpt.NDArray[cp.int32]) -> cpt.NDArray:
         """The norm W on the component points `lin_index`: the half points' along its own axis."""
-        component, node = np.divmod(lin_index.get(), self.comp_stride)
+        component, node = np.divmod(cp.asnumpy(lin_index), self.comp_stride)
         nodal = self._norm_lines(())
         half = self._norm_lines(tuple(range(self.ndim)))
         weight = np.ones(len(node))
@@ -386,6 +385,8 @@ class ElasticWave(Simulation):
 
     def _fuses_pair(self) -> bool:
         """Whether one launch steps the pair: DRAM bounds it and the ring at most doubles the stresses."""
+        if not ON_GPU:
+            return False  # the fused tile shares memory
         device = cp.cuda.Device().attributes
         nodes = math.prod(map(int, self.Nx))  # a caller may pass numpy int32
         fields = (3 * self.ndim + self.nvoigt + 1) * nodes * self.dtype().itemsize
@@ -503,7 +504,8 @@ class ElasticWave(Simulation):
         """
         radius = self.radius
         if (
-            self.ndim != 2
+            not ON_GPU
+            or self.ndim != 2
             or self.precision != "float32"
             or radius > len(BLOCKED)
             or self.pml is not None
@@ -552,7 +554,7 @@ class ElasticWave(Simulation):
         upper = np.asarray(self.Nx)[:, None] - 2
         points, layers = [], []
         for index in (sources, targets):
-            flat = index.get()
+            flat = cp.asnumpy(index)
             layer, node = np.divmod(flat, self.comp_stride)
             point = np.stack(np.divmod(node, self.Nx_padded[1]))
             # in the interior, each point once, the index fitting an entry's half

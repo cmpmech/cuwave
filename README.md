@@ -74,7 +74,28 @@ Additional benefits of **CuWave** are
 pip install cuwave
 ```
 
-Requires an NVIDIA GPU and [CuPy](https://docs.cupy.dev/en/stable/install.html) matching your CUDA toolkit (e.g. `pip install cupy-cuda12x`), which is not pulled in automatically. For the full installation, including the optional PyTorch and running the tests, see [docs/install.md](https://github.com/cmpmech/cuwave/blob/main/docs/install.md).
+Requires an NVIDIA GPU and [CuPy](https://docs.cupy.dev/en/stable/install.html) matching your CUDA toolkit (e.g. `pip install cupy-cuda12x`), which is not pulled in automatically, or the CPU fallback below. For the full installation, including the optional PyTorch and running the tests, see [docs/install.md](https://github.com/cmpmech/cuwave/blob/main/docs/install.md).
+
+### CPU fallback
+
+CuPy on a GPU stays the default. Without an NVIDIA GPU (or without CuPy) CuWave runs on the CPU instead: NumPy holds the arrays, and the same CUDA kernels are compiled for the CPU at first use and cached in `~/.cache/cuwave`. Results agree with the GPU to floating-point round-off. To force the CPU on a machine with a GPU, set `CUWAVE_DEVICE=cpu` before CuWave is imported, on the command line (`CUWAVE_DEVICE=cpu python examples/forward/scalarND.py`) or at the top of a script, as [examples/forward/scalar2D_cpu.py](https://github.com/cmpmech/cuwave/blob/main/examples/forward/scalar2D_cpu.py) does.
+
+```bash
+pip install "cuwave[cpu]"     # adds SciPy, which stands in for cupyx.scipy
+```
+
+Requirements:
+- a **C++17 compiler with OpenMP** that takes GCC-style flags (GCC or Clang), called as `CXX` (default `c++`) with the flags `CUWAVE_CXXFLAGS` (default `-O3 -march=native -fopenmp -ffp-contract=off`)
+- `OMP_NUM_THREADS` sets the number of threads (default: all cores, the right choice on a machine of your own; the step is bound by memory bandwidth, so threads past the physical cores add little)
+
+What that means per platform:
+- **Linux**: works with the system GCC, which ships OpenMP (`sudo apt install g++` on Debian/Ubuntu).
+- **macOS** (untested): Apple Clang has no OpenMP. Either install it with `brew install libomp` and set
+  `export CUWAVE_CXXFLAGS="-O3 -ffp-contract=off -Xclang -fopenmp -I$(brew --prefix libomp)/include -L$(brew --prefix libomp)/lib -lomp"`,
+  or use Homebrew's GCC (`brew install gcc`, then `export CXX=g++-15` with the installed version).
+- **Windows**: not supported natively, since MSVC does not take GCC-style flags and Python does not find the OpenMP runtime of a MinGW build. Use [WSL2](https://learn.microsoft.com/windows/wsl/install), which is Linux.
+
+The CPU runs the plain kernels only: none of the GPU's blocked and fused fast paths, and no `devices` (several GPUs). It is roughly two orders of magnitude slower than a GPU, so it suits machines without one, tests and small grids.
 
 ## References
 

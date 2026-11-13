@@ -20,17 +20,10 @@ from cuwave.stencils import (
     weights,
 )
 
-try:
-    import cupy as cp
-
-    HAS_CUDA = cp.cuda.runtime.getDeviceCount() > 0
-except Exception:  # cupy missing or no GPU
-    HAS_CUDA = False
-
-if HAS_CUDA:
-    from cuwave.elastic import ElasticWave
-    from cuwave.scalar import ScalarWave
-    from cuwave.wave import compile_kernels, stable_dt
+from cuwave.backend import cp
+from cuwave.elastic import ElasticWave
+from cuwave.scalar import ScalarWave
+from cuwave.wave import compile_kernels, stable_dt
 
 
 # -------------------------------------- helpers --------------------------------------
@@ -96,7 +89,6 @@ class OptimizedRowTest(unittest.TestCase):
             cell_coefficients(3, "spectral")
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class CompiledRowTest(unittest.TestCase):
     def test_stable_dt_follows_the_row(self):
         for R in (1, 2, 4):

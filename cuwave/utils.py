@@ -5,11 +5,10 @@ import warnings
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 
-import cupy as cp
-import cupy.typing as cpt
 import numpy as np
 import numpy.typing as npt
 
+from .backend import ON_GPU, cp, cpt
 from .sensitivity import l2_misfit, sensitivity
 from .wave import Simulation, Source, simulate
 
@@ -56,6 +55,8 @@ def _spread(
     Each device runs in its own thread on its own stream, with `shared` and its share
     replicated there, and what `work` returns comes back onto the calling device.
     """
+    if not ON_GPU:
+        raise ValueError(f"devices {devices} name GPUs, but cuwave runs on the CPU")
     cp.cuda.get_current_stream().synchronize()
     home, n = cp.cuda.Device().id, len(devices)
 

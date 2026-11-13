@@ -15,17 +15,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      # cupy is imported at module level throughout, so it must be installed even
-      # though the runner has no GPU: HAS_CUDA turns false and the kernels skip.
+      # no cupy: the runner has no GPU, so cuwave runs on the CPU, compiling the
+      # kernels with the runner's g++ and OpenMP; the cpu extra brings scipy.
       # torch is the cpu wheel, which is what HAS_TORCH needs and far smaller
       - name: install
         run: |
           python -m pip install --upgrade pip
-          pip install cupy-cuda12x
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e .
+          pip install -e ".[cpu]"
           pip install pytest
 
-      # the CUDA tests skip here; this pins imports, the stencil math and the optimizers
+      # the solver runs on the CPU here; only the GPU-only classes skip (ON_GPU)
       - name: test
-        run: pytest tests/ -q
+        run: pytest tests/ -q -rs

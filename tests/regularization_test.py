@@ -20,25 +20,18 @@ that `set` retunes a live instance the way a `continuation` schedule needs.
 import math
 import unittest
 
-try:
-    import cupy as cp
-
-    HAS_CUDA = cp.cuda.runtime.getDeviceCount() > 0
-except Exception:
-    HAS_CUDA = False
-
-if HAS_CUDA:
-    from cuwave.regularization import (
-        SIMP,
-        DensityFilter,
-        Projection,
-        SmoothedProjection,
-        Tikhonov,
-        TotalVariation,
-        _spatial_grad,
-        _spatial_grad_adjoint,
-        continuation,
-    )
+from cuwave.backend import cp
+from cuwave.regularization import (
+    SIMP,
+    DensityFilter,
+    Projection,
+    SmoothedProjection,
+    Tikhonov,
+    TotalVariation,
+    _spatial_grad,
+    _spatial_grad_adjoint,
+    continuation,
+)
 
 STEP = 1e-6
 
@@ -60,7 +53,6 @@ def _directional(f, x, v, h=STEP):
     return (f(x + h * v) - f(x - h * v)) / (2.0 * h)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class DifferencingTest(unittest.TestCase):
     """`_spatial_grad_adjoint` transposes `_spatial_grad`, under both penalties"""
 
@@ -81,7 +73,6 @@ class DifferencingTest(unittest.TestCase):
 
 
 # ------------------------ penalties against finite differences -----------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class PenaltyGradientTest(unittest.TestCase):
     """`Tikhonov` and `TotalVariation` are scalar, so `grad` is checked entrywise"""
 
@@ -123,7 +114,6 @@ class PenaltyGradientTest(unittest.TestCase):
 
 
 # ------------------------- maps against the adjoint identity -------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class MapAdjointTest(unittest.TestCase):
     """A map returns an array, so `grad` is its transpose against a random `dy`"""
 
@@ -151,7 +141,6 @@ class MapAdjointTest(unittest.TestCase):
 
 
 # --------------------------- properties a driver relies on ---------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class DensityFilterTest(unittest.TestCase):
     def test_the_filter_preserves_a_uniform_design(self):
         x = cp.full((12, 10), 0.3, dtype=cp.float64)
@@ -174,7 +163,6 @@ class DensityFilterTest(unittest.TestCase):
         self.assertTrue(bool(cp.all(cp.isfinite(filtered))))
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class ProjectionTest(unittest.TestCase):
     def test_a_symmetric_threshold_maps_to_one_half(self):
         x = cp.full((4, 4), 0.5, dtype=cp.float64)
@@ -215,7 +203,6 @@ class ProjectionTest(unittest.TestCase):
         self.assertGreater(sharp, gentle)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class SmoothedProjectionTest(unittest.TestCase):
     def test_away_from_the_interface_it_is_the_projection(self):
         x = cp.full((6, 6), 0.7, dtype=cp.float64)
@@ -247,7 +234,6 @@ class SmoothedProjectionTest(unittest.TestCase):
                 self.assertLessEqual(float(y.max()), 1.0 + 1e-12)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class SimpTest(unittest.TestCase):
     def test_unit_exponent_without_a_floor_is_the_identity(self):
         x = _design()
@@ -263,7 +249,6 @@ class SimpTest(unittest.TestCase):
 
 
 # ------------------------------- continuation schedules ------------------------------
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class ContinuationTest(unittest.TestCase):
     def test_set_retunes_a_live_instance(self):
         x = _design()

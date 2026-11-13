@@ -1,11 +1,10 @@
 import math
 import time
 
-import cupy as cp
-import cupy.typing as cpt
 import matplotlib.pyplot as plt
 import numpy as np
 
+from cuwave.backend import cp, cpt
 from cuwave.geometry import box, nodes
 from cuwave.optimization import Adam
 from cuwave.postprocessing import markers, outline, show
@@ -162,7 +161,7 @@ fig, axes = plt.subplots(1, 2, figsize=(7, 3))
 axes[0].semilogy(history, "k")
 show(axes[1], field=wavefield[interior], indicator=final[interior], scale=scale)
 outline(
-    axes[1], sensors.min(axis=1).get(), sensors.max(axis=1).get(), origin=1, color="k"
+    axes[1], cp.asnumpy(sensors.min(axis=1)), cp.asnumpy(sensors.max(axis=1)), origin=1, color="k"
 )
 markers(axes[1], (SOURCE_X, SOURCE_Y), dx=dx, origin=1, nodes=6, color="k")
 axes[1].set_aspect("equal")

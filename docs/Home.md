@@ -15,6 +15,8 @@ Gradients useful in **optimization** scenarios such as inverse problems (full wa
 
 Common **helpers** ease the creation of driver files for applied problem setups
 
+**Without a GPU** the same kernels run on the CPU, compiled with the system C++ compiler and OpenMP (see [cpu](cpu.md))
+
 See [install](install.md) for the installation
 
 ## forward simulation
@@ -27,6 +29,7 @@ See [install](install.md) for the installation
 - [stencils](stencils.md)
 - [boundary](boundary.md)
 - [decomposition](decomposition.md), one grid split over several GPUs
+- [cpu](cpu.md), the kernels on the CPU where no GPU is found
 
 ## sensitivity analysis
 

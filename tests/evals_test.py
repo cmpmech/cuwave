@@ -17,25 +17,18 @@ recovered field happens to be uniform.
 import math
 import unittest
 
-try:
-    import cupy as cp
-
-    HAS_CUDA = cp.cuda.runtime.getDeviceCount() > 0
-except Exception:
-    HAS_CUDA = False
-
-if HAS_CUDA:
-    from cuwave.evals import (
-        confusion,
-        f1_score,
-        false_positive_rate,
-        l2_error,
-        non_discreteness,
-        pr_auc,
-        precision,
-        recall,
-        roc_auc,
-    )
+from cuwave.backend import cp
+from cuwave.evals import (
+    confusion,
+    f1_score,
+    false_positive_rate,
+    l2_error,
+    non_discreteness,
+    pr_auc,
+    precision,
+    recall,
+    roc_auc,
+)
 
 # two damaged nodes at 0 and three intact at 1, so the midpoint threshold is 0.5
 TRUTH = [0.0, 0.0, 1.0, 1.0, 1.0]
@@ -47,7 +40,6 @@ def _field(values):
     return cp.asarray(values, dtype=cp.float64)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class OrientationTest(unittest.TestCase):
     """Damage is the low value, the one convention every metric in the module shares"""
 
@@ -81,7 +73,6 @@ class OrientationTest(unittest.TestCase):
             confusion(cp.ones(3), cp.ones(4))
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class RateTest(unittest.TestCase):
     """The four counting metrics against hand-checked confusion matrices"""
 
@@ -111,7 +102,6 @@ class RateTest(unittest.TestCase):
         self.assertEqual(confusion(field, truth, threshold=0.7), (2, 1, 0, 2))
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class AreaTest(unittest.TestCase):
     """`pr_auc` and `roc_auc` rank rather than threshold, so ties are the real case"""
 
@@ -144,7 +134,6 @@ class AreaTest(unittest.TestCase):
                 )
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class DegenerateTest(unittest.TestCase):
     """An inversion scores itself every iteration, so an undefined metric returns NAN"""
 
@@ -165,7 +154,6 @@ class DegenerateTest(unittest.TestCase):
         self.assertTrue(math.isnan(non_discreteness(_field([1.0] * 4), region)))
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class GreynessTest(unittest.TestCase):
     """`non_discreteness` takes no truth, so it scores a topology optimization too"""
 
@@ -186,7 +174,6 @@ class GreynessTest(unittest.TestCase):
         self.assertAlmostEqual(non_discreteness(field), 0.5)
 
 
-@unittest.skipUnless(HAS_CUDA, "needs a CUDA device")
 class L2ErrorTest(unittest.TestCase):
     def test_an_exact_reconstruction_has_no_error(self):
         truth = _field(TRUTH)

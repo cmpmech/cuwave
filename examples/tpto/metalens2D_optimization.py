@@ -2,11 +2,10 @@ import math
 import time
 from dataclasses import replace
 
-import cupy as cp
-import cupy.typing as cpt
 import matplotlib.pyplot as plt
 import numpy as np
 
+from cuwave.backend import cp, cpt
 from cuwave.boundary import Pml, pad_for_sponge
 from cuwave.geometry import box
 from cuwave.maxwell import MagneticWave
@@ -182,8 +181,8 @@ print(
 # ----------------------------------- postprocessing ----------------------------------
 wavefield = simulate(replace(sim, N=math.ceil(T_SNAPSHOT / dt)), source, final)
 scale = 0.5 * float(cp.max(cp.abs(wavefield[domain]))) + 1e-30
-low = (region.nonzero()[0].min().get(), region.nonzero()[1].min().get())
-high = (region.nonzero()[0].max().get(), region.nonzero()[1].max().get())
+low = (cp.asnumpy(region.nonzero()[0].min()), cp.asnumpy(region.nonzero()[1].min()))
+high = (cp.asnumpy(region.nonzero()[0].max()), cp.asnumpy(region.nonzero()[1].max()))
 
 fig, axes = plt.subplots(1, 2, figsize=(7, 3))
 axes[0].semilogy(history, "k")

@@ -73,50 +73,43 @@ import numpy as np
 
 from cuwave.sensitivity import checkpoint_schedule
 
-try:
-    import cupy as cp
-
-    HAS_CUDA = cp.cuda.runtime.getDeviceCount() > 0
-except Exception:  # cupy missing or no GPU
-    HAS_CUDA = False
-
-if HAS_CUDA:
-    from cuwave.boundary import (
-        Dirichlet,
-        Neumann,
-        Pml,
-        define_boundary,
-        pad_for_sponge,
-        pml_nodes,
-        sponge,
-    )
-    from cuwave.boundary import Clamped, Conductor, Magnetic, Traction
-    from cuwave.anisotropic import AnisotropicElasticWave
-    from cuwave.elastic import ElasticWave
-    from cuwave.maxwell import DielectricWave
-    from cuwave.scalar import AcousticWave, ScalarWave
-    from cuwave.sensitivity import (
-        l2_misfit,
-        reconstruction_nodes,
-        reconstruction_sensitivity,
-        sensitivity,
-        source_sensitivity,
-        spectral_sensitivity,
-        superposition_sensitivity,
-    )
-    from cuwave.utils import collect_source, intensity, point_source
-    from cuwave.signals import ricker
-    from cuwave.wave import (
-        apply_cell_weights,
-        Source,
-        compile_kernels,
-        define_excitation,
-        flatten_indices,
-        grid_coords,
-        sensor_cell_weights,
-        simulate,
-        stable_dt,
-    )
+from cuwave.backend import ON_GPU, cp
+from cuwave.boundary import (
+    Dirichlet,
+    Neumann,
+    Pml,
+    define_boundary,
+    pad_for_sponge,
+    pml_nodes,
+    sponge,
+)
+from cuwave.boundary import Clamped, Conductor, Magnetic, Traction
+from cuwave.anisotropic import AnisotropicElasticWave
+from cuwave.elastic import ElasticWave
+from cuwave.maxwell import DielectricWave
+from cuwave.scalar import AcousticWave, ScalarWave
+from cuwave.sensitivity import (
+    l2_misfit,
+    reconstruction_nodes,
+    reconstruction_sensitivity,
+    sensitivity,
+    source_sensitivity,
+    spectral_sensitivity,
+    superposition_sensitivity,
+)
+from cuwave.utils import collect_source, intensity, point_source
+from cuwave.signals import ricker
+from cuwave.wave import (
+    apply_cell_weights,
+    Source,
+    compile_kernels,
+    define_excitation,
+    flatten_indices,
+    grid_coords,
+    sensor_cell_weights,
+    simulate,
+    stable_dt,
+)
 
 NC = 30  # logical grid points per axis (ghosts included)
 NSTEPS = 120  # long enough for the wave to reach the sensors and reflect
@@ -271,7 +264,6 @@ def _discrepancy(sim, a, b):
     return rel, cos
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class GradientTest(unittest.TestCase):
     def _nodes(self, sim):
         # a wall node per axis, a corner, interior: the ring pins the cell weights
@@ -440,7 +432,7 @@ class GradientTest(unittest.TestCase):
                 )
                 expected = np.array([float(field[n]) for n in nodes])
                 np.testing.assert_allclose(
-                    sensor_cell_weights(sim, probe).get(), expected, rtol=0, atol=0
+                    cp.asnumpy(sensor_cell_weights(sim, probe)), expected, rtol=0, atol=0
                 )
                 # and the values are the {1, 1/2, 1/4} the derivation calls for
                 self.assertEqual(expected[0], 0.25)
@@ -538,7 +530,7 @@ class GradientTest(unittest.TestCase):
                 self.assertLess(error, 1e-12, f"{name} off by {error:.2e}")
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
+@unittest.skipUnless(ON_GPU, "needs a CUDA device")
 class RecordedTest(unittest.TestCase):
     def test_the_recorded_forward_is_the_launched_one_bit_for_bit(self):
         # 53 steps: graphed chunks of whole blocks, then a few launched one by one
@@ -579,7 +571,6 @@ class RecordedTest(unittest.TestCase):
                 self.assertTrue(bool(same), (order, name))
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class PmlTest(unittest.TestCase):
     def _rows(self, sim, rows):
         # a vector unknown takes the component row first, one per column
@@ -700,7 +691,6 @@ class PmlTest(unittest.TestCase):
             superposition_sensitivity(sim, source, indicator, sensors, objective)
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class TransposeTest(unittest.TestCase):
     def _sim(self, ndim, order, faces, kind):
         Nx = {1: (41,), 2: (37, 29), 3: (27, 23, 21)}[ndim]
@@ -777,7 +767,6 @@ class TransposeTest(unittest.TestCase):
                             self.assertLess(error, 1e-12, f"off by {error:.2e}")
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class SuperpositionTest(unittest.TestCase):
     def _both(self, sim, frequency, base, scale=1.0):
         source, sensors, indicator, objective = _problem(sim, frequency, base)
@@ -864,6 +853,7 @@ class SuperpositionTest(unittest.TestCase):
         tight = superposition_sensitivity(*args, scale=1e-2)[3]["cancellation"]
         self.assertAlmostEqual(tight / loose, 100.0, delta=1.0)
 
+    @unittest.skipUnless(ON_GPU, "reads cupy's memory pool")
     def test_memory_does_not_grow_with_the_number_of_steps(self):
         # the whole point: the standard adjoint stores N + 2 fields, this stores 3
         pool = cp.get_default_memory_pool()
@@ -917,7 +907,6 @@ class SuperpositionTest(unittest.TestCase):
             superposition_sensitivity(sim, source, indicator, ghost, objective)
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class ReconstructionTest(unittest.TestCase):
     def _both(self, sim):
         source, sensors, indicator, objective = _problem(sim, 5.0, 1.0)
@@ -1001,6 +990,7 @@ class ReconstructionTest(unittest.TestCase):
         rel, _ = _discrepancy(sim, _combine(sim, g), _combine(sim, gr))
         self.assertLess(rel, 1e-12, f"relative difference {rel:.3e}")
 
+    @unittest.skipUnless(ON_GPU, "reads cupy's memory pool")
     def test_memory_grows_with_the_strip_not_the_grid(self):
         # the point: the strip is a ring of nodes where the history is a grid of them
         pool = cp.get_default_memory_pool()
@@ -1102,6 +1092,7 @@ class ReconstructionTest(unittest.TestCase):
                     if checkpoints >= segments:
                         self.assertLess(info["sweeps"], 2.0)
 
+    @unittest.skipUnless(ON_GPU, "reads cupy's memory pool")
     def test_checkpoint_memory_does_not_grow_with_the_number_of_steps(self):
         # only the traces still grow with N, which every variant records
         pool = cp.get_default_memory_pool()
@@ -1152,7 +1143,6 @@ class CheckpointScheduleTest(unittest.TestCase):
                     self.assertEqual(leaves, list(range(segments))[::-1])
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class SpectralTest(unittest.TestCase):
     frequencies = (5.0, 7.0)
 
@@ -1203,7 +1193,6 @@ class SpectralTest(unittest.TestCase):
             )
 
 
-@unittest.skipUnless(HAS_CUDA, "requires CuPy and a CUDA device")
 class SourceGradientTest(unittest.TestCase):
     def _nodes(self, sim):
         # wall, corner and interior, so a misweighting cannot hide in a global factor

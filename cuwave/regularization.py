@@ -13,10 +13,9 @@ import abc
 import math
 from collections.abc import Sequence
 
-import cupy as cp
-import cupy.typing as cpt
-import cupyx.scipy.ndimage as ndi
 import numpy.typing as npt
+
+from .backend import cp, cpt, ndi
 
 
 # -------------------------------------- helpers --------------------------------------
