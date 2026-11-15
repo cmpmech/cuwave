@@ -76,7 +76,7 @@ pip install cuwave
 
 Requires an NVIDIA GPU and [CuPy](https://docs.cupy.dev/en/stable/install.html) matching your CUDA toolkit (e.g. `pip install cupy-cuda12x`), which is not pulled in automatically, or the CPU fallback below. For the full installation, including the optional PyTorch and running the tests, see [docs/install.md](https://github.com/cmpmech/cuwave/blob/main/docs/install.md).
 
-### CPU fallback
+### CPU fallback (beta)
 
 CuPy on a GPU stays the default. Without an NVIDIA GPU (or without CuPy) CuWave runs on the CPU instead: NumPy holds the arrays, and the same CUDA kernels are compiled for the CPU at first use and cached in `~/.cache/cuwave`. Results agree with the GPU to floating-point round-off. To force the CPU on a machine with a GPU, set `CUWAVE_DEVICE=cpu` before CuWave is imported, on the command line (`CUWAVE_DEVICE=cpu python examples/forward/scalarND.py`) or at the top of a script, as [examples/forward/scalar2D_cpu.py](https://github.com/cmpmech/cuwave/blob/main/examples/forward/scalar2D_cpu.py) does.
 
