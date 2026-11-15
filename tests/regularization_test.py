@@ -117,12 +117,13 @@ class PenaltyGradientTest(unittest.TestCase):
 class MapAdjointTest(unittest.TestCase):
     """A map returns an array, so `grad` is its transpose against a random `dy`"""
 
-    def _check(self, regularization, x, places=6):
+    def _check(self, regularization, x, rtol=1e-7):
         v, dy = _design(x.shape, seed=5), _design(x.shape, seed=6)
         jacobian = _directional(regularization, x, v)
         forward = float(cp.sum(dy * jacobian))
         backward = float(cp.sum(v * regularization.grad(x, dy)))
-        self.assertAlmostEqual(forward, backward, places=places)
+        # relative: the sums reach hundreds, and their difference scales with them
+        self.assertAlmostEqual(forward / backward, 1.0, delta=rtol)
 
     def test_the_density_filter_is_its_own_transpose_against_dy(self):
         x = _design()
