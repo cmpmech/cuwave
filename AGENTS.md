@@ -28,6 +28,9 @@ python examples/fwi/scalar2D_fwi_adam.py  # drivers are run directly
   the GPU-only classes (blocked, fused, streamed, marched, folded steps, several devices)
   carry `skipUnless(ON_GPU)` and torch `skipUnless(HAS_TORCH)`, so check the pass/skip
   counts. A CPU run needs a C++ compiler with OpenMP and scipy, and takes far longer.
+- `tests/cpu_test.py` pins `cpu.RawModule` to cupy's launch contract and, on a GPU
+  machine, holds every equation's CPU `sensitivity` (a subprocess under
+  `CUWAVE_DEVICE=cpu`) to the GPU's at float64 round-off.
 - `ruff` is not a project dependency; run `ruff check` from wherever it is installed
   (88 columns). Do not run `ruff format`: the house-style banners sit at column 0 even
   inside a block, which the formatter would indent. `.cu` files are clang-format LLVM
