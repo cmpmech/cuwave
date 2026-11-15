@@ -63,7 +63,8 @@ def _setup(damped=False, precision="float32", order=4):
         wavespeed=1.0,
         density=1.0,
     )
-    indicator = 1.0 + 0.2 * cp.random.RandomState(0).rand(*sim.Nx_padded)
+    uniform = np.random.RandomState(0).rand(*sim.Nx_padded)
+    indicator = 1.0 + 0.2 * cp.asarray(uniform)
     indicator = indicator.astype(sim.dtype)
     if damped:
         sim.damping = sponge(sim, indicator, 6, 0.05)
@@ -176,7 +177,8 @@ class MarchTest(unittest.TestCase):
             source = Source(
                 cp.array([[1], [20], [24]], cp.int32), cp.asarray(signal, sim.dtype)
             )
-            indicator = 1.0 + 0.2 * cp.random.RandomState(0).rand(*sim.Nx_padded)
+            uniform = np.random.RandomState(0).rand(*sim.Nx_padded)
+            indicator = 1.0 + 0.2 * cp.asarray(uniform)
             args = (sim, source, indicator.astype(sim.dtype), sensors)
             objective = l2_misfit(cp.zeros((N, 3), sim.dtype))
             for run in (simulate, sensitivity, reconstruction_sensitivity):
@@ -265,7 +267,8 @@ class DomainTest(unittest.TestCase):
         observed = cp.zeros((sim.N, sensors.shape[1]), sim.dtype)
         objective = l2_misfit(observed)
         gradient = source_sensitivity(sim, source, indicator, sensors, objective)[1]
-        direction = cp.random.RandomState(1).standard_normal(source.signal.shape)
+        noise = np.random.RandomState(1).standard_normal(source.signal.shape)
+        direction = cp.asarray(noise)
         h = 1e-3
 
         def cost(signal):

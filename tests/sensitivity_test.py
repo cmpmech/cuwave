@@ -298,8 +298,8 @@ class GradientTest(unittest.TestCase):
         return traces
 
     def _random(self, sim, base, spread):
-        cp.random.seed(0)
-        return (base + spread * cp.random.rand(*sim.Nx_padded)).astype(sim.dtype)
+        uniform = cp.asarray(np.random.RandomState(0).rand(*sim.Nx_padded))
+        return (base + spread * uniform).astype(sim.dtype)
 
     def test_scalar_gradient_matches_finite_differences(self):
         sim = _scalar()
@@ -1233,8 +1233,8 @@ class SourceGradientTest(unittest.TestCase):
         self.assertLess(error, tol, f"source gradient off by {error:.2e}")
 
     def _random(self, sim, base, spread):
-        cp.random.seed(0)
-        return (base + spread * cp.random.rand(*sim.Nx_padded)).astype(sim.dtype)
+        uniform = cp.asarray(np.random.RandomState(0).rand(*sim.Nx_padded))
+        return (base + spread * uniform).astype(sim.dtype)
 
     def test_scalar_source_gradient_matches_finite_differences(self):
         sim = _scalar()

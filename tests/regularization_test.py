@@ -20,6 +20,8 @@ that `set` retunes a live instance the way a `continuation` schedule needs.
 import math
 import unittest
 
+import numpy as np
+
 from cuwave.backend import cp
 from cuwave.regularization import (
     SIMP,
@@ -39,8 +41,8 @@ STEP = 1e-6
 # -------------------------------------- helpers --------------------------------------
 def _design(shape=(9, 7), low=0.15, high=0.85, seed=0):
     """A float64 design strictly inside [0, 1], where every map is differentiable."""
-    cp.random.seed(seed)
-    return cp.random.uniform(low, high, size=shape).astype(cp.float64)
+    rng = np.random.RandomState(seed)  # numpy's, so both backends see the same design
+    return cp.asarray(rng.uniform(low, high, size=shape), dtype=cp.float64)
 
 
 def _smooth(shape=(24, 20), seed=0):
