@@ -19,6 +19,8 @@ const SPEED = 0.25; // window diagonals a wave travels per second
 const FPS = 30; // frames drawn a second, the time between them the solver's
 const BUDGET = 0.6; // share of a frame the solver may take
 const SMALLEST = 2; // finest CPU cell, CSS px
+const SETTLE = 1200; // ms the animation runs on the empty field before input
+const BEHIND = 0.85; // share of the due steps below which the grid coarsens
 const THREADS = Math.min(8, Math.max(1, (navigator.hardwareConcurrency || 2) >> 1));
 // interaction
 const BRUSH = 10; // wall radius, CSS px
@@ -36,13 +38,24 @@ const help = document.getElementById("help");
 const badge = document.getElementById("backend");
 const edges = [...document.querySelectorAll(".edge")];
 const dark = matchMedia("(prefers-color-scheme: dark)");
+const root = document.documentElement;
+const mode = () => root.dataset.theme || (dark.matches ? "dark" : "light"); // the toggle, else the system
 const modes = [0, 0, 0, 2]; // top, bottom, left, right
 let solver, backend, rate, cell, rows, cols, lambda, margin, theme, lut, wallColor;
 let stepsPerSecond, msPerStep, dirty = null, debt = 0, last = performance.now();
 let quiet = 0, redraw = true; // when the last burst has faded, and whether to draw anyway
+const pace = { due: 0, done: 0 }; // steps owed and taken while stepping, for keepUp
 
+document.querySelector(".theme").addEventListener("click", () => {
+  root.dataset.theme = mode() === "dark" ? "light" : "dark";
+  try {
+    localStorage.setItem("theme", root.dataset.theme);
+  } catch (e) {}
+  applyTheme();
+});
 if (matchMedia("(pointer: coarse)").matches)
-  for (const line of help.children) line.textContent = line.textContent.replace("click", "tap");
+  for (const line of help.children)
+    if (line.textContent.includes("click")) line.textContent = line.textContent.replace("click", "tap");
 script(crossOriginIsolated ? "solver-threads.js" : "solver.js")
   .then(() => Solver())
   .then(start)
@@ -57,14 +70,18 @@ async function start(module) {
   modes.forEach((mode, face) => solver._boundary(face, mode));
   rate = await calibrate(threads);
   cell = cellSize();
-  badge.textContent = backend.name === "webgpu" ? "gpu" : `cpu ×${threads}`;
-  badge.title = `${(rate / 1e6).toFixed(0)} M node updates/s, ${cell.toFixed(1)} px cells`;
+  document.getElementById("pitch").hidden = backend.name === "webgpu";
   applyTheme();
   resize();
   dark.addEventListener("change", applyTheme);
-  addEventListener("resize", resize);
-  listen();
+  addEventListener("resize", () => resize());
+  document.fonts.ready.then(fit);
   requestAnimationFrame(animate);
+  quiet = performance.now() + SETTLE; // the empty field stepped, so keepUp can refit
+  await new Promise((resolve) => setTimeout(resolve, SETTLE));
+  badge.textContent = backend.name === "webgpu" ? "gpu" : `cpu \u00d7${threads}`;
+  badge.title = `${(rate / 1e6).toFixed(0)} M node updates/s, ${cell.toFixed(1)} px cells`;
+  listen();
 }
 
 // -------------------------------------- helpers
@@ -83,7 +100,9 @@ function geometry(size) {
   return { lambda, margin: Math.round(SPONGE * lambda) };
 }
 
-// node updates per second, timed on a scratch grid
+// node updates per second on a scratch grid, timed as the animation steps:
+// for BUDGET of a frame, then idle, which runs slower than steps back to back
+// where cores clock down or other work evicts the grid from the cache
 async function calibrate(threads) {
   const [r, c] = backend.name === "webgpu" ? [1000, 1500] : [200 * threads, 300];
   const { margin } = geometry(4);
@@ -91,19 +110,26 @@ async function calibrate(threads) {
   solver._resize(r, c);
   backend.resize(r, c);
   solver._burst(r / 2, c / 2, 1, 0.1, CYCLES);
-  backend.advance(4);
-  await backend.finished();
-  let steps = 0;
-  const start = performance.now();
-  while (performance.now() - start < 150) {
-    backend.advance(8);
-    await backend.finished();
-    steps += 8;
+  const frame = 1e3 / FPS;
+  let steps = 0, busy = 0;
+  for (let k = 0; k < 10; ++k) {
+    const start = performance.now();
+    let n = 0;
+    while (performance.now() - start < BUDGET * frame) {
+      backend.advance(2);
+      await backend.finished();
+      n += 2;
+    }
+    const elapsed = performance.now() - start;
+    if (k >= 2) {
+      steps += n; // the first frames warm up
+      busy += elapsed;
+    }
+    await new Promise((resolve) => setTimeout(resolve, frame - elapsed));
   }
-  const measured = (steps * backend.cost(r, c, margin)) / ((performance.now() - start) / 1e3);
   solver._clear();
   backend.clear();
-  return measured;
+  return (steps * backend.cost(r, c, margin)) / (busy / 1e3);
 }
 
 // the finest cell whose steps at SPEED fit the BUDGET of the measured rate
@@ -120,7 +146,7 @@ function cellSize() {
 }
 
 function applyTheme() {
-  theme = THEMES[dark.matches ? "dark" : "light"];
+  theme = THEMES[mode()];
   lut = new Uint32Array(256);
   for (let i = 0; i < 256; ++i) lut[i] = rgba(theme.colors(i / 255));
   wallColor = rgba(theme.wall);
@@ -135,8 +161,9 @@ function rgba([r, g, b]) {
   return ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0;
 }
 
-// the grid at the window, the field and walls of the overlap kept
-function resize() {
+// the grid at the window, cells `scale` times the old ones, the field and
+// walls resampled onto it
+function resize(scale = 1) {
   const dpr = devicePixelRatio || 1;
   canvas.width = Math.round(innerWidth * dpr);
   canvas.height = Math.round(innerHeight * dpr);
@@ -147,10 +174,36 @@ function resize() {
   msPerStep = (1e3 * backend.cost(rows, cols, margin)) / rate;
   const decay = 2 / (FADE * stepsPerSecond * COURANT); // u ~ exp(-decay t / 2)
   solver._configure(COURANT, decay, margin, BETA);
-  solver._resize(rows, cols);
+  solver._resize(rows, cols, scale);
   backend.resize(rows, cols);
   backend.view(rows, cols, cell * dpr, theme.limit, lut, wallColor);
+  pace.due = pace.done = 0;
   redraw = true;
+  fit();
+}
+
+// a coarser grid where a second of stepping fell behind, at the rate the
+// animation itself reached: drawing, a busy machine and clocked-down cores
+// make it slower than the calibration, and change over time
+function keepUp() {
+  if (pace.due < stepsPerSecond) return;
+  if (pace.done < BEHIND * pace.due && cell < 32) {
+    rate = (1e3 * backend.cost(rows, cols, margin)) / msPerStep;
+    const old = cell;
+    cell = Math.max(1.1 * cell, cellSize());
+    resize(cell / old);
+    badge.title = `${(rate / 1e6).toFixed(0)} M node updates/s, ${cell.toFixed(1)} px cells`;
+  }
+  pace.due = pace.done = 0;
+}
+
+// the bar stacked where it would cover the top edge's label
+function fit() {
+  const bar = document.getElementById("bar");
+  document.body.classList.remove("narrow");
+  const a = edges[0].getBoundingClientRect(), b = bar.getBoundingClientRect();
+  const hit = a.right > b.left && a.left < b.right && a.bottom > b.top && a.top < b.bottom;
+  document.body.classList.toggle("narrow", hit);
 }
 
 function animate(now) {
@@ -170,6 +223,10 @@ function animate(now) {
   debt = Math.min(debt + elapsed * stepsPerSecond, cap);
   const steps = now < quiet ? Math.floor(debt) : 0; // a faded field is not stepped
   debt -= Math.floor(debt);
+  if (now < quiet) {
+    pace.due += elapsed * stepsPerSecond;
+    pace.done += steps;
+  }
   if (steps) {
     const start = performance.now();
     backend.advance(steps);
@@ -181,6 +238,7 @@ function animate(now) {
   }
   if (steps || redraw) backend.draw();
   redraw = false;
+  keepUp();
 }
 
 // the faces' modes rebuilt into the grid
@@ -190,6 +248,7 @@ function rebuild() {
   backend.upload(0, solver._extent(), true);
   edges.forEach((edge, face) => (edge.textContent = MODES[modes[face]]));
   redraw = true;
+  fit();
 }
 
 // --------------------------------------- backend

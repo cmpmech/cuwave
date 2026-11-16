@@ -62,12 +62,13 @@ std::vector<float> signal, weights;
 
 // ------------------------------------------- threads
 #ifdef CUWAVE_THREADS
-constexpr int CHUNK = 4;   // blocks a thread takes at once
-constexpr int SPIN = 4000; // polls before a worker sleeps between frames
-int workers = 0;           // detached, so they end with the process
-std::atomic<int> generation{0}, finished{0};
-std::atomic<long> next{0};
-long blocks = 0;
+constexpr int SPIN = 1 << 16; // polls before a worker sleeps, past a frame's steps
+constexpr int FIELD = 20;     // bits of the block count and of the next block
+constexpr uint64_t MASK = (uint64_t(1) << FIELD) - 1;
+int workers = 0; // detached, so they end with the process
+std::atomic<int> generation{0};
+std::atomic<uint64_t> cursor{0}; // epoch, block count, next block: one word
+std::atomic<long> done{0};
 std::function<void(long)> job;
 
 void sleep_on(std::atomic<int> &word, const int seen) {
@@ -86,11 +87,19 @@ void wake_all(std::atomic<int> &word) {
 #endif
 }
 
-// the blocks left of the current job, CHUNK at a time
+// the blocks left of the current job, one at a time; a block is claimed with
+// its job's epoch, and `parallel` waits for every claimed one, so `job` holds
 void drain() {
-  for (long b; (b = next.fetch_add(CHUNK)) < blocks;)
-    for (long c = b; c < std::min(b + CHUNK, blocks); ++c)
-      job(c);
+  for (uint64_t v = cursor.load();;) {
+    const long b = long(v & MASK), count = long(v >> FIELD & MASK);
+    if (b >= count)
+      return;
+    if (!cursor.compare_exchange_weak(v, v + 1))
+      continue; // v reloaded
+    job(b);
+    done.fetch_add(1);
+    v = cursor.load();
+  }
 }
 
 // a worker from generation `seen` on, which it has already run
@@ -102,18 +111,25 @@ void work(int seen) {
       sleep_on(generation, seen);
     seen = generation.load();
     drain();
-    finished.fetch_add(1);
   }
 }
 
-// `count` blocks of `run` across the pool and this thread, returning when done
+// `count` blocks of `run` across this thread and the workers awake, returning
+// when all are done, so a worker still asleep holds no step up
 void parallel(const long count, std::function<void(long)> run) {
-  job = std::move(run), blocks = count;
-  next = 0, finished = 0;
+  if (count > long(MASK)) { // past the packed count: this thread alone
+    for (long b = 0; b < count; ++b)
+      run(b);
+    return;
+  }
+  job = std::move(run);
+  done = 0;
+  const uint64_t epoch = (cursor.load() >> 2 * FIELD) + 1;
+  cursor = epoch << 2 * FIELD | uint64_t(count) << FIELD;
   generation.fetch_add(1);
   wake_all(generation);
   drain();
-  while (finished.load() < workers)
+  while (done.load() < count)
     ;
 }
 #endif
@@ -362,9 +378,10 @@ void repaint(const int first, const int last) {
 // the flat index of visible node (0, 0)
 int origin() { return (margin + 1) * n1 + margin + 1; }
 
-// a grid of `rows` by `cols` visible nodes, the field and walls of the
-// overlap kept
-void resize(const int rows, const int cols) {
+// a grid of `rows` by `cols` visible nodes, each `scale` old nodes wide, the
+// walls and field sampled at the old node under each new one's center; a new
+// step spans `scale` old ones, so the earlier level keeps the time derivative
+void resize(const int rows, const int cols, const double scale) {
   const int m1 = n1, from = origin(), m0 = n0 - 2 * margin - 2,
             mc = n1 - 2 * margin - 2;
   std::vector<float> old[2] = {U[(t + 1) % 2], U[t % 2]};
@@ -375,12 +392,16 @@ void resize(const int rows, const int cols) {
   solid.assign(n0 * n1, 0);
   stiff.assign(n0 * n1, 1);
   const int to = origin();
-  for (int r = 0; r < std::min(m0, rows); ++r)
-    for (int c = 0; c < std::min(mc, cols); ++c) {
-      const int i = from + r * m1 + c, j = to + r * n1 + c;
+  for (int r = 0; r < rows; ++r)
+    for (int c = 0; c < cols; ++c) {
+      const int a = int((r + 0.5) * scale), b = int((c + 0.5) * scale);
+      if (a >= m0 || b >= mc)
+        continue;
+      const int i = from + a * m1 + b, j = to + r * n1 + c;
       solid[j] = walls[i];
       U[1][j] = old[0][i]; // the latest level
-      U[0][j] = old[1][i];
+      U[0][j] = scale == 1 ? old[1][i]
+                           : float(old[0][i] - scale * (old[0][i] - old[1][i]));
     }
   t = 0, bursts.clear();
   rebuild();

@@ -91,7 +91,7 @@ class AgreementTest(unittest.TestCase):
         )
         for face, mode in enumerate(self.MODES):
             s.boundary(face, mode)
-        s.resize(self.ROWS, self.COLS)
+        s.resize(self.ROWS, self.COLS, ctypes.c_double(1.0))
         s.clear()
         shape = (s.extent(), s.stride())
         walls = np.ctypeslib.as_array(s.walls(), shape=shape)
@@ -210,6 +210,21 @@ class AgreementTest(unittest.TestCase):
                     self.assertEqual(self.solvers[order].threads(threads), threads)
                     demo = self._demo(order)
                     np.testing.assert_allclose(demo, reference, rtol=0, atol=tolerance)
+
+    def test_a_coarser_grid_samples_the_old_one(self):
+        self._demo(4)
+        s = self.solvers[4]
+        shape = (s.extent(), s.stride())
+        o = self.WIDTH + 1
+        field = np.ctypeslib.as_array(s.field(), shape=shape)[o:-o, o:-o].copy()
+        walls = np.ctypeslib.as_array(s.walls(), shape=shape)[o:-o, o:-o].copy()
+        s.resize(self.ROWS // 2, self.COLS // 2, ctypes.c_double(2.0))
+        shape = (s.extent(), s.stride())
+        coarse = np.ctypeslib.as_array(s.field(), shape=shape)[o:-o, o:-o]
+        solid = np.ctypeslib.as_array(s.walls(), shape=shape)[o:-o, o:-o]
+        # the old node under each new node's center, the field zero in a wall
+        np.testing.assert_array_equal(solid, walls[1::2, 1::2])
+        np.testing.assert_array_equal(coarse, np.where(solid, 0, field[1::2, 1::2]))
 
     def test_the_plan_adds_the_excitation(self):
         for order in self.ORDERS:

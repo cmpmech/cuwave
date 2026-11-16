@@ -6,11 +6,17 @@
 <meta name="color-scheme" content="light dark">
 <meta name="description" content="The 2D scalar wave equation in the browser, stepped by cuwave's kernels compiled to WebAssembly.">
 <title>cuwave demo</title>
+<script>
+// the light or dark mode chosen with the toggle, before the page is drawn
+try { const theme = localStorage.getItem("theme"); if (theme) document.documentElement.dataset.theme = theme; } catch (e) {}
+</script>
 <script src="coi.js"></script>
 <style>
   @font-face { font-family: "CMU Typewriter"; src: url(fonts/cmuntt.otf); } /* fonts/OFL.txt */
+  @font-face { font-family: "CMU Typewriter"; font-weight: 700; src: url(fonts/cmuntb.otf); }
   :root { --fg: #222; --bg: #fff; }
-  @media (prefers-color-scheme: dark) { :root { --fg: #ddd; --bg: #190c09; } }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --fg: #ddd; --bg: #190c09; } }
+  :root[data-theme="dark"] { --fg: #ddd; --bg: #190c09; }
   html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--fg);
     font: 16px/1.4 "CMU Typewriter", ui-monospace, monospace; }
   canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block;
@@ -18,8 +24,9 @@
   button, a { color: inherit; font: inherit; background: none; border: 0; padding: 6px 8px;
     cursor: pointer; text-decoration: none; }
   button:hover, a:hover, button:focus-visible, a:focus-visible { text-decoration: underline; }
-  #bar, .edge { text-shadow: 0 0 2px var(--bg), 0 0 5px var(--bg), 0 0 10px var(--bg); }
+  #bar, .edge, .theme { text-shadow: 0 0 2px var(--bg), 0 0 5px var(--bg), 0 0 10px var(--bg); }
   #bar { position: fixed; top: 8px; right: 8px; display: flex; align-items: center; }
+  .theme { position: fixed; top: 8px; left: 8px; line-height: 1; font-size: 18px; }
   #backend { padding: 6px 8px; opacity: 0.6; }
   .edge { position: fixed; }
   .edge:nth-of-type(1) { top: 8px; left: 50%; transform: translateX(-50%); }
@@ -28,10 +35,14 @@
   .edge:nth-of-type(3) { left: 8px; transform: translateY(-50%) rotate(180deg); }
   .edge:nth-of-type(4) { right: 8px; transform: translateY(-50%); }
   #help { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); width: max-content;
-    max-width: calc(100vw - 32px); box-sizing: border-box; padding: 18px 26px; font-size: 22px;
+    max-width: calc(100vw - 96px); box-sizing: border-box; padding: min(18px, 4vw) min(26px, 5vw);
+    font-size: min(22px, 5.4vw);
     background: var(--bg); border: 1px solid var(--fg); pointer-events: none; transition: opacity 0.6s; }
   #help p { margin: 4px 0; }
   #help.gone { opacity: 0; }
+  #help #pitch { margin-top: 1em; font-size: 0.8em; opacity: 0.7; }
+  .whole { white-space: nowrap; }
+  body.narrow #bar { flex-direction: column; align-items: flex-end; } /* demo.js fit */
 </style>
 </head>
 <body>
@@ -42,6 +53,7 @@
   <button class="edge" type="button" aria-label="left boundary condition"></button>
   <button class="edge" type="button" aria-label="right boundary condition"></button>
 </div>
+<button class="theme" type="button" aria-label="Switch between light and dark">&#9680;</button>
 <div id="bar">
   <span id="backend"></span>
   <button id="reset" type="button">reset</button>
@@ -51,6 +63,7 @@
   <p>click to emit a source</p>
   <p>click &amp; drag to draw an obstacle</p>
   <p>click an edge label to change its boundary condition</p>
+  <p id="pitch">want it about 100&times; faster? on an NVIDIA GPU:<br><b>pip install cuwave <span class="whole">cupy-cuda12x</span></b></p>
 </div>
 <noscript><p style="padding: 16px">The demo needs JavaScript and WebAssembly.</p></noscript>
 <script src="gpu.js"></script>
