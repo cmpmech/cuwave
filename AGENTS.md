@@ -41,7 +41,7 @@ python examples/fwi/scalar2D_fwi_adam.py  # drivers are run directly
 
 ## Style is defined by two skills — invoke them
 
-- **`cuwave-code-style`** before writing or editing any `.py` or `.cu`.
+- **`cu-code-style`** (shared, in `~/.claude/skills/`; its `cuwave.md` holds this repo's part) before writing or editing any `.py` or `.cu`.
 - **`cuwave-docs-style`** before writing or editing anything in `docs/`.
 
 They are authoritative and detailed (banner arithmetic, docstring register, import aliases,

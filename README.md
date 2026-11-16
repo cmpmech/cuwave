@@ -1,7 +1,6 @@
 # CuWave
 
-**[Interactive demo](https://cmpmech.github.io/cuwave/)**: the 2D wave equation in your browser, stepped by CuWave's own kernels compiled to WebAssembly.
-Click to emit a wave, drag to draw obstacles, and click the edge labels to switch between Neumann, Dirichlet and absorbing boundaries.
+**[Interactive demo](https://cmpmech.github.io/cuwave/)**
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cmpmech/cuwave/main/.assets/readme-dark.webp">

@@ -54,7 +54,7 @@ module that is two alternatives, and the page that says when to pick which),
   belongs to the **cell** either side of the node: *cell stiffness*, *cell flux*,
   *cell-flux stencil*, *the two cells the node borders*. Never *cell face*: a cell's own
   boundaries lie on the nodes, so it names the wrong thing. The geometry table in
-  `cuwave-code-style` pins the whole vocabulary.
+  `cu-code-style` (`cuwave.md`) pins the whole vocabulary.
 
 ## Page shape
 
@@ -199,7 +199,7 @@ $$\nabla\cdot(k\nabla u)|_i\approx\ldots$$
 
 ## What the code sends here
 
-`cuwave-code-style` holds every comment to a single line, so a derivation or a caller-facing
+`cu-code-style` holds every comment to a single line, so a derivation or a caller-facing
 trade-off that outgrows one line arrives here. It lands in the closing paragraph of the
 section it belongs to, bound to identifiers by the usual `with ...` sentence, not as a
 transplanted comment block and not as a section of its own.
