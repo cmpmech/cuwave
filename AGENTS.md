@@ -340,6 +340,20 @@ driver (a metalens), which is `examples/tato/`'s shape with `intensity` in place
 `examples/validation/` cross-checks the Maxwell classes against fdtdx: one script runs in a
 separate jax venv and writes `tests/reference/*.npz`, which `FdtdxReferenceTest` replays.
 
+`web/` is the browser demo published to GitHub Pages by `.github/workflows/pages.yml`:
+`build.sh` concatenates what `cpu.RawModule` compiles (`cpu.hpp`, the stencil table,
+`common.cuh`, `scalar.cu`, order 4 by default) and compiles it with `solver.cpp` to
+WebAssembly twice, `solver.js` and `solver-threads.js` (a pool splitting `fd_kernel`'s
+blocks; it needs cross-origin isolation, which `coi.js` supplies through a service worker
+where the host sends no headers), so the page steps the unchanged `fd_kernel`. Each face
+is a margin off the domain (Neumann), behind `dirichlet` nodes (Dirichlet) or a sponge
+(absorbing). `solver.cpp` ports `domain_cells`, `domain_tiles`, `sponge`,
+`excitation_weights` and `simulate`'s step order by hand; a change to any of them, or to
+`fd_kernel`'s arguments, must be mirrored there, and `tests/web_test.py` (bitwise on the
+CPU backend, one and four threads, orders 2 and 4) catches a mismatch. `gpu.js` is a WGSL
+port of the same step, used only with `?gpu`; no test covers it (no WebGPU in CI), so a
+change to `fd_kernel` must be mirrored there by hand too.
+
 ### Docs (`docs/`)
 
 An Obsidian wiki (one page per module, indexed by `docs/Home.md`) carrying the *what and

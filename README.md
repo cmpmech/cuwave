@@ -1,9 +1,12 @@
 # CuWave
 
-<picture>
+**[Interactive demo](https://cmpmech.github.io/cuwave/)**: the 2D wave equation in your browser, stepped by CuWave's own kernels compiled to WebAssembly.
+Click to emit a wave, drag to draw obstacles, and click the edge labels to switch between Neumann, Dirichlet and absorbing boundaries.
+
+<a href="https://cmpmech.github.io/cuwave/"><picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cmpmech/cuwave/main/.assets/readme-dark.webp">
-  <img src="https://raw.githubusercontent.com/cmpmech/cuwave/main/.assets/readme-light.webp" width="100%">
-</picture>
+  <img src="https://raw.githubusercontent.com/cmpmech/cuwave/main/.assets/readme-light.webp" width="100%" alt="interactive demo">
+</picture></a>
 
 **CuWave** is a GPU-accelerated (single or multi), differentiable finite difference wave propagation code.
 Possible applications include

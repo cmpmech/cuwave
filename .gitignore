@@ -15,6 +15,10 @@ venv/
 ruff.toml
 
 # Generated output
+web/module.cpp
+web/solver.js
+web/solver-threads.js
+web/solver*.so
 *.pdf
 *.webm
 

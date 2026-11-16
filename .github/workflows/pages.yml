@@ -1,0 +1,55 @@
+name: pages
+
+# the browser demo (web/): cuwave's scalar kernels compiled to WebAssembly and
+# published to GitHub Pages, whose source must be set to "GitHub Actions"
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "cuwave/kernels/**"
+      - "cuwave/stencils.py"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # em++ from the pinned emscripten image, as a local build runs it
+      - name: build
+        run: |
+          pip install numpy
+          EMXX="docker run --rm -v $PWD/web:/src -w /src -u $(id -u):$(id -g) emscripten/emsdk:4.0.10 em++" \
+            bash web/build.sh
+          mkdir site
+          cp -r web/index.html web/demo.js web/gpu.js web/coi.js web/solver.js web/solver-threads.js web/fonts site/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
