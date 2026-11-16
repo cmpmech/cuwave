@@ -2,14 +2,15 @@
 
 The demo compiles cuwave's own scalar kernels, but drives them with its own C++: the
 margins behind its faces (outside the domain for Neumann, behind held nodes for
-Dirichlet, a sponge for absorbing), the domain cells and tiles of its walls, the damping,
-the weights and sine bursts of its excitation and the order of the step, the excitation
-and the Neumann refill are ports of `domain`, `dirichlet`, `domain_cells`, `domain_tiles`,
-`sponge`, `excitation_weights`, `sineburst` and `simulate`. `AgreementTest` runs both on
-one walled, damped grid with every face mode and two bursts, at orders 2 and 4 and on one
-thread and four, and holds the demo's field to `simulate`'s, built natively from the source the browser gets:
-bitwise on the CPU backend, which compiles the kernels as the demo does, and to the GPU's
-fast-math rounding there. The source schedule a GPU steps with is held to
+Dirichlet, a sponge for absorbing), the domain cells and tiles of its walls, the
+damping, the weights and sine bursts of its excitation and the order of the step, the
+excitation and the Neumann refill are ports of `domain`, `dirichlet`, `domain_cells`,
+`domain_tiles`, `sponge`, `excitation_weights`, `sineburst` and `simulate`.
+`AgreementTest` runs both on one walled, damped grid with every face mode and two
+bursts, at orders 2 and 4 and on one thread and four, and holds the demo's field to
+`simulate`'s, built natively (in a temporary folder) from the source the browser gets:
+bitwise on the CPU backend, which compiles the kernels as the demo does, and to the
+GPU's fast-math rounding there. The source schedule a GPU steps with is held to
 `excitation_weights` times the signal. It needs a C++ compiler, not a GPU.
 """
 
@@ -18,6 +19,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -53,16 +55,19 @@ class AgreementTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.solvers = {}
+        build = tempfile.mkdtemp()
+        cls.addClassCleanup(shutil.rmtree, build)
         for order in cls.ORDERS:
             environment = {
                 **os.environ,
                 "PYTHON": sys.executable,
                 "SPACE_ORDER": str(order),
+                "OUT": build,
             }
             subprocess.run(
                 ["bash", WEB / "build.sh", "native"], check=True, env=environment
             )
-            solver = ctypes.CDLL(str(WEB / f"solver{order}.so"))
+            solver = ctypes.CDLL(str(Path(build) / f"solver{order}.so"))
             solver.field.restype = ctypes.POINTER(ctypes.c_float)
             solver.walls.restype = ctypes.POINTER(ctypes.c_ubyte)
             solver.plan.restype = ctypes.POINTER(_Source)
