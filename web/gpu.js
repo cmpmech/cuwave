@@ -170,11 +170,11 @@ const MAX_STEPS = 64; // steps a submission, the plan's rows
 const SLOTS = 16; // sources a step, solver.cpp's SOURCES
 
 // the GPU backend over `solver`'s grid on `canvas` at Courant number `courant`,
-// or null without WebGPU
+// throwing why where WebGPU is missing or fails
 async function gpuBackend(solver, canvas, courant) {
-  if (!navigator.gpu) return null;
+  if (!navigator.gpu) throw new Error("no WebGPU here (switched off, or the page not on https)");
   const adapter = await navigator.gpu.requestAdapter();
-  if (!adapter) return null;
+  if (!adapter) throw new Error("WebGPU offers no GPU");
   const device = await adapter.requestDevice();
   device.pushErrorScope("validation");
   const R = solver._radius();

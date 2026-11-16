@@ -65,7 +65,10 @@ async function start(module) {
   solver = module;
   const threads = solver._threads(THREADS);
   if (new URLSearchParams(location.search).has("gpu"))
-    backend = await gpuBackend(solver, canvas, COURANT).catch(() => null);
+    backend = await gpuBackend(solver, canvas, COURANT).catch((e) => {
+      help.append(Object.assign(document.createElement("p"), { textContent: `no gpu: ${e.message ?? e}` }));
+      return null;
+    });
   backend ??= cpuBackend();
   modes.forEach((mode, face) => solver._boundary(face, mode));
   rate = await calibrate(threads);
