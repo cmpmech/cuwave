@@ -152,17 +152,22 @@ fn at(c: vec2i) -> i32 {
   return v.origin + k.y * v.stride + k.x;
 }
 
-// the field between the four nearest nodes, a wall where the nearest is one
+// a node's color: the wall's off the domain, else the field's
+fn color(c: vec2i) -> vec4f {
+  let i = at(c);
+  if (cells[i] == 0) { return unpack4x8unorm(v.wall); }
+  return unpack4x8unorm(lut[u32(clamp(127.5 + 127.5 * u[i] / v.limit, 0.0, 255.0))]);
+}
+
+// the colors of the four nearest nodes blended, as the CPU's image is scaled
 @fragment
 fn fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
   let x = position.xy / v.cell - 0.5;
-  if (cells[at(vec2i(round(x)))] == 0) { return unpack4x8unorm(v.wall); }
   let c = vec2i(floor(x));
-  let w = x - floor(x);
-  let top = mix(u[at(c)], u[at(c + vec2i(1, 0))], w.x);
-  let bottom = mix(u[at(c + vec2i(0, 1))], u[at(c + vec2i(1, 1))], w.x);
-  let i = clamp(127.5 + 127.5 * mix(top, bottom, w.y) / v.limit, 0.0, 255.0);
-  return unpack4x8unorm(lut[u32(i)]);
+  let w = fract(x);
+  let top = mix(color(c), color(c + vec2i(1, 0)), w.x);
+  let bottom = mix(color(c + vec2i(0, 1)), color(c + vec2i(1, 1)), w.x);
+  return mix(top, bottom, w.y);
 }
 `;
 

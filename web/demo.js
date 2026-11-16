@@ -1,8 +1,8 @@
 // The cuwave demo: the 2D scalar wave equation on a grid the size of the window,
 // stepped by cuwave's own kernels compiled to WebAssembly (solver.js, build.sh),
 // on a pool of threads where the page is cross-origin isolated (coi.js), or by
-// their WGSL port (gpu.js) with ?gpu. Classic scripts, so it also runs opened
-// as a file.
+// their WGSL port (gpu.js) where the browser offers WebGPU and the address does
+// not end in ?cpu. Classic scripts, so it also runs opened as a file.
 
 // ------------------------------------- settings
 // discretization
@@ -64,16 +64,18 @@ script(crossOriginIsolated ? "solver-threads.js" : "solver.js")
 async function start(module) {
   solver = module;
   const threads = solver._threads(THREADS);
-  if (new URLSearchParams(location.search).has("gpu"))
+  const asked = new URLSearchParams(location.search);
+  if (!asked.has("cpu"))
     backend = await gpuBackend(solver, canvas, COURANT).catch((e) => {
-      help.append(Object.assign(document.createElement("p"), { textContent: `no gpu: ${e.message ?? e}` }));
+      if (asked.has("gpu")) // only ?gpu says why it fell back
+        help.append(Object.assign(document.createElement("p"), { textContent: `no gpu: ${e.message ?? e}` }));
       return null;
     });
   backend ??= cpuBackend();
   modes.forEach((mode, face) => solver._boundary(face, mode));
-  rate = await calibrate(threads);
+  rate = backend.name === "webgpu" ? await calibrateGpu() : await calibrate(threads);
   cell = cellSize();
-  document.getElementById("pitch").hidden = backend.name === "webgpu";
+  document.getElementById("faster").hidden = backend.name === "webgpu"; // 100x is against the CPU
   applyTheme();
   resize();
   dark.addEventListener("change", applyTheme);
@@ -83,6 +85,9 @@ async function start(module) {
   quiet = performance.now() + SETTLE; // the empty field stepped, so keepUp can refit
   await new Promise((resolve) => setTimeout(resolve, SETTLE));
   badge.textContent = backend.name === "webgpu" ? "gpu" : `cpu \u00d7${threads}`;
+  // the other backend on a reload, since a canvas keeps its first context
+  if (backend.name === "webgpu") badge.href = "?cpu";
+  else if (asked.has("cpu") && navigator.gpu) badge.href = "?gpu";
   badge.title = `${(rate / 1e6).toFixed(0)} M node updates/s, ${cell.toFixed(1)} px cells`;
   listen();
 }
@@ -107,12 +112,8 @@ function geometry(size) {
 // for BUDGET of a frame, then idle, which runs slower than steps back to back
 // where cores clock down or other work evicts the grid from the cache
 async function calibrate(threads) {
-  const [r, c] = backend.name === "webgpu" ? [1000, 1500] : [200 * threads, 300];
-  const { margin } = geometry(4);
-  solver._configure(COURANT, 0, margin, BETA);
-  solver._resize(r, c);
-  backend.resize(r, c);
-  solver._burst(r / 2, c / 2, 1, 0.1, CYCLES);
+  const [r, c] = [200 * threads, 300];
+  const margin = scratch(r, c);
   const frame = 1e3 / FPS;
   let steps = 0, busy = 0;
   for (let k = 0; k < 10; ++k) {
@@ -120,7 +121,6 @@ async function calibrate(threads) {
     let n = 0;
     while (performance.now() - start < BUDGET * frame) {
       backend.advance(2);
-      await backend.finished();
       n += 2;
     }
     const elapsed = performance.now() - start;
@@ -133,6 +133,34 @@ async function calibrate(threads) {
   solver._clear();
   backend.clear();
   return (steps * backend.cost(r, c, margin)) / (busy / 1e3);
+}
+
+// node updates per second of the GPU, in batches doubled until one takes half a
+// second, since a GPU reports its work done late (Firefox polls every 100 ms)
+async function calibrateGpu() {
+  const [r, c] = [1000, 1500];
+  const margin = scratch(r, c);
+  let steps = 32, elapsed = 0;
+  while (elapsed < 500) {
+    steps *= 2;
+    const start = performance.now();
+    backend.advance(steps);
+    await backend.finished();
+    elapsed = performance.now() - start;
+  }
+  solver._clear();
+  backend.clear();
+  return (steps * backend.cost(r, c, margin)) / (elapsed / 1e3);
+}
+
+// a scratch grid of `r` by `c` nodes with a burst in its middle, returning its margin
+function scratch(r, c) {
+  const { margin } = geometry(4);
+  solver._configure(COURANT, 0, margin, BETA);
+  solver._resize(r, c, 1);
+  backend.resize(r, c);
+  solver._burst(r / 2, c / 2, 1, 0.1, CYCLES);
+  return margin;
 }
 
 // the finest cell whose steps at SPEED fit the BUDGET of the measured rate
@@ -233,11 +261,8 @@ function animate(now) {
   if (steps) {
     const start = performance.now();
     backend.advance(steps);
-    const record = () => {
-      msPerStep = 0.9 * msPerStep + (0.1 * (performance.now() - start)) / steps;
-    };
-    const done = backend.finished();
-    done ? done.then(record) : record(); // the CPU's steps are done on return
+    // the CPU's steps are done on return; the GPU keeps its calibrated pace
+    if (backend.name === "wasm") msPerStep = 0.9 * msPerStep + (0.1 * (performance.now() - start)) / steps;
   }
   if (steps || redraw) backend.draw();
   redraw = false;
@@ -293,7 +318,6 @@ function cpuBackend() {
       context.drawImage(image, 0, 0, cols * cell * dpr, rows * cell * dpr);
     },
     clear() {},
-    finished: () => null,
   };
 }
 

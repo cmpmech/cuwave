@@ -351,7 +351,8 @@ is a margin off the domain (Neumann), behind `dirichlet` nodes (Dirichlet) or a 
 `excitation_weights` and `simulate`'s step order by hand; a change to any of them, or to
 `fd_kernel`'s arguments, must be mirrored there, and `tests/web_test.py` (bitwise on the
 CPU backend, one and four threads, orders 2 and 4) catches a mismatch. `gpu.js` is a WGSL
-port of the same step, used only with `?gpu`; no test covers it (no WebGPU in CI), so a
+port of the same step, used where the browser offers WebGPU unless the address ends in
+`?cpu` (`?gpu` shows why it fell back); no test covers it (no WebGPU in CI), so a
 change to `fd_kernel` must be mirrored there by hand too.
 
 ### Docs (`docs/`)

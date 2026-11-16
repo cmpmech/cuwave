@@ -27,7 +27,8 @@ try { const theme = localStorage.getItem("theme"); if (theme) document.documentE
   #bar, .edge, .theme { text-shadow: 0 0 2px var(--bg), 0 0 5px var(--bg), 0 0 10px var(--bg); }
   #bar { position: fixed; top: 8px; right: 8px; display: flex; align-items: center; }
   .theme { position: fixed; top: 8px; left: 8px; line-height: 1; font-size: 18px; }
-  #backend { padding: 6px 8px; opacity: 0.6; }
+  #backend { opacity: 0.6; text-decoration: underline dotted; }
+  #backend:not([href]) { cursor: auto; text-decoration: none; }
   .edge { position: fixed; }
   .edge:nth-of-type(1) { top: 8px; left: 50%; transform: translateX(-50%); }
   .edge:nth-of-type(2) { bottom: 8px; left: 50%; transform: translateX(-50%); }
@@ -55,7 +56,7 @@ try { const theme = localStorage.getItem("theme"); if (theme) document.documentE
 </div>
 <button class="theme" type="button" aria-label="Switch between light and dark">&#9680;</button>
 <div id="bar">
-  <span id="backend"></span>
+  <a id="backend"></a>
   <button id="reset" type="button">reset</button>
   <a href="https://github.com/cmpmech/cuwave">cuwave</a>
 </div>
@@ -63,7 +64,7 @@ try { const theme = localStorage.getItem("theme"); if (theme) document.documentE
   <p>click to emit a source</p>
   <p>click &amp; drag to draw an obstacle</p>
   <p>click an edge label to change its boundary condition</p>
-  <p id="pitch">want it about 100&times; faster? on an NVIDIA GPU:<br><b>pip install cuwave <span class="whole">cupy-cuda12x</span></b></p>
+  <p id="pitch"><span id="faster">want it about 100&times; faster? on an NVIDIA GPU:<br></span><b>pip install cuwave <span class="whole">cupy-cuda12x</span></b></p>
 </div>
 <noscript><p style="padding: 16px">The demo needs JavaScript and WebAssembly.</p></noscript>
 <script src="gpu.js"></script>
