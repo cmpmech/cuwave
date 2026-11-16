@@ -7,8 +7,9 @@
 // ------------------------------------- settings
 // discretization
 const COURANT = 0.5; // c dt / dx, below the 2D limit at order 4 (0.61)
-const WAVELENGTH = 36; // CSS px of a burst's wavelength, where the grid resolves it
 const RESOLVED = { 1: 20, 2: 10 }; // fewest nodes a wavelength, by stencil radius
+const SAFETY = 1.5; // a burst's nodes a wavelength over RESOLVED: phase speed 0.2 % off at order 4
+const WAVELENGTH = 36; // CSS px of a burst's wavelength the colors' limits are set for
 const CYCLES = 3; // periods of a burst
 // absorption
 const SPONGE = 2; // wavelengths of margin behind an absorbing face
@@ -41,6 +42,9 @@ const dark = matchMedia("(prefers-color-scheme: dark)");
 const root = document.documentElement;
 const mode = () => root.dataset.theme || (dark.matches ? "dark" : "light"); // the toggle, else the system
 const modes = [0, 0, 0, 2]; // top, bottom, left, right
+const asked = new URLSearchParams(location.search);
+// the GPU asked for while the solver loads
+const gpu = asked.has("cpu") ? null : navigator.gpu?.requestAdapter().then((a) => a?.requestDevice());
 let solver, backend, rate, cell, rows, cols, lambda, margin, theme, lut, wallColor;
 let stepsPerSecond, msPerStep, dirty = null, debt = 0, last = performance.now();
 let quiet = 0, redraw = true; // when the last burst has faded, and whether to draw anyway
@@ -64,9 +68,10 @@ script(crossOriginIsolated ? "solver-threads.js" : "solver.js")
 async function start(module) {
   solver = module;
   const threads = solver._threads(THREADS);
-  const asked = new URLSearchParams(location.search);
-  if (!asked.has("cpu"))
-    backend = await gpuBackend(solver, canvas, COURANT).catch((e) => {
+  lambda = SAFETY * RESOLVED[solver._radius()];
+  margin = Math.round(SPONGE * lambda);
+  if (gpu !== null)
+    backend = await gpuBackend(solver, canvas, COURANT, gpu).catch((e) => {
       if (asked.has("gpu")) // only ?gpu says why it fell back
         help.append(Object.assign(document.createElement("p"), { textContent: `no gpu: ${e.message ?? e}` }));
       return null;
@@ -102,18 +107,12 @@ function script(src) {
   });
 }
 
-// nodes a wavelength and margin nodes at `size` CSS px a node
-function geometry(size) {
-  const lambda = Math.max(RESOLVED[solver._radius()], WAVELENGTH / size);
-  return { lambda, margin: Math.round(SPONGE * lambda) };
-}
-
 // node updates per second on a scratch grid, timed as the animation steps:
 // for BUDGET of a frame, then idle, which runs slower than steps back to back
 // where cores clock down or other work evicts the grid from the cache
 async function calibrate(threads) {
   const [r, c] = [200 * threads, 300];
-  const margin = scratch(r, c);
+  scratch(r, c);
   const frame = 1e3 / FPS;
   let steps = 0, busy = 0;
   for (let k = 0; k < 10; ++k) {
@@ -135,14 +134,16 @@ async function calibrate(threads) {
   return (steps * backend.cost(r, c, margin)) / (busy / 1e3);
 }
 
-// node updates per second of the GPU, in batches doubled until one takes half a
-// second, since a GPU reports its work done late (Firefox polls every 100 ms)
+// node updates per second of the GPU, on batches grown until one takes 200 ms,
+// since a GPU reports its work done late (Firefox only every 100 ms)
 async function calibrateGpu() {
   const [r, c] = [1000, 1500];
-  const margin = scratch(r, c);
-  let steps = 32, elapsed = 0;
-  while (elapsed < 500) {
-    steps *= 2;
+  scratch(r, c);
+  backend.advance(1); // the first dispatch compiles
+  await backend.finished();
+  let steps = 128, elapsed = 0;
+  while (elapsed < 200) {
+    if (elapsed) steps = Math.ceil((steps * 300) / elapsed);
     const start = performance.now();
     backend.advance(steps);
     await backend.finished();
@@ -153,14 +154,12 @@ async function calibrateGpu() {
   return (steps * backend.cost(r, c, margin)) / (elapsed / 1e3);
 }
 
-// a scratch grid of `r` by `c` nodes with a burst in its middle, returning its margin
+// a scratch grid of `r` by `c` nodes with a burst in its middle
 function scratch(r, c) {
-  const { margin } = geometry(4);
   solver._configure(COURANT, 0, margin, BETA);
   solver._resize(r, c, 1);
   backend.resize(r, c);
-  solver._burst(r / 2, c / 2, 1, 0.1, CYCLES);
-  return margin;
+  solver._burst(r / 2, c / 2, 1, 1 / lambda, CYCLES);
 }
 
 // the finest cell whose steps at SPEED fit the BUDGET of the measured rate
@@ -169,7 +168,7 @@ function cellSize() {
   let size = backend.smallest;
   while (size < 32) {
     const r = Math.ceil(screen.height / size), c = Math.ceil(screen.width / size);
-    const cost = backend.cost(r, c, geometry(size).margin) * reach / (size * COURANT);
+    const cost = backend.cost(r, c, margin) * reach / (size * COURANT);
     if (cost <= BUDGET * rate) break;
     size *= 1.05;
   }
@@ -200,7 +199,6 @@ function resize(scale = 1) {
   canvas.height = Math.round(innerHeight * dpr);
   rows = Math.ceil(innerHeight / cell);
   cols = Math.ceil(innerWidth / cell);
-  ({ lambda, margin } = geometry(cell));
   stepsPerSecond = (SPEED * Math.hypot(innerWidth, innerHeight)) / (cell * COURANT);
   msPerStep = (1e3 * backend.cost(rows, cols, margin)) / rate;
   const decay = 2 / (FADE * stepsPerSecond * COURANT); // u ~ exp(-decay t / 2)
@@ -378,7 +376,8 @@ function listen() {
     presses.delete(e.pointerId);
     if (press && !press.drawing) {
       const [r, c] = node(press.x, press.y);
-      solver._burst(r, c, 1, 1 / lambda, CYCLES);
+      // 2D waves fall as the root of the wavelengths they travel, so a shorter one starts louder
+      solver._burst(r, c, Math.sqrt(WAVELENGTH / (lambda * cell)), 1 / lambda, CYCLES);
       quiet = performance.now() + 6e3 * FADE; // e^-6 of the burst left, below a color step
     }
   });

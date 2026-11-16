@@ -175,12 +175,11 @@ const MAX_STEPS = 64; // steps a submission, the plan's rows
 const SLOTS = 16; // sources a step, solver.cpp's SOURCES
 
 // the GPU backend over `solver`'s grid on `canvas` at Courant number `courant`,
-// throwing why where WebGPU is missing or fails
-async function gpuBackend(solver, canvas, courant) {
-  if (!navigator.gpu) throw new Error("no WebGPU here (switched off, or the page not on https)");
-  const adapter = await navigator.gpu.requestAdapter();
-  if (!adapter) throw new Error("WebGPU offers no GPU");
-  const device = await adapter.requestDevice();
+// on the device `request` resolves to, throwing why where WebGPU is missing or fails
+async function gpuBackend(solver, canvas, courant, request) {
+  if (!request) throw new Error("no WebGPU here (switched off, or the page not on https)");
+  const device = await request;
+  if (!device) throw new Error("WebGPU offers no GPU");
   device.pushErrorScope("validation");
   const R = solver._radius();
   const compute = (code, entryPoint, constants) =>
@@ -201,7 +200,7 @@ async function gpuBackend(solver, canvas, courant) {
   const error = await device.popErrorScope();
   if (error) throw new Error(error.message);
   const context = canvas.getContext("webgpu");
-  context.configure({ device, format, alphaMode: "opaque" });
+  let configured = false; // until the first draw the page shows through, not opaque black
 
   const STORAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
   const UNIFORM = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
@@ -303,6 +302,8 @@ async function gpuBackend(solver, canvas, courant) {
 
     // the latest level, U[(s + 1) % 2], drawn over the canvas
     draw() {
+      if (!configured) context.configure({ device, format, alphaMode: "opaque" });
+      configured = true;
       const encoder = device.createCommandEncoder();
       const pass = encoder.beginRenderPass({
         colorAttachments: [
